@@ -1330,7 +1330,11 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
     for (auto yieldOperand : llvm::enumerate(yieldOp->getOperands())) {
       if (aliveValues.contains(yieldOperand.value()))
         continue;
-      if (yieldOperand.value() == block.getArgument(yieldOperand.index() + 1))
+
+      // If yield operand is a block argument or an init argument, don't bother
+      // with it as it will be removed anyway by the ForOp canonicalizations.
+      if (yieldOperand.value() == block.getArgument(yieldOperand.index() + 1) ||
+          yieldOperand.value() == forOp.getInitArgs()[yieldOperand.index()])
         continue;
 
       // The yield operand might live outside the loop, e.g.
@@ -1350,8 +1354,7 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
       // can still mark the operand as dead. This occurs in the above example
       // when %init is the same as %x.
       if (!forOp->isAncestor(
-              yieldOperand.value().getParentRegion()->getParentOp()) &&
-          yieldOperand.value() != forOp.getInitArgs()[yieldOperand.index()])
+              yieldOperand.value().getParentRegion()->getParentOp()))
         continue;
 
       deadArg.push_back(yieldOperand.index());
@@ -1360,10 +1363,10 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
       return failure();
     rewriter.modifyOpInPlace(forOp, [&]() {
       // For simplicity we just change the dead yield operand to use the
-      // associated argument and leave the operations and argument removal to
+      // associated init value and leave the operations and argument removal to
       // dead code elimination.
       for (unsigned deadArgIdx : deadArg) {
-        BlockArgument arg = block.getArgument(deadArgIdx + 1);
+        Value arg = forOp.getInitArgs()[deadArgIdx];
         yieldOp.setOperand(deadArgIdx, arg);
       }
     });
