@@ -30,6 +30,13 @@ import triton
 import triton.language as tl
 from utils.benchmark_utils import get_available_models, get_model_configs
 
+# Gluon implementation (stub).
+from flash_attention_gluon import gluon_attn_fwd
+
+# Global flag to switch between implementations.
+USE_GLUON = False
+
+
 @triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     ## pid remapping on xcds
@@ -1175,21 +1182,22 @@ class _attention(torch.autograd.Function):
 
         atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
 
-        # test_op_fwd(Z, x_vals_list[1], x_vals_list[2], N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, dtype=torch.float16):
+        # Select kernel implementation.
+        kernel = gluon_attn_fwd if USE_GLUON else attn_fwd
 
-        attn_fwd[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
-                       *bias_strides, *alibi_strides, q_descale, k_descale, p_scale, p_descale, v_descale,
-                       metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
-                       philox_seed=philox_seed, philox_offset_base=philox_offset, encoded_softmax=encoded_softmax,
-                       alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
-                       MAX_SEQLENS_Q=metadata.max_seqlens_q, MAX_SEQLENS_K=metadata.max_seqlens_k,
-                       IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
-                       USE_BIAS=False if metadata.bias is None else True,
-                       USE_ALIBI=False if metadata.alibi_slopes is None else True, ENABLE_DROPOUT=metadata.dropout_p
-                       > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
-                       USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
-                       PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
-                       NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
+        kernel[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
+                     *bias_strides, *alibi_strides, q_descale, k_descale, p_scale, p_descale, v_descale,
+                     metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
+                     philox_seed=philox_seed, philox_offset_base=philox_offset, encoded_softmax=encoded_softmax,
+                     alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
+                     MAX_SEQLENS_Q=metadata.max_seqlens_q, MAX_SEQLENS_K=metadata.max_seqlens_k,
+                     IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
+                     USE_BIAS=False if metadata.bias is None else True,
+                     USE_ALIBI=False if metadata.alibi_slopes is None else True, ENABLE_DROPOUT=metadata.dropout_p
+                     > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
+                     USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
+                     PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
+                     NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
@@ -1202,7 +1210,7 @@ class _attention(torch.autograd.Function):
         ctx.philox_offset = philox_offset
         ctx.encoded_softmax = encoded_softmax
         ctx.return_encoded_softmax = metadata.return_encoded_softmax
-        return o, encoded_softmax, attn_fwd.best_config
+        return o, encoded_softmax, kernel.best_config if hasattr(kernel, 'best_config') else None
 
     @staticmethod
     def backward(ctx, *gradients):
@@ -2135,6 +2143,8 @@ def parse_args():
     parser.add_argument(
         "-persistent", nargs='?', const='fixed', choices=['fixed', 'dynamic'], default=None,
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.")
+    parser.add_argument("-gluon", action='store_true', default=False,
+                        help="Use the Gluon implementation of Flash Attention (experimental stub).")
     return parser.parse_args()
 
 
@@ -2142,7 +2152,11 @@ arg_to_torch_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': tor
 
 
 def main():
+    global USE_GLUON
     args = parse_args()
+    USE_GLUON = args.gluon
+    if USE_GLUON:
+        print("Using Gluon implementation (experimental stub)")
     custom_config = False
     assert args.layout == 'thd' or not args.equal_seqlens or args.model, \
            "Equal sequence lengths arg must be used with the thd layout or a model config."
