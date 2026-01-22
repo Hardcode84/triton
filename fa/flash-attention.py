@@ -1480,6 +1480,63 @@ def test_op_fwd(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, 
 
 
 @pytest.mark.parametrize('Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD', [
+    (1, 4, 4, 64, 64, 64),
+    (2, 8, 8, 128, 128, 64),
+    (1, 4, 2, 128, 128, 64),  # MQA/GQA.
+    (2, 4, 4, 256, 256, 128),
+])
+@pytest.mark.parametrize('causal', [True, False])
+@pytest.mark.parametrize('layout', ['bhsd'])
+def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16):
+    """Test Gluon Flash Attention implementation."""
+    global USE_GLUON
+    USE_GLUON = True
+    try:
+        torch.manual_seed(20)
+        q, k, v, input_metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout)
+        if causal:
+            input_metadata.need_causal()
+
+        o = torch.empty_like(q)
+
+        # Gluon implementation.
+        tri_out, _, _ = attention(q, k, v, o, input_metadata)
+
+        # Reference implementation.
+        scores = torch.einsum('bhqd,bhkd->bhqk', q, k).float() * input_metadata.sm_scale
+        if causal:
+            mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
+            scores[:, :, mask == 0] = float("-inf")
+
+        p = torch.softmax(scores, dim=-1)
+        if causal:
+            nan_mask = torch.isnan(p)
+            p[nan_mask == 1] = 0
+
+        # Handle MQA/GQA for reference.
+        if HQ != HK:
+            k_ref = k.view(k.shape[0], k.shape[1], -1, k.shape[2],
+                           k.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(k.shape[0], -1, k.shape[2], k.shape[3])
+            v_ref = v.view(v.shape[0], v.shape[1], -1, v.shape[2],
+                           v.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(v.shape[0], -1, v.shape[2], v.shape[3])
+            scores = torch.einsum('bhqd,bhkd->bhqk', q, k_ref).float() * input_metadata.sm_scale
+            if causal:
+                scores[:, :, mask == 0] = float("-inf")
+            p = torch.softmax(scores, dim=-1)
+            if causal:
+                nan_mask = torch.isnan(p)
+                p[nan_mask == 1] = 0
+            ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v_ref)
+        else:
+            ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v)
+
+        torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
+        print("✅ Gluon and Torch match")
+    finally:
+        USE_GLUON = False
+
+
+@pytest.mark.parametrize('Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD', [
     (4, 48, 24, 1024, 1024, 64),
     (1, 24, 6, 8192, 8192, 64),
     (1, 4, 2, 16384, 16384, 128),
