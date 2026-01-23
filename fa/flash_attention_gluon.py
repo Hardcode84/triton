@@ -1,8 +1,10 @@
 """
-Flash Attention v2 - Gluon Implementation
-=========================================
+Flash Attention v2 - Gluon Implementation (AMD RDNA3)
+=====================================================
 
-This is a simplified implementation of Flash Attention using Triton's Gluon language.
+This is a simplified implementation of Flash Attention using Triton's Gluon language
+with AMD RDNA3 WMMA instructions for matrix multiplication.
+
 Supports: basic forward pass with optional causal masking.
 Does NOT support: VARLEN, INT8, dropout, ALiBi, bias, persistent mode.
 """
@@ -11,6 +13,9 @@ import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd import AMDWMMALayout
+from triton.experimental.gluon.language.amd.rdna3 import wmma
+from triton.experimental.gluon.language._layouts import DotOperandLayout
 
 
 @gluon.jit
@@ -39,7 +44,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                    USE_P_SCALE: gl.constexpr, INT8_KV: gl.constexpr,
                    num_warps: gl.constexpr):
     """
-    Gluon Flash Attention Forward Kernel.
+    Gluon Flash Attention Forward Kernel with AMD RDNA3 WMMA.
 
     Grid: (num_heads_q, num_m_blocks, batch)
     """
@@ -59,42 +64,44 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # MQA/GQA head mapping.
     off_h_k = off_h_q * HK // HQ
 
-    # Layouts for accumulator (output) tiles.
-    # acc_layout is for [BLOCK_M, BLOCK_DMODEL] accumulator.
-    acc_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1],
-        threads_per_warp=[32, 1],
+    # AMD WMMA layout for RDNA3 (version=1).
+    # WMMA instruction shape is [16, 16, 16] by default.
+    qk_wmma_layout: gl.constexpr = AMDWMMALayout(
+        version=1,
+        transposed=False,
         warps_per_cta=[num_warps, 1],
-        order=[1, 0],
+        instr_shape=[16, 16, 16],
     )
 
-    # qk_layout is for [BLOCK_M, BLOCK_N] attention scores.
-    qk_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1],
-        threads_per_warp=[32, 1],
+    acc_wmma_layout: gl.constexpr = AMDWMMALayout(
+        version=1,
+        transposed=False,
         warps_per_cta=[num_warps, 1],
-        order=[1, 0],
+        instr_shape=[16, 16, 16],
     )
 
-    # DotOperandLayouts for matrix multiplications.
+    # DotOperandLayouts for WMMA.
     # For QK^T: Q [M, D] @ K^T [D, N] -> QK [M, N].
-    q_dot_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=qk_layout, k_width=0)
-    kt_dot_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=qk_layout, k_width=0)
+    q_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=qk_wmma_layout, k_width=16)
+    kt_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=qk_wmma_layout, k_width=16)
 
     # For P @ V: P [M, N] @ V [N, D] -> O [M, D].
-    p_dot_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=acc_layout, k_width=0)
-    v_dot_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=acc_layout, k_width=0)
+    p_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=acc_wmma_layout, k_width=16)
+    v_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=acc_wmma_layout, k_width=16)
+
+    # Blocked layout for loads/stores.
+    blocked_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[32, 1],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+    )
 
     # 1D slice layouts.
-    # For expand_dims to work correctly:
-    # - SliceLayout(dim=1, parent=layout)[:, None] -> adds dim at axis 1.
-    # - SliceLayout(dim=0, parent=layout)[None, :] -> adds dim at axis 0.
-    offs_m_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=acc_layout)
-    offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=acc_layout)
-    # For K indexing: offs_n[:, None] needs SliceLayout(dim=1, ...).
-    offs_n_row_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_layout)
-    # For K masking: offs_n[None, :] needs SliceLayout(dim=0, ...).
-    offs_n_col_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=qk_layout)
+    offs_m_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=blocked_layout)
+    offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=blocked_layout)
+    offs_n_row_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=blocked_layout)
+    offs_n_col_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=blocked_layout)
 
     # Offset ranges.
     offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_layout)
@@ -112,10 +119,11 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
-    # Initialize accumulators.
-    m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=offs_m_layout)
-    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=offs_m_layout)
-    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=gl.float32, layout=acc_layout)
+    # Initialize accumulators with WMMA-compatible slice layout.
+    wmma_m_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_wmma_layout)
+    m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=wmma_m_layout)
+    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=wmma_m_layout)
+    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=gl.float32, layout=acc_wmma_layout)
 
     # Scale factor (log2(e) * sm_scale for exp2 trick).
     qk_scale: gl.constexpr = SM_SCALE * 1.44269504089
@@ -123,25 +131,16 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # Number of K/V blocks to process.
     n_blocks: gl.constexpr = (MAX_SEQLENS_K + BLOCK_N - 1) // BLOCK_N
 
+    # WMMA-compatible slice layouts for masking (defined outside loop to avoid redefinition).
+    wmma_offs_n_col: gl.constexpr = gl.SliceLayout(dim=0, parent=qk_wmma_layout)
+    wmma_offs_m_row: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_wmma_layout)
+
     # Main loop over K/V blocks.
+    # Note: Gluon doesn't support `continue` in static_range, so we rely on
+    # the causal mask to mask out blocks that would have been skipped.
     for block_n in gl.static_range(n_blocks):
         start_n = block_n * BLOCK_N
-        # Use row layout for pointer arithmetic (offs_n[:, None]).
         offs_n = start_n + gl.arange(0, BLOCK_N, layout=offs_n_row_layout)
-
-        # Check if we should skip this block for causal attention.
-        # For causal: only attend to positions where m >= n + (seqlen_q - seqlen_k).
-        if IS_CAUSAL:
-            # Skip blocks that are entirely masked out.
-            # Block starts at start_n, ends at start_n + BLOCK_N - 1.
-            # We process if any position in the Q block can attend to any position in K block.
-            # Q positions: [start_m * BLOCK_M, (start_m + 1) * BLOCK_M - 1].
-            # For causal: q_pos >= k_pos + (MAX_SEQLENS_Q - MAX_SEQLENS_K).
-            # So we skip if: (start_m + 1) * BLOCK_M - 1 < start_n + (MAX_SEQLENS_Q - MAX_SEQLENS_K).
-            # Rearranged: start_n > (start_m + 1) * BLOCK_M - 1 - MAX_SEQLENS_Q + MAX_SEQLENS_K.
-            causal_start_n = (start_m + 1) * BLOCK_M + MAX_SEQLENS_K - MAX_SEQLENS_Q
-            if start_n >= causal_start_n:
-                continue
 
         # Load K tile [BLOCK_N, BLOCK_DMODEL].
         k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
@@ -150,40 +149,33 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             k_mask = k_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
         k = gl.load(k_ptrs, mask=k_mask, other=0.0)
 
-        # Compute QK^T = Q @ K^T.
+        # Compute QK^T using WMMA.
         # Q is [BLOCK_M, BLOCK_DMODEL], K is [BLOCK_N, BLOCK_DMODEL].
-        # We need Q @ K^T -> [BLOCK_M, BLOCK_N].
-        # For dot_fma: a [M, K] @ b [K, N] -> c [M, N].
-        # So we need K transposed: K^T [BLOCK_DMODEL, BLOCK_N].
         # Transpose K: [BLOCK_N, BLOCK_DMODEL] -> [BLOCK_DMODEL, BLOCK_N].
-        k_t = gl.permute(k, [1, 0])  # [BLOCK_DMODEL, BLOCK_N]
+        k_t = gl.permute(k, [1, 0])
 
-        # Convert to dot operand layouts.
+        # Convert to dot operand layouts for WMMA.
         q_dot = gl.convert_layout(q, q_dot_layout)
         kt_dot = gl.convert_layout(k_t, kt_dot_layout)
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=qk_layout)
-        qk = gl.dot_fma(q_dot, kt_dot, qk)
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=qk_wmma_layout)
+        qk = wmma(q_dot, kt_dot, qk)
 
         # Scale QK scores.
         qk = qk * qk_scale
 
         # Apply causal mask.
         if IS_CAUSAL:
-            # Use col layout for [None, :] broadcast.
-            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=offs_n_col_layout)
-            # Use row layout for [:, None] broadcast.
-            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_layout)
-            # Mask: m >= n + (seqlen_q - seqlen_k), i.e., m - n >= seqlen_q - seqlen_k.
+            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=wmma_offs_n_col)
+            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=wmma_offs_m_row)
             causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
             causal_mask = causal_offs_m[:, None] >= causal_boundary
-            neg_inf = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_layout)
+            neg_inf = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_wmma_layout)
             qk = gl.where(causal_mask, qk, neg_inf)
 
         # Mask out-of-bounds K positions.
-        # Use col layout for [None, :] broadcast.
-        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=offs_n_col_layout)
+        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=wmma_offs_n_col)
         bound_mask = bound_offs[None, :] < MAX_SEQLENS_K
-        neg_inf2 = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_layout)
+        neg_inf2 = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_wmma_layout)
         qk = gl.where(bound_mask, qk, neg_inf2)
 
         # Online softmax: compute new running max.
@@ -208,13 +200,13 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
         v = gl.load(v_ptrs, mask=k_mask, other=0.0)
 
-        # Accumulate P @ V.
-        # P is [BLOCK_M, BLOCK_N], V is [BLOCK_N, BLOCK_DMODEL].
-        # dot_fma: a [M, K] @ b [K, N] -> c [M, N].
-        # Here: P [BLOCK_M, BLOCK_N] @ V [BLOCK_N, BLOCK_DMODEL] -> acc [BLOCK_M, BLOCK_DMODEL].
-        p_dot = gl.convert_layout(p, p_dot_layout)
+        # Accumulate P @ V using WMMA.
+        # P is [BLOCK_M, BLOCK_N] (fp32), V is [BLOCK_N, BLOCK_DMODEL] (fp16).
+        # Convert P to fp16 for WMMA.
+        p_f16 = p.to(gl.float16)
+        p_dot = gl.convert_layout(p_f16, p_dot_layout)
         v_dot = gl.convert_layout(v, v_dot_layout)
-        acc = gl.dot_fma(p_dot, v_dot, acc)
+        acc = wmma(p_dot, v_dot, acc)
 
     # Normalize by softmax sum.
     acc = acc / l_i[:, None]
@@ -225,11 +217,15 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     o_mask = offs_m[:, None] < MAX_SEQLENS_Q
     if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
         o_mask = o_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-    gl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_mask)
+    # Convert layout for store.
+    acc_blocked = gl.convert_layout(acc, blocked_layout)
+    gl.store(o_ptrs, acc_blocked.to(Out.dtype.element_ty), mask=o_mask)
 
     # Store log-sum-exp for backward pass.
     l_ptrs = L + off_z * HQ * MAX_SEQLENS_Q + off_h_q * MAX_SEQLENS_Q + offs_m
     l_mask = offs_m < MAX_SEQLENS_Q
     # Convert from log2 scale back to natural log.
     lse = m_i / 1.44269504089 + gl.log2(l_i) / 1.44269504089
-    gl.store(l_ptrs, lse, mask=l_mask)
+    # Convert from WMMA slice layout to blocked slice layout for store.
+    lse_blocked = gl.convert_layout(lse, offs_m_layout)
+    gl.store(l_ptrs, lse_blocked, mask=l_mask)
