@@ -1182,22 +1182,46 @@ class _attention(torch.autograd.Function):
 
         atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
 
-        # Select kernel implementation.
-        kernel = gluon_attn_fwd if USE_GLUON else attn_fwd
-
-        kernel[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
-                     *bias_strides, *alibi_strides, q_descale, k_descale, p_scale, p_descale, v_descale,
-                     metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
-                     philox_seed=philox_seed, philox_offset_base=philox_offset, encoded_softmax=encoded_softmax,
-                     alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
-                     MAX_SEQLENS_Q=metadata.max_seqlens_q, MAX_SEQLENS_K=metadata.max_seqlens_k,
-                     IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
-                     USE_BIAS=False if metadata.bias is None else True,
-                     USE_ALIBI=False if metadata.alibi_slopes is None else True, ENABLE_DROPOUT=metadata.dropout_p
-                     > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
-                     USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
-                     PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
-                     NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
+        if USE_GLUON:
+            # Gluon kernel with fixed block sizes (no autotune).
+            BLOCK_M, BLOCK_N = 64, 64
+            gluon_grid = (nheads_q, triton.cdiv(metadata.max_seqlens_q, BLOCK_M), batch)
+            gluon_attn_fwd[gluon_grid](
+                q, k, v, metadata.bias, metadata.sm_scale, M, o,
+                *q_strides, *k_strides, *v_strides, *o_strides,
+                *bias_strides, *alibi_strides, q_descale, k_descale, p_scale, p_descale, v_descale,
+                metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
+                philox_seed=philox_seed, philox_offset_base=philox_offset, encoded_softmax=encoded_softmax,
+                alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
+                MAX_SEQLENS_Q=metadata.max_seqlens_q, MAX_SEQLENS_K=metadata.max_seqlens_k,
+                IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                USE_BIAS=False if metadata.bias is None else True,
+                USE_ALIBI=False if metadata.alibi_slopes is None else True,
+                ENABLE_DROPOUT=metadata.dropout_p > 0.0,
+                RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
+                USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
+                PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
+                NUM_CU=NUM_CU, GRID_CU_MULTIP=2, atomic_counter=atomic_counter, B=batch, PRE_LOAD_V=False,
+                num_warps=4,
+            )
+            best_config = None
+        else:
+            # Standard Triton kernel with autotune.
+            attn_fwd[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
+                         *bias_strides, *alibi_strides, q_descale, k_descale, p_scale, p_descale, v_descale,
+                         metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
+                         philox_seed=philox_seed, philox_offset_base=philox_offset, encoded_softmax=encoded_softmax,
+                         alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
+                         MAX_SEQLENS_Q=metadata.max_seqlens_q, MAX_SEQLENS_K=metadata.max_seqlens_k,
+                         IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
+                         USE_BIAS=False if metadata.bias is None else True,
+                         USE_ALIBI=False if metadata.alibi_slopes is None else True, ENABLE_DROPOUT=metadata.dropout_p
+                         > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
+                         USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
+                         PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
+                         NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
+            best_config = attn_fwd.best_config
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
@@ -1210,7 +1234,7 @@ class _attention(torch.autograd.Function):
         ctx.philox_offset = philox_offset
         ctx.encoded_softmax = encoded_softmax
         ctx.return_encoded_softmax = metadata.return_encoded_softmax
-        return o, encoded_softmax, kernel.best_config if hasattr(kernel, 'best_config') else None
+        return o, encoded_softmax, best_config
 
     @staticmethod
     def backward(ctx, *gradients):
