@@ -1,20 +1,29 @@
 """
-Flash Attention v2 - Gluon Implementation (AMD RDNA3)
-=====================================================
+Flash Attention v2 - Gluon Implementation (AMD)
+===============================================
 
 This is a simplified implementation of Flash Attention using Triton's Gluon language
-with AMD RDNA3 WMMA instructions for matrix multiplication.
+with configurable AMD matrix core instructions (WMMA/MFMA).
 
 Supports: basic forward pass with optional causal masking.
 Does NOT support: VARLEN, INT8, dropout, ALiBi, bias, persistent mode.
+
+MMA_TYPE options:
+- "wmma_rdna3": AMD RDNA3 WMMA (gfx1100, gfx1101)
+- "wmma_rdna4": AMD RDNA4 WMMA (gfx1200, gfx1201)
+- "mfma_cdna3": AMD CDNA3 MFMA (gfx942)
+- "mfma_cdna4": AMD CDNA4 MFMA (gfx950)
 """
 
 import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd import AMDWMMALayout
-from triton.experimental.gluon.language.amd.rdna3 import wmma
+from triton.experimental.gluon.language.amd import AMDWMMALayout, AMDMFMALayout
+from triton.experimental.gluon.language.amd.rdna3 import wmma as wmma_rdna3
+from triton.experimental.gluon.language.amd.rdna4 import wmma as wmma_rdna4
+from triton.experimental.gluon.language.amd.cdna3 import mfma as mfma_cdna3
+from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
 from triton.experimental.gluon.language._layouts import DotOperandLayout
 
 
@@ -42,11 +51,17 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                    ENABLE_DROPOUT: gl.constexpr, RETURN_ENCODED_SOFTMAX: gl.constexpr,
                    USE_ALIBI: gl.constexpr, INT8: gl.constexpr,
                    USE_P_SCALE: gl.constexpr, INT8_KV: gl.constexpr,
+                   MMA_TYPE: gl.constexpr,
                    num_warps: gl.constexpr):
     """
-    Gluon Flash Attention Forward Kernel with AMD RDNA3 WMMA.
+    Gluon Flash Attention Forward Kernel with configurable AMD MMA.
 
     Grid: (num_heads_q, num_m_blocks, batch)
+
+    MMA_TYPE options:
+    - "wmma_rdna3": AMD RDNA3 WMMA (gfx1100, gfx1101)
+    - "wmma_rdna4": AMD RDNA4 WMMA (gfx1200, gfx1201)
+    - "mfma_cdna3": AMD CDNA3 MFMA (gfx942)
     """
     # Validate unsupported features at compile time.
     gl.static_assert(not VARLEN, "VARLEN not supported in Gluon implementation")
@@ -64,35 +79,86 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # MQA/GQA head mapping.
     off_h_k = off_h_q * HK // HQ
 
-    # AMD WMMA layout for RDNA3 (version=1).
-    # WMMA instruction shape is [16, 16, 16] by default.
-    qk_wmma_layout: gl.constexpr = AMDWMMALayout(
-        version=1,
-        transposed=False,
-        warps_per_cta=[num_warps, 1],
-        instr_shape=[16, 16, 16],
-    )
+    # Configure MMA layout and instruction based on MMA_TYPE.
+    # WMMA types use 32-thread warps, MFMA uses 64-thread warps.
+    if MMA_TYPE == "wmma_rdna3":
+        qk_mma_layout: gl.constexpr = AMDWMMALayout(
+            version=1,
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+            instr_shape=[16, 16, 16],
+        )
+        acc_mma_layout: gl.constexpr = AMDWMMALayout(
+            version=1,
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+            instr_shape=[16, 16, 16],
+        )
+        k_width: gl.constexpr = 16
+        threads_per_warp: gl.constexpr = 32
+    elif MMA_TYPE == "wmma_rdna4":
+        qk_mma_layout: gl.constexpr = AMDWMMALayout(
+            version=2,
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+            instr_shape=[16, 16, 16],
+        )
+        acc_mma_layout: gl.constexpr = AMDWMMALayout(
+            version=2,
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+            instr_shape=[16, 16, 16],
+        )
+        k_width: gl.constexpr = 16
+        threads_per_warp: gl.constexpr = 32
+    elif MMA_TYPE == "mfma_cdna3":
+        # CDNA3 MFMA with 16x16x16 instruction shape.
+        qk_mma_layout: gl.constexpr = AMDMFMALayout(
+            version=3,
+            instr_shape=[16, 16, 16],
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+        )
+        acc_mma_layout: gl.constexpr = AMDMFMALayout(
+            version=3,
+            instr_shape=[16, 16, 16],
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+        )
+        k_width: gl.constexpr = 4
+        threads_per_warp: gl.constexpr = 64
+    elif MMA_TYPE == "mfma_cdna4":
+        # CDNA4 MFMA with 16x16x16 instruction shape.
+        qk_mma_layout: gl.constexpr = AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 16],
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+        )
+        acc_mma_layout: gl.constexpr = AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 16],
+            transposed=False,
+            warps_per_cta=[num_warps, 1],
+        )
+        k_width: gl.constexpr = 4
+        threads_per_warp: gl.constexpr = 64
+    else:
+        gl.static_assert(False, "Unknown MMA_TYPE. Supported: wmma_rdna3, wmma_rdna4, mfma_cdna3, mfma_cdna4")
 
-    acc_wmma_layout: gl.constexpr = AMDWMMALayout(
-        version=1,
-        transposed=False,
-        warps_per_cta=[num_warps, 1],
-        instr_shape=[16, 16, 16],
-    )
-
-    # DotOperandLayouts for WMMA.
+    # DotOperandLayouts for MMA.
     # For QK^T: Q [M, D] @ K^T [D, N] -> QK [M, N].
-    q_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=qk_wmma_layout, k_width=16)
-    kt_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=qk_wmma_layout, k_width=16)
+    q_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=qk_mma_layout, k_width=k_width)
+    kt_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=qk_mma_layout, k_width=k_width)
 
     # For P @ V: P [M, N] @ V [N, D] -> O [M, D].
-    p_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=acc_wmma_layout, k_width=16)
-    v_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=acc_wmma_layout, k_width=16)
+    p_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=acc_mma_layout, k_width=k_width)
+    v_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=acc_mma_layout, k_width=k_width)
 
     # Blocked layout for loads/stores.
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1],
-        threads_per_warp=[32, 1],
+        threads_per_warp=[threads_per_warp, 1],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
@@ -119,11 +185,11 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
-    # Initialize accumulators with WMMA-compatible slice layout.
-    wmma_m_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_wmma_layout)
-    m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=wmma_m_layout)
-    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=wmma_m_layout)
-    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=gl.float32, layout=acc_wmma_layout)
+    # Initialize accumulators with MMA-compatible slice layout.
+    mma_m_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_mma_layout)
+    m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
+    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=mma_m_layout)
+    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=gl.float32, layout=acc_mma_layout)
 
     # Scale factor (log2(e) * sm_scale for exp2 trick).
     qk_scale: gl.constexpr = SM_SCALE * 1.44269504089
@@ -131,9 +197,9 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # Number of K/V blocks to process.
     n_blocks: gl.constexpr = (MAX_SEQLENS_K + BLOCK_N - 1) // BLOCK_N
 
-    # WMMA-compatible slice layouts for masking (defined outside loop to avoid redefinition).
-    wmma_offs_n_col: gl.constexpr = gl.SliceLayout(dim=0, parent=qk_wmma_layout)
-    wmma_offs_m_row: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_wmma_layout)
+    # MMA-compatible slice layouts for masking (defined outside loop to avoid redefinition).
+    mma_offs_n_col: gl.constexpr = gl.SliceLayout(dim=0, parent=qk_mma_layout)
+    mma_offs_m_row: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_mma_layout)
 
     # Main loop over K/V blocks.
     # Note: Gluon doesn't support `continue` in static_range, so we rely on
@@ -149,33 +215,40 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             k_mask = k_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
         k = gl.load(k_ptrs, mask=k_mask, other=0.0)
 
-        # Compute QK^T using WMMA.
+        # Compute QK^T using MMA.
         # Q is [BLOCK_M, BLOCK_DMODEL], K is [BLOCK_N, BLOCK_DMODEL].
         # Transpose K: [BLOCK_N, BLOCK_DMODEL] -> [BLOCK_DMODEL, BLOCK_N].
         k_t = gl.permute(k, [1, 0])
 
-        # Convert to dot operand layouts for WMMA.
+        # Convert to dot operand layouts for MMA.
         q_dot = gl.convert_layout(q, q_dot_layout)
         kt_dot = gl.convert_layout(k_t, kt_dot_layout)
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=qk_wmma_layout)
-        qk = wmma(q_dot, kt_dot, qk)
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=qk_mma_layout)
+        if MMA_TYPE == "wmma_rdna3":
+            qk = wmma_rdna3(q_dot, kt_dot, qk)
+        elif MMA_TYPE == "wmma_rdna4":
+            qk = wmma_rdna4(q_dot, kt_dot, qk)
+        elif MMA_TYPE == "mfma_cdna3":
+            qk = mfma_cdna3(q_dot, kt_dot, qk)
+        elif MMA_TYPE == "mfma_cdna4":
+            qk = mfma_cdna4(q_dot, kt_dot, qk)
 
         # Scale QK scores.
         qk = qk * qk_scale
 
         # Apply causal mask.
         if IS_CAUSAL:
-            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=wmma_offs_n_col)
-            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=wmma_offs_m_row)
+            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
+            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
             causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
             causal_mask = causal_offs_m[:, None] >= causal_boundary
-            neg_inf = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_wmma_layout)
+            neg_inf = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_mma_layout)
             qk = gl.where(causal_mask, qk, neg_inf)
 
         # Mask out-of-bounds K positions.
-        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=wmma_offs_n_col)
+        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
         bound_mask = bound_offs[None, :] < MAX_SEQLENS_K
-        neg_inf2 = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_wmma_layout)
+        neg_inf2 = gl.full([BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=qk_mma_layout)
         qk = gl.where(bound_mask, qk, neg_inf2)
 
         # Online softmax: compute new running max.
@@ -200,13 +273,20 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
         v = gl.load(v_ptrs, mask=k_mask, other=0.0)
 
-        # Accumulate P @ V using WMMA.
+        # Accumulate P @ V using MMA.
         # P is [BLOCK_M, BLOCK_N] (fp32), V is [BLOCK_N, BLOCK_DMODEL] (fp16).
-        # Convert P to fp16 for WMMA.
+        # Convert P to fp16 for MMA.
         p_f16 = p.to(gl.float16)
         p_dot = gl.convert_layout(p_f16, p_dot_layout)
         v_dot = gl.convert_layout(v, v_dot_layout)
-        acc = wmma(p_dot, v_dot, acc)
+        if MMA_TYPE == "wmma_rdna3":
+            acc = wmma_rdna3(p_dot, v_dot, acc)
+        elif MMA_TYPE == "wmma_rdna4":
+            acc = wmma_rdna4(p_dot, v_dot, acc)
+        elif MMA_TYPE == "mfma_cdna3":
+            acc = mfma_cdna3(p_dot, v_dot, acc)
+        elif MMA_TYPE == "mfma_cdna4":
+            acc = mfma_cdna4(p_dot, v_dot, acc)
 
     # Normalize by softmax sum.
     acc = acc / l_i[:, None]
