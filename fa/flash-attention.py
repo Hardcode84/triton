@@ -1527,7 +1527,17 @@ def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype
         tri_out, _, _ = attention(q, k, v, o, input_metadata)
 
         # Reference implementation.
-        scores = torch.einsum('bhqd,bhkd->bhqk', q, k).float() * input_metadata.sm_scale
+        # Handle MQA/GQA by expanding K and V to match Q heads.
+        if HQ != HK:
+            k_ref = k.view(k.shape[0], k.shape[1], -1, k.shape[2],
+                           k.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(k.shape[0], -1, k.shape[2], k.shape[3])
+            v_ref = v.view(v.shape[0], v.shape[1], -1, v.shape[2],
+                           v.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(v.shape[0], -1, v.shape[2], v.shape[3])
+        else:
+            k_ref = k
+            v_ref = v
+
+        scores = torch.einsum('bhqd,bhkd->bhqk', q, k_ref).float() * input_metadata.sm_scale
         if causal:
             mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
             scores[:, :, mask == 0] = float("-inf")
@@ -1537,22 +1547,7 @@ def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype
             nan_mask = torch.isnan(p)
             p[nan_mask == 1] = 0
 
-        # Handle MQA/GQA for reference.
-        if HQ != HK:
-            k_ref = k.view(k.shape[0], k.shape[1], -1, k.shape[2],
-                           k.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(k.shape[0], -1, k.shape[2], k.shape[3])
-            v_ref = v.view(v.shape[0], v.shape[1], -1, v.shape[2],
-                           v.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(v.shape[0], -1, v.shape[2], v.shape[3])
-            scores = torch.einsum('bhqd,bhkd->bhqk', q, k_ref).float() * input_metadata.sm_scale
-            if causal:
-                scores[:, :, mask == 0] = float("-inf")
-            p = torch.softmax(scores, dim=-1)
-            if causal:
-                nan_mask = torch.isnan(p)
-                p[nan_mask == 1] = 0
-            ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v_ref)
-        else:
-            ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v)
+        ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v_ref)
 
         torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
         print("✅ Gluon and Torch match")
