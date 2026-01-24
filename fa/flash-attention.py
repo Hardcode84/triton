@@ -1529,7 +1529,7 @@ def test_op_fwd(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, 
     (2, 4, 4, 256, 256, 128),
 ])
 @pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('layout', ['bhsd'])
+@pytest.mark.parametrize('layout', ['bhsd', 'bshd'])
 def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16):
     """Test Gluon Flash Attention implementation."""
     global USE_GLUON
@@ -1544,6 +1544,13 @@ def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype
 
         # Gluon implementation.
         tri_out, _, _ = attention(q, k, v, o, input_metadata)
+
+        # Transpose to bhsd for reference computation if bshd layout.
+        if layout == 'bshd':
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            tri_out = tri_out.transpose(1, 2)
 
         # Reference implementation.
         # Handle MQA/GQA by expanding K and V to match Q heads.
