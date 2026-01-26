@@ -214,22 +214,41 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     mma_offs_n_col: gl.constexpr = gl.SliceLayout(dim=0, parent=qk_mma_layout)
     mma_offs_m_row: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_mma_layout)
 
+    # Blocked layout for K^T loading (transposed: [D, N]).
+    kt_blocked_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[1, threads_per_warp],
+        warps_per_cta=[1, num_warps],
+        order=[0, 1],
+    )
+    kt_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kt_blocked_layout)
+    kt_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=kt_blocked_layout)
+
+    # Initial offsets for K and V (will be advanced via pointer arithmetic).
+    offs_n_base = gl.arange(0, BLOCK_N, layout=offs_n_row_layout)
+    kt_offs_d = gl.arange(0, BLOCK_DMODEL, layout=kt_offs_d_layout)
+    kt_offs_n = gl.arange(0, BLOCK_N, layout=kt_offs_n_layout)
+
+    # Initialize K^T and V pointers (load K transposed directly: [D, N]).
+    kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + kt_offs_n[None, :] * stride_kn
+    v_ptrs = v_base + offs_n_base[:, None] * stride_vk + offs_d[None, :] * stride_vn
+
     # Main loop over K/V blocks (dynamic range for runtime bounds).
     for block_n in range(n_blocks):
         start_n = block_n * BLOCK_N
-        offs_n = start_n + gl.arange(0, BLOCK_N, layout=offs_n_row_layout)
 
-        # Load K tile [BLOCK_N, BLOCK_DMODEL].
-        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
-        k_mask = offs_n[:, None] < MAX_SEQLENS_K
+        # PRE_LOAD_V: Load V early to allow pipelining with K load and QK computation.
+        if PRE_LOAD_V:
+            v_mask = (start_n + offs_n_base[:, None]) < MAX_SEQLENS_K
+            if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+                v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+            v = gl.load(v_ptrs, mask=v_mask, other=0.0)
+
+        # Load K^T tile directly as [BLOCK_DMODEL, BLOCK_N] (no permute needed).
+        kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
         if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            k_mask = k_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-        k = gl.load(k_ptrs, mask=k_mask, other=0.0)
-
-        # Compute QK^T using MMA.
-        # Q is [BLOCK_M, BLOCK_DMODEL], K is [BLOCK_N, BLOCK_DMODEL].
-        # Transpose K: [BLOCK_N, BLOCK_DMODEL] -> [BLOCK_DMODEL, BLOCK_N].
-        k_t = gl.permute(k, [1, 0])
+            kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
+        k_t = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
 
         # Convert K^T to dot operand layout for MMA (Q already converted outside loop).
         kt_dot = gl.convert_layout(k_t, kt_dot_layout)
@@ -263,7 +282,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
 
         # Online softmax: compute new running max.
         m_ij = gl.max(qk, axis=1)
-        m_new = gl.where(m_ij > m_i, m_ij, m_i)
+        m_new = gl.maximum(m_i, m_ij)
 
         # Compute exp2(qk - m_new) for numerical stability.
         p = gl.exp2(qk - m_new[:, None])
@@ -279,9 +298,12 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         # Update running max.
         m_i = m_new
 
-        # Load V tile [BLOCK_N, BLOCK_DMODEL].
-        v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
-        v = gl.load(v_ptrs, mask=k_mask, other=0.0)
+        # Load V tile [BLOCK_N, BLOCK_DMODEL] if not pre-loaded.
+        if not PRE_LOAD_V:
+            v_mask = (start_n + offs_n_base[:, None]) < MAX_SEQLENS_K
+            if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+                v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+            v = gl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # Accumulate P @ V using MMA.
         # P is [BLOCK_M, BLOCK_N] (fp32), V is [BLOCK_N, BLOCK_DMODEL].
@@ -297,6 +319,10 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             acc = mfma_cdna3(p_dot, v_dot, acc)
         elif MMA_TYPE == "mfma_cdna4":
             acc = mfma_cdna4(p_dot, v_dot, acc)
+
+        # Advance pointers for next block (pointer arithmetic).
+        kt_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vk
 
     # Normalize by softmax sum.
     acc = acc / l_i[:, None]
