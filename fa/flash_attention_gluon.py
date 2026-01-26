@@ -76,6 +76,109 @@ def do_mma(MMA_TYPE: gl.constexpr, a, b, c):
         return mfma_cdna4(a, b, c)
 
 
+@gluon.jit
+def attn_fwd_inner(
+    acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+    kt_offs_d, kt_offs_n, start_m,
+    stride_kn, stride_vk,
+    block_start, block_end,
+    qk_scale: gl.constexpr,
+    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
+    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr,
+    ACTUAL_BLOCK_DMODEL: gl.constexpr,
+    PRE_LOAD_V: gl.constexpr, MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
+    MMA_TYPE: gl.constexpr,
+    kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
+    mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
+):
+    """Inner attention loop over K/V blocks."""
+    for block_n in range(block_start, block_end):
+        start_n = block_n * BLOCK_N
+
+        # PRE_LOAD_V: Load V early to allow pipelining.
+        if PRE_LOAD_V:
+            if MASK_STEPS:
+                v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
+                if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+                    v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+                v = gl.load(v_ptrs, mask=v_mask, other=0.0)
+            else:
+                v = gl.load(v_ptrs)
+
+        # Load K^T directly as [BLOCK_DMODEL, BLOCK_N].
+        if MASK_STEPS:
+            kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
+            if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+                kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
+            k_t = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
+        else:
+            k_t = gl.load(kt_ptrs)
+
+        # Compute QK^T using MMA.
+        kt_dot = gl.convert_layout(k_t, kt_dot_layout)
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+        qk = do_mma(MMA_TYPE, q_dot, kt_dot, qk)
+
+        # Scale QK scores.
+        qk = qk * qk_scale
+
+        # Apply causal mask (only for masked blocks).
+        if MASK_STEPS and IS_CAUSAL:
+            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
+            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
+            causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
+            causal_mask = causal_offs_m[:, None] >= causal_boundary
+            qk = gl.where(causal_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
+                                                    dtype=gl.float32, layout=mma_layout))
+
+        # Mask out-of-bounds K positions (only for masked blocks).
+        if MASK_STEPS:
+            bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
+            bound_mask = bound_offs[None, :] < MAX_SEQLENS_K
+            qk = gl.where(bound_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
+                                                   dtype=gl.float32, layout=mma_layout))
+
+        # Online softmax: compute new running max.
+        m_ij = gl.max(qk, axis=1)
+        m_new = gl.maximum(m_i, m_ij)
+
+        # Compute exp2(qk - m_new) for numerical stability.
+        p = gl.exp2(qk - m_new[:, None])
+
+        # Update running sum.
+        l_ij = gl.sum(p, axis=1)
+        alpha = gl.exp2(m_i - m_new)
+        l_i = l_i * alpha + l_ij
+
+        # Scale accumulator by alpha.
+        acc = acc * alpha[:, None]
+
+        # Update running max.
+        m_i = m_new
+
+        # Load V tile [BLOCK_N, BLOCK_DMODEL] if not pre-loaded.
+        if not PRE_LOAD_V:
+            if MASK_STEPS:
+                v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
+                if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+                    v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+                v = gl.load(v_ptrs, mask=v_mask, other=0.0)
+            else:
+                v = gl.load(v_ptrs)
+
+        # Accumulate P @ V using MMA.
+        p_cast = p.to(v.dtype)
+        p_dot = gl.convert_layout(p_cast, p_dot_layout)
+        v_dot = gl.convert_layout(v, v_dot_layout)
+        acc = do_mma(MMA_TYPE, p_dot, v_dot, acc)
+
+        # Advance pointers.
+        kt_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vk
+
+    return acc, l_i, m_i, kt_ptrs, v_ptrs
+
+
 def get_gluon_cdna_autotune_configs():
     """Autotune configs for CDNA (MI series) GPUs."""
     return [
@@ -250,96 +353,61 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # Number of K/V blocks to process.
     # For causal attention, we can skip blocks where all positions are masked.
     n_blocks_total: gl.constexpr = (MAX_SEQLENS_K + BLOCK_N - 1) // BLOCK_N
+    n_extra_tokens: gl.constexpr = MAX_SEQLENS_K % BLOCK_N
+    padded_block_k: gl.constexpr = n_extra_tokens != 0
+    is_modulo_mn: gl.constexpr = not padded_block_k and (MAX_SEQLENS_Q % BLOCK_M == 0)
+
     if IS_CAUSAL:
-        # Causal boundary: positions where m >= n + (seqlen_q - seqlen_k)
-        # For block starting at start_n, all masked if: (start_m + 1) * BLOCK_M <= start_n + (seqlen_q - seqlen_k)
-        # Rearranging: start_n >= (start_m + 1) * BLOCK_M + seqlen_k - seqlen_q
-        # So we only need blocks where start_n < causal_block_limit
+        # Causal boundary: positions where m >= n + (seqlen_q - seqlen_k).
         causal_block_limit = (start_m + 1) * BLOCK_M + MAX_SEQLENS_K - MAX_SEQLENS_Q
         n_blocks = gl.minimum(n_blocks_total, (causal_block_limit + BLOCK_N - 1) // BLOCK_N)
+        # There are always at least BLOCK_M // BLOCK_N masked blocks.
+        # Additionally there might be one more due to dissimilar seqlens.
+        masked_blocks: gl.constexpr = BLOCK_M // BLOCK_N + (not is_modulo_mn)
     else:
         n_blocks = n_blocks_total
+        # Padding on Q does not need to be masked in the FA loop.
+        masked_blocks: gl.constexpr = 1 if padded_block_k else 0
+
+    # Clamp masked_blocks to n_blocks (may exceed for small sequences).
+    masked_blocks_clamped = gl.minimum(masked_blocks, n_blocks)
+    n_full_blocks = n_blocks - masked_blocks_clamped
 
     # Initialize K^T and V pointers (K loaded transposed: [D, N]).
     kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + kt_offs_n[None, :] * stride_kn
     v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
 
-    # Main loop over K/V blocks.
-    for block_n in range(n_blocks):
-        start_n = block_n * BLOCK_N
+    # Process full blocks (no masking needed - faster).
+    if n_full_blocks > 0:
+        acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
+            acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+            kt_offs_d, kt_offs_n, start_m,
+            stride_kn, stride_vk,
+            0, n_full_blocks,
+            qk_scale,
+            MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            PRE_LOAD_V, False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
+            MMA_TYPE,
+            kt_dot_layout, p_dot_layout, v_dot_layout,
+            mma_layout, mma_offs_n_col, mma_offs_m_row,
+        )
 
-        # PRE_LOAD_V: Load V early to allow pipelining with K load and QK computation.
-        if PRE_LOAD_V:
-            v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
-            if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-                v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-            v = gl.load(v_ptrs, mask=v_mask, other=0.0)
-
-        # Load K^T directly as [BLOCK_DMODEL, BLOCK_N].
-        kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
-        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
-        k_t = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
-
-        # Compute QK^T using MMA.
-        kt_dot = gl.convert_layout(k_t, kt_dot_layout)
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
-        qk = do_mma(MMA_TYPE, q_dot, kt_dot, qk)
-
-        # Scale QK scores.
-        qk = qk * qk_scale
-
-        # Apply causal mask.
-        if IS_CAUSAL:
-            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
-            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
-            causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
-            causal_mask = causal_offs_m[:, None] >= causal_boundary
-            qk = gl.where(causal_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
-                                                    dtype=gl.float32, layout=mma_layout))
-
-        # Mask out-of-bounds K positions.
-        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
-        bound_mask = bound_offs[None, :] < MAX_SEQLENS_K
-        qk = gl.where(bound_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
-                                               dtype=gl.float32, layout=mma_layout))
-
-        # Online softmax: compute new running max.
-        m_ij = gl.max(qk, axis=1)
-        m_new = gl.maximum(m_i, m_ij)
-
-        # Compute exp2(qk - m_new) for numerical stability.
-        p = gl.exp2(qk - m_new[:, None])
-
-        # Update running sum.
-        l_ij = gl.sum(p, axis=1)
-        alpha = gl.exp2(m_i - m_new)
-        l_i = l_i * alpha + l_ij
-
-        # Scale accumulator by alpha.
-        acc = acc * alpha[:, None]
-
-        # Update running max.
-        m_i = m_new
-
-        # Load V tile [BLOCK_N, BLOCK_DMODEL] if not pre-loaded.
-        if not PRE_LOAD_V:
-            v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
-            if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-                v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-            v = gl.load(v_ptrs, mask=v_mask, other=0.0)
-
-        # Accumulate P @ V using MMA.
-        # P is [BLOCK_M, BLOCK_N] (fp32), V is [BLOCK_N, BLOCK_DMODEL].
-        # Convert P to match V's dtype for MMA.
-        p_cast = p.to(v.dtype)
-        p_dot = gl.convert_layout(p_cast, p_dot_layout)
-        v_dot = gl.convert_layout(v, v_dot_layout)
-        acc = do_mma(MMA_TYPE, p_dot, v_dot, acc)
-
-        # Advance pointers.
-        kt_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vk
+    # Process masked blocks (need causal and/or boundary masking).
+    if masked_blocks > 0:
+        acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
+            acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+            kt_offs_d, kt_offs_n, start_m,
+            stride_kn, stride_vk,
+            n_full_blocks, n_blocks,
+            qk_scale,
+            MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            PRE_LOAD_V, True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
+            MMA_TYPE,
+            kt_dot_layout, p_dot_layout, v_dot_layout,
+            mma_layout, mma_offs_n_col, mma_offs_m_row,
+        )
 
     # Normalize by softmax sum.
     acc = acc / l_i[:, None]
