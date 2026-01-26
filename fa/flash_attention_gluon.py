@@ -195,16 +195,24 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     qk_scale: gl.constexpr = SM_SCALE * 1.44269504089
 
     # Number of K/V blocks to process.
-    n_blocks: gl.constexpr = (MAX_SEQLENS_K + BLOCK_N - 1) // BLOCK_N
+    # For causal attention, we can skip blocks where all positions are masked.
+    n_blocks_total: gl.constexpr = (MAX_SEQLENS_K + BLOCK_N - 1) // BLOCK_N
+    if IS_CAUSAL:
+        # Causal boundary: positions where m >= n + (seqlen_q - seqlen_k)
+        # For block starting at start_n, all masked if: (start_m + 1) * BLOCK_M <= start_n + (seqlen_q - seqlen_k)
+        # Rearranging: start_n >= (start_m + 1) * BLOCK_M + seqlen_k - seqlen_q
+        # So we only need blocks where start_n < causal_block_limit
+        causal_block_limit = (start_m + 1) * BLOCK_M + MAX_SEQLENS_K - MAX_SEQLENS_Q
+        n_blocks = gl.minimum(n_blocks_total, (causal_block_limit + BLOCK_N - 1) // BLOCK_N)
+    else:
+        n_blocks = n_blocks_total
 
     # MMA-compatible slice layouts for masking (defined outside loop to avoid redefinition).
     mma_offs_n_col: gl.constexpr = gl.SliceLayout(dim=0, parent=qk_mma_layout)
     mma_offs_m_row: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_mma_layout)
 
-    # Main loop over K/V blocks.
-    # Note: Gluon doesn't support `continue` in static_range, so we rely on
-    # the causal mask to mask out blocks that would have been skipped.
-    for block_n in gl.static_range(n_blocks):
+    # Main loop over K/V blocks (dynamic range for runtime bounds).
+    for block_n in range(n_blocks):
         start_n = block_n * BLOCK_N
         offs_n = start_n + gl.arange(0, BLOCK_N, layout=offs_n_row_layout)
 
@@ -274,10 +282,10 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         v = gl.load(v_ptrs, mask=k_mask, other=0.0)
 
         # Accumulate P @ V using MMA.
-        # P is [BLOCK_M, BLOCK_N] (fp32), V is [BLOCK_N, BLOCK_DMODEL] (fp16).
-        # Convert P to fp16 for MMA.
-        p_f16 = p.to(gl.float16)
-        p_dot = gl.convert_layout(p_f16, p_dot_layout)
+        # P is [BLOCK_M, BLOCK_N] (fp32), V is [BLOCK_N, BLOCK_DMODEL].
+        # Convert P to match V's dtype for MMA.
+        p_cast = p.to(v.dtype)
+        p_dot = gl.convert_layout(p_cast, p_dot_layout)
         v_dot = gl.convert_layout(v, v_dot_layout)
         if MMA_TYPE == "wmma_rdna3":
             acc = wmma_rdna3(p_dot, v_dot, acc)

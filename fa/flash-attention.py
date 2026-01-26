@@ -1530,7 +1530,8 @@ def test_op_fwd(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, 
 ])
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('layout', ['bhsd', 'bshd'])
-def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16):
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype):
     """Test Gluon Flash Attention implementation."""
     global USE_GLUON
     USE_GLUON = True
@@ -1573,7 +1574,7 @@ def test_op_fwd_gluon(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype
             nan_mask = torch.isnan(p)
             p[nan_mask == 1] = 0
 
-        ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v_ref)
+        ref_out = torch.einsum('bhqk,bhkd->bhqd', p.to(dtype), v_ref)
 
         torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
         print("✅ Gluon and Torch match")
