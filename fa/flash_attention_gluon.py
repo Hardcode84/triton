@@ -20,6 +20,7 @@ Optimizations applied:
 - PRE_LOAD_V: V loaded early for pipelining
 - Pointer arithmetic instead of offset recomputation
 - gl.maximum for running max computation
+- Autotuning for BLOCK_M, BLOCK_N, num_warps, PRE_LOAD_V
 """
 
 import torch
@@ -34,6 +35,79 @@ from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
 from triton.experimental.gluon.language._layouts import DotOperandLayout
 
 
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+def is_cdna():
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
+        'gfx950', 'gfx940', 'gfx941', 'gfx942', 'gfx90a', 'gfx908')
+
+
+def is_rdna():
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
+        "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201")
+
+
+def get_mma_type_for_arch(arch: str) -> str:
+    """Get the appropriate MMA type for the given GPU architecture."""
+    if arch.startswith("gfx110"):
+        return "wmma_rdna3"
+    elif arch.startswith("gfx120"):
+        return "wmma_rdna4"
+    elif arch in ("gfx940", "gfx941", "gfx942"):
+        return "mfma_cdna3"
+    elif arch == "gfx950":
+        return "mfma_cdna4"
+    else:
+        raise ValueError(f"Unsupported GPU architecture: {arch}")
+
+
+def get_gluon_cdna_autotune_configs():
+    """Autotune configs for CDNA (MI series) GPUs."""
+    return [
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': True}, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'PRE_LOAD_V': True}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': True}, num_warps=4),
+    ]
+
+
+def get_gluon_rdna_autotune_configs():
+    """Autotune configs for RDNA (RX series) GPUs."""
+    return [
+        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True}, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False}, num_warps=4),
+        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': True}, num_warps=2),
+        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False}, num_warps=2),
+        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'PRE_LOAD_V': True}, num_warps=2),
+        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'PRE_LOAD_V': False}, num_warps=2),
+        # triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'PRE_LOAD_V': True}, num_warps=2),
+        # triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'PRE_LOAD_V': False}, num_warps=2),
+    ]
+
+
+def get_gluon_autotune_configs():
+    """Get autotune configs based on current GPU architecture."""
+    if is_rdna():
+        return get_gluon_rdna_autotune_configs()
+    elif is_cdna():
+        return get_gluon_cdna_autotune_configs()
+    else:
+        # Fallback configs.
+        return [triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False}, num_warps=4)]
+
+
+# Autotune keys: parameters that affect which config is best.
+GLUON_AUTOTUNE_KEYS = ['IS_CAUSAL', 'MAX_SEQLENS_Q', 'MAX_SEQLENS_K', 'ACTUAL_BLOCK_DMODEL', 'HQ', 'HK']
+
+
+@triton.autotune(
+    configs=get_gluon_autotune_configs(),
+    key=GLUON_AUTOTUNE_KEYS,
+)
 @gluon.jit
 def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                    stride_qz, stride_qh, stride_qm, stride_qk,
@@ -58,12 +132,15 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                    ENABLE_DROPOUT: gl.constexpr, RETURN_ENCODED_SOFTMAX: gl.constexpr,
                    USE_ALIBI: gl.constexpr, INT8: gl.constexpr,
                    USE_P_SCALE: gl.constexpr, INT8_KV: gl.constexpr,
-                   MMA_TYPE: gl.constexpr,
-                   num_warps: gl.constexpr):
+                   MMA_TYPE: gl.constexpr):
     """
     Gluon Flash Attention Forward Kernel with configurable AMD MMA.
     Grid: (num_heads_q, num_m_blocks, batch)
+
+    Note: num_warps is set via autotune config, accessed via gl.num_warps().
     """
+    # Get num_warps from runtime (set by autotune).
+    num_warps: gl.constexpr = gl.num_warps()
     # Validate unsupported features at compile time.
     gl.static_assert(not VARLEN, "VARLEN not supported in Gluon implementation")
     gl.static_assert(not INT8, "INT8 not supported in Gluon implementation")
