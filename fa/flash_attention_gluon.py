@@ -63,6 +63,19 @@ def get_mma_type_for_arch(arch: str) -> str:
         raise ValueError(f"Unsupported GPU architecture: {arch}")
 
 
+@gluon.jit
+def do_mma(MMA_TYPE: gl.constexpr, a, b, c):
+    """Dispatch to the appropriate MMA function based on MMA_TYPE."""
+    if MMA_TYPE == "wmma_rdna3":
+        return wmma_rdna3(a, b, c)
+    elif MMA_TYPE == "wmma_rdna4":
+        return wmma_rdna4(a, b, c)
+    elif MMA_TYPE == "mfma_cdna3":
+        return mfma_cdna3(a, b, c)
+    elif MMA_TYPE == "mfma_cdna4":
+        return mfma_cdna4(a, b, c)
+
+
 def get_gluon_cdna_autotune_configs():
     """Autotune configs for CDNA (MI series) GPUs."""
     return [
@@ -271,14 +284,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         # Compute QK^T using MMA.
         kt_dot = gl.convert_layout(k_t, kt_dot_layout)
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
-        if MMA_TYPE == "wmma_rdna3":
-            qk = wmma_rdna3(q_dot, kt_dot, qk)
-        elif MMA_TYPE == "wmma_rdna4":
-            qk = wmma_rdna4(q_dot, kt_dot, qk)
-        elif MMA_TYPE == "mfma_cdna3":
-            qk = mfma_cdna3(q_dot, kt_dot, qk)
-        elif MMA_TYPE == "mfma_cdna4":
-            qk = mfma_cdna4(q_dot, kt_dot, qk)
+        qk = do_mma(MMA_TYPE, q_dot, kt_dot, qk)
 
         # Scale QK scores.
         qk = qk * qk_scale
@@ -329,14 +335,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         p_cast = p.to(v.dtype)
         p_dot = gl.convert_layout(p_cast, p_dot_layout)
         v_dot = gl.convert_layout(v, v_dot_layout)
-        if MMA_TYPE == "wmma_rdna3":
-            acc = wmma_rdna3(p_dot, v_dot, acc)
-        elif MMA_TYPE == "wmma_rdna4":
-            acc = wmma_rdna4(p_dot, v_dot, acc)
-        elif MMA_TYPE == "mfma_cdna3":
-            acc = mfma_cdna3(p_dot, v_dot, acc)
-        elif MMA_TYPE == "mfma_cdna4":
-            acc = mfma_cdna4(p_dot, v_dot, acc)
+        acc = do_mma(MMA_TYPE, p_dot, v_dot, acc)
 
         # Advance pointers.
         kt_ptrs += BLOCK_N * stride_kn
