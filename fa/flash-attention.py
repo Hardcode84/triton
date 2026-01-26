@@ -31,24 +31,10 @@ import triton.language as tl
 from utils.benchmark_utils import get_available_models, get_model_configs
 
 # Gluon implementation.
-from flash_attention_gluon import gluon_attn_fwd
+from flash_attention_gluon import gluon_attn_fwd, get_mma_type_for_arch
 
 # Global flag to switch between implementations.
 USE_GLUON = False
-
-
-def get_mma_type_for_arch(arch: str) -> str:
-    """Detect MMA type based on GPU architecture."""
-    if arch.startswith("gfx110"):  # RDNA3: gfx1100, gfx1101, gfx1102, gfx1103.
-        return "wmma_rdna3"
-    elif arch.startswith("gfx120"):  # RDNA4: gfx1200, gfx1201.
-        return "wmma_rdna4"
-    elif arch in ("gfx940", "gfx941", "gfx942"):  # CDNA3.
-        return "mfma_cdna3"
-    elif arch == "gfx950":  # CDNA4.
-        return "mfma_cdna4"
-    else:
-        raise ValueError(f"Unsupported GPU architecture for Gluon: {arch}")
 
 
 @triton.jit
@@ -1197,13 +1183,15 @@ class _attention(torch.autograd.Function):
         atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
 
         if USE_GLUON:
-            # Gluon kernel with fixed block sizes (no autotune).
+            # Gluon kernel with autotuning.
             # Detect GPU architecture and select appropriate MMA type.
             arch = triton.runtime.driver.active.get_current_target().arch
             mma_type = get_mma_type_for_arch(arch)
 
-            BLOCK_M, BLOCK_N = 64, 64
-            gluon_grid = (nheads_q, triton.cdiv(metadata.max_seqlens_q, BLOCK_M), batch)
+            # Dynamic grid based on autotuned BLOCK_M.
+            def gluon_grid(META):
+                return (nheads_q, triton.cdiv(metadata.max_seqlens_q, META['BLOCK_M']), batch)
+
             gluon_attn_fwd[gluon_grid](
                 q, k, v, metadata.bias, metadata.sm_scale, M, o,
                 *q_strides, *k_strides, *v_strides, *o_strides,
@@ -1213,18 +1201,16 @@ class _attention(torch.autograd.Function):
                 alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
                 MAX_SEQLENS_Q=metadata.max_seqlens_q, MAX_SEQLENS_K=metadata.max_seqlens_k,
                 IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                 USE_BIAS=False if metadata.bias is None else True,
                 USE_ALIBI=False if metadata.alibi_slopes is None else True,
                 ENABLE_DROPOUT=metadata.dropout_p > 0.0,
                 RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
                 USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
                 PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
-                NUM_CU=NUM_CU, GRID_CU_MULTIP=2, atomic_counter=atomic_counter, B=batch, PRE_LOAD_V=False,
+                NUM_CU=NUM_CU, GRID_CU_MULTIP=2, atomic_counter=atomic_counter, B=batch,
                 MMA_TYPE=mma_type,
-                num_warps=4,
             )
-            best_config = None
+            best_config = gluon_attn_fwd.best_config
         else:
             # Standard Triton kernel with autotune.
             attn_fwd[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
@@ -1241,6 +1227,8 @@ class _attention(torch.autograd.Function):
                          PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
                          NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
             best_config = attn_fwd.best_config
+
+        print(f"Best config: {best_config}")
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
