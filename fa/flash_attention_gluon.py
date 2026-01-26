@@ -185,6 +185,9 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
+    # Convert Q to dot operand layout once (hoisted from loop).
+    q_dot = gl.convert_layout(q, q_dot_layout)
+
     # Initialize accumulators with MMA-compatible slice layout.
     mma_m_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=qk_mma_layout)
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
@@ -228,8 +231,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         # Transpose K: [BLOCK_N, BLOCK_DMODEL] -> [BLOCK_DMODEL, BLOCK_N].
         k_t = gl.permute(k, [1, 0])
 
-        # Convert to dot operand layouts for MMA.
-        q_dot = gl.convert_layout(q, q_dot_layout)
+        # Convert K^T to dot operand layout for MMA (Q already converted outside loop).
         kt_dot = gl.convert_layout(k_t, kt_dot_layout)
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=qk_mma_layout)
         if MMA_TYPE == "wmma_rdna3":
