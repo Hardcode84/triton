@@ -325,7 +325,13 @@ def attn_fwd_inner_pipelined(
     # Wait count is constant: (NUM_STAGES - 1) * 2 loads remain in flight.
     WAIT_STAGES: gl.constexpr = (NUM_STAGES - 1) * 2
     for block_n in range(block_start, block_end):
-        stage = block_n % NUM_STAGES
+        # stage = block_n % NUM_STAGES
+        kt_smem_stage = kt_smem_stages[0]
+        v_smem_stage = v_smem_stages[0]
+        for s in gl.static_range(NUM_STAGES):
+            if block_n % NUM_STAGES == s:
+                kt_smem_stage = kt_smem_stages[s]
+                v_smem_stage = v_smem_stages[s]
         start_n = block_n * BLOCK_N
 
         # Wait for this stage's loads to complete.
@@ -334,7 +340,7 @@ def attn_fwd_inner_pipelined(
         # Compute attention for this block.
         acc, l_i, m_i = compute_block(
             acc, l_i, m_i, q_dot,
-            kt_smem_stages[stage], v_smem_stages[stage],
+            kt_smem_stage, v_smem_stage,
             start_n, start_m,
             qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
             BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
@@ -350,7 +356,7 @@ def attn_fwd_inner_pipelined(
             future_kt_ptrs = kt_ptrs + (future_block - block_start) * BLOCK_N * stride_kn
             future_v_ptrs = v_ptrs + (future_block - block_start) * BLOCK_N * stride_vk
             issue_async_load(
-                kt_smem_stages[stage], v_smem_stages[stage],
+                kt_smem_stage, v_smem_stage,
                 future_kt_ptrs, future_v_ptrs, future_start_n,
                 offs_n, offs_d, kt_offs_d, kt_offs_n,
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
