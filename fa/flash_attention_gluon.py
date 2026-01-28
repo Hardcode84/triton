@@ -340,7 +340,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     v_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=mma_layout, k_width=k_width)
 
     blocked_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1], threads_per_warp=[threads_per_warp, 1],
+        size_per_thread=[1, 8], threads_per_warp=[threads_per_warp // 4, 4],
         warps_per_cta=[num_warps, 1], order=[1, 0])
     kt_blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1], threads_per_warp=[1, threads_per_warp],
