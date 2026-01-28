@@ -614,42 +614,42 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + kt_offs_n[None, :] * stride_kn
     v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
 
-    # Allocate shared memory for K^T [BLOCK_DMODEL, BLOCK_N] and V [BLOCK_N, BLOCK_DMODEL].
-    # Use SwizzledSharedLayout for bank conflict reduction.
-    kt_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[0, 1])
-    v_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[1, 0])
-
     # Use pipelined path for CDNA4 with NUM_STAGES > 1.
     USE_PIPELINED: gl.constexpr = (MMA_TYPE == "mfma_cdna4") and (NUM_STAGES > 1)
 
     if USE_PIPELINED:
+        # Async copy requires simple swizzling (within warp boundary).
+        # Use vec=1, per_phase=1, max_phase=1 for async copy compatibility.
+        kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
+        v_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+
         # Allocate multi-buffered shared memory for pipelining.
         # Explicit allocation for each supported NUM_STAGES value.
         if NUM_STAGES == 2:
-            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
-            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
+            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
             kt_smem_stages = (kt_smem_0, kt_smem_1)
             v_smem_stages = (v_smem_0, v_smem_1)
         elif NUM_STAGES == 3:
-            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
-            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
-            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
+            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
+            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
             kt_smem_stages = (kt_smem_0, kt_smem_1, kt_smem_2)
             v_smem_stages = (v_smem_0, v_smem_1, v_smem_2)
         elif NUM_STAGES == 4:
-            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            kt_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
-            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
-            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
-            v_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            kt_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
+            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
+            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
+            v_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
             kt_smem_stages = (kt_smem_0, kt_smem_1, kt_smem_2, kt_smem_3)
             v_smem_stages = (v_smem_0, v_smem_1, v_smem_2, v_smem_3)
         else:
@@ -689,7 +689,9 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
     else:
-        # Non-pipelined path: single-buffered shared memory.
+        # Non-pipelined path: single-buffered shared memory with optimized swizzling.
+        kt_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[0, 1])
+        v_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[1, 0])
         kt_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
         v_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
 
