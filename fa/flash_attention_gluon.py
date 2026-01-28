@@ -15,11 +15,13 @@ MMA_TYPE options:
 - "mfma_cdna4": AMD CDNA4 MFMA (gfx950)
 
 Optimizations applied:
+- Q, K, V loaded through shared memory (global->shared->registers)
 - Q layout conversion hoisted out of loop
 - K loaded with transposed layout directly (no permute)
 - PRE_LOAD_V: V loaded early for pipelining
 - Pointer arithmetic instead of offset recomputation
 - gl.maximum for running max computation
+- Full/masked block split to skip masking for most blocks
 - Autotuning for BLOCK_M, BLOCK_N, num_warps, PRE_LOAD_V
 """
 
@@ -82,37 +84,45 @@ def attn_fwd_inner(
     kt_offs_d, kt_offs_n, start_m,
     stride_kn, stride_vk,
     block_start, block_end,
+    kt_smem, v_smem,
     qk_scale: gl.constexpr,
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,
     PRE_LOAD_V: gl.constexpr, MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
     MMA_TYPE: gl.constexpr,
+    kt_blocked_layout: gl.constexpr, blocked_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
-    """Inner attention loop over K/V blocks."""
+    """Inner attention loop over K/V blocks with shared memory staging."""
     for block_n in range(block_start, block_end):
         start_n = block_n * BLOCK_N
 
         # PRE_LOAD_V: Load V early to allow pipelining.
+        # Global load -> shared store -> shared load.
         if PRE_LOAD_V:
             if MASK_STEPS:
                 v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
                 if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
                     v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-                v = gl.load(v_ptrs, mask=v_mask, other=0.0)
+                v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
-                v = gl.load(v_ptrs)
+                v_global = gl.load(v_ptrs)
+            v_smem.store(v_global)
 
-        # Load K^T directly as [BLOCK_DMODEL, BLOCK_N].
+        # Load K^T: global -> shared -> registers.
         if MASK_STEPS:
             kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
             if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
                 kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
-            k_t = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
+            kt_global = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
         else:
-            k_t = gl.load(kt_ptrs)
+            kt_global = gl.load(kt_ptrs)
+        kt_smem.store(kt_global)
+
+        # Load K^T from shared memory.
+        k_t = kt_smem.load(kt_blocked_layout)
 
         # Compute QK^T using MMA.
         kt_dot = gl.convert_layout(k_t, kt_dot_layout)
@@ -156,15 +166,19 @@ def attn_fwd_inner(
         # Update running max.
         m_i = m_new
 
-        # Load V tile [BLOCK_N, BLOCK_DMODEL] if not pre-loaded.
+        # Load V tile if not pre-loaded: global -> shared -> registers.
         if not PRE_LOAD_V:
             if MASK_STEPS:
                 v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
                 if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
                     v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-                v = gl.load(v_ptrs, mask=v_mask, other=0.0)
+                v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
-                v = gl.load(v_ptrs)
+                v_global = gl.load(v_ptrs)
+            v_smem.store(v_global)
+
+        # Load V from shared memory.
+        v = v_smem.load(blocked_layout)
 
         # Accumulate P @ V using MMA.
         p_cast = p.to(v.dtype)
@@ -333,12 +347,18 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     k_base = K + off_z * stride_kz + off_h_k * stride_kh
     v_base = V + off_z * stride_vz + off_h_k * stride_vh
 
-    # Load Q tile [BLOCK_M, BLOCK_DMODEL].
+    # Allocate shared memory for Q [BLOCK_M, BLOCK_DMODEL].
+    q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    q_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_M, BLOCK_DMODEL], layout=q_smem_layout)
+
+    # Load Q tile: global -> shared -> registers.
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q_mask = offs_m[:, None] < MAX_SEQLENS_Q
     if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
         q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-    q = gl.load(q_ptrs, mask=q_mask, other=0.0)
+    q_global = gl.load(q_ptrs, mask=q_mask, other=0.0)
+    q_smem.store(q_global)
+    q = q_smem.load(blocked_layout)
 
     # Convert Q to dot operand layout once (hoisted from loop).
     q_dot = gl.convert_layout(q, q_dot_layout)
@@ -378,6 +398,13 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + kt_offs_n[None, :] * stride_kn
     v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
 
+    # Allocate shared memory for K^T [BLOCK_DMODEL, BLOCK_N] and V [BLOCK_N, BLOCK_DMODEL].
+    # Use SwizzledSharedLayout for bank conflict reduction.
+    kt_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
+    v_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    kt_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+    v_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+
     # Process full blocks (no masking needed - faster).
     if n_full_blocks > 0:
         acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
@@ -385,11 +412,13 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             kt_offs_d, kt_offs_n, start_m,
             stride_kn, stride_vk,
             0, n_full_blocks,
+            kt_smem, v_smem,
             qk_scale,
             MAX_SEQLENS_Q, MAX_SEQLENS_K,
             BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
             PRE_LOAD_V, False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
             MMA_TYPE,
+            kt_blocked_layout, blocked_layout,
             kt_dot_layout, p_dot_layout, v_dot_layout,
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
@@ -401,11 +430,13 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             kt_offs_d, kt_offs_n, start_m,
             stride_kn, stride_vk,
             n_full_blocks, n_blocks,
+            kt_smem, v_smem,
             qk_scale,
             MAX_SEQLENS_Q, MAX_SEQLENS_K,
             BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
             PRE_LOAD_V, True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
             MMA_TYPE,
+            kt_blocked_layout, blocked_layout,
             kt_dot_layout, p_dot_layout, v_dot_layout,
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
