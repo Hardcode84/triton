@@ -415,8 +415,8 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
 
     # Allocate shared memory for K^T [BLOCK_DMODEL, BLOCK_N] and V [BLOCK_N, BLOCK_DMODEL].
     # Use SwizzledSharedLayout for bank conflict reduction.
-    kt_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
-    v_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    kt_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[0, 1])
+    v_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[1, 0])
     kt_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
     v_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
 
