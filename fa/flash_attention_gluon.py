@@ -311,18 +311,18 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
 
     # Configure MMA layout based on MMA_TYPE.
     if MMA_TYPE == "wmma_rdna3":
-        mma_layout: gl.constexpr = AMDWMMALayout(version=1, transposed=False,
+        mma_layout: gl.constexpr = AMDWMMALayout(version=1, transposed=True,
                                                   warps_per_cta=[num_warps, 1], instr_shape=[16, 16, 16])
         k_width: gl.constexpr = 16
         threads_per_warp: gl.constexpr = 32
     elif MMA_TYPE == "wmma_rdna4":
-        mma_layout: gl.constexpr = AMDWMMALayout(version=2, transposed=False,
+        mma_layout: gl.constexpr = AMDWMMALayout(version=2, transposed=True,
                                                   warps_per_cta=[num_warps, 1], instr_shape=[16, 16, 16])
         k_width: gl.constexpr = 16
         threads_per_warp: gl.constexpr = 32
     elif MMA_TYPE == "mfma_cdna3":
         mma_layout: gl.constexpr = AMDMFMALayout(version=3, instr_shape=[16, 16, 16],
-                                                  transposed=False, warps_per_cta=[num_warps, 1])
+                                                  transposed=True, warps_per_cta=[num_warps, 1])
         k_width: gl.constexpr = 4
         threads_per_warp: gl.constexpr = 64
     elif MMA_TYPE == "mfma_cdna4":

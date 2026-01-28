@@ -2235,7 +2235,7 @@ def parse_args():
         "-persistent", nargs='?', const='fixed', choices=['fixed', 'dynamic'], default=None,
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.")
     parser.add_argument("-gluon", action='store_true', default=False,
-                        help="Use the Gluon implementation of Flash Attention (experimental stub).")
+                        help="Use the Gluon implementation of Flash Attention.")
     return parser.parse_args()
 
 
@@ -2247,7 +2247,7 @@ def main():
     args = parse_args()
     USE_GLUON = args.gluon
     if USE_GLUON:
-        print("Using Gluon implementation (experimental stub)")
+        print("Using Gluon implementation")
     custom_config = False
     assert args.layout == 'thd' or not args.equal_seqlens or args.model, \
            "Equal sequence lengths arg must be used with the thd layout or a model config."
