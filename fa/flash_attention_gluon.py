@@ -34,6 +34,7 @@ from triton.experimental.gluon.language.amd.rdna3 import wmma as wmma_rdna3
 from triton.experimental.gluon.language.amd.rdna4 import wmma as wmma_rdna4
 from triton.experimental.gluon.language.amd.cdna3 import mfma as mfma_cdna3
 from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
 from triton.experimental.gluon.language._layouts import DotOperandLayout
 
 
@@ -193,30 +194,203 @@ def attn_fwd_inner(
     return acc, l_i, m_i, kt_ptrs, v_ptrs
 
 
+@gluon.jit
+def issue_async_load(
+    kt_smem, v_smem, kt_ptrs, v_ptrs, start_n,
+    offs_n, offs_d, kt_offs_d, kt_offs_n,
+    MASK_STEPS: gl.constexpr,
+    MAX_SEQLENS_K: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr, ACTUAL_BLOCK_DMODEL: gl.constexpr,
+):
+    """Issue async loads for K^T and V into shared memory."""
+    if MASK_STEPS:
+        kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
+        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+            kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
+        cdna4_async.global_load_to_shared(kt_smem, kt_ptrs, mask=kt_mask, other=0.0)
+        v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
+        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
+            v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+        cdna4_async.global_load_to_shared(v_smem, v_ptrs, mask=v_mask, other=0.0)
+    else:
+        cdna4_async.global_load_to_shared(kt_smem, kt_ptrs)
+        cdna4_async.global_load_to_shared(v_smem, v_ptrs)
+
+
+@gluon.jit
+def compute_block(
+    acc, l_i, m_i, q_dot, kt_smem, v_smem, start_n, start_m,
+    qk_scale: gl.constexpr,
+    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
+    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+    MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
+    kt_blocked_layout: gl.constexpr, blocked_layout: gl.constexpr,
+    kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
+    mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
+):
+    """Compute attention for one block using data from shared memory."""
+    # Load K^T from shared memory.
+    k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_blocked_layout)
+
+    # Compute QK^T using MMA.
+    kt_dot = gl.convert_layout(k_t, kt_dot_layout)
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+    qk = do_mma("mfma_cdna4", q_dot, kt_dot, qk)
+
+    # Scale QK scores.
+    qk = qk * qk_scale
+
+    # Apply causal mask (only for masked blocks).
+    if MASK_STEPS and IS_CAUSAL:
+        causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
+        causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
+        causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
+        causal_mask = causal_offs_m[:, None] >= causal_boundary
+        qk = gl.where(causal_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
+                                                dtype=gl.float32, layout=mma_layout))
+
+    # Mask out-of-bounds K positions (only for masked blocks).
+    if MASK_STEPS:
+        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
+        bound_mask = bound_offs[None, :] < MAX_SEQLENS_K
+        qk = gl.where(bound_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
+                                               dtype=gl.float32, layout=mma_layout))
+
+    # Online softmax: compute new running max.
+    m_ij = gl.max(qk, axis=1)
+    m_new = gl.maximum(m_i, m_ij)
+
+    # Compute exp2(qk - m_new) for numerical stability.
+    p = gl.exp2(qk - m_new[:, None])
+
+    # Update running sum.
+    l_ij = gl.sum(p, axis=1)
+    alpha = gl.exp2(m_i - m_new)
+    l_i = l_i * alpha + l_ij
+
+    # Scale accumulator by alpha.
+    acc = acc * alpha[:, None]
+
+    # Update running max.
+    m_i = m_new
+
+    # Load V from shared memory.
+    v = cdna4_async.load_shared_relaxed(v_smem, blocked_layout)
+
+    # Accumulate P @ V using MMA.
+    p_cast = p.to(v.dtype)
+    p_dot = gl.convert_layout(p_cast, p_dot_layout)
+    v_dot = gl.convert_layout(v, v_dot_layout)
+    acc = do_mma("mfma_cdna4", p_dot, v_dot, acc)
+
+    return acc, l_i, m_i
+
+
+@gluon.jit
+def attn_fwd_inner_pipelined(
+    acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+    kt_offs_d, kt_offs_n, start_m,
+    stride_kn, stride_vk,
+    block_start, block_end,
+    kt_smem_stages, v_smem_stages,
+    qk_scale: gl.constexpr,
+    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
+    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr,
+    ACTUAL_BLOCK_DMODEL: gl.constexpr,
+    MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    kt_blocked_layout: gl.constexpr, blocked_layout: gl.constexpr,
+    kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
+    mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
+):
+    """
+    Pipelined inner attention loop for CDNA4 using async memory operations.
+    NUM_STAGES controls the pipeline depth (number of buffers).
+    """
+    # Prologue: issue async loads for first NUM_STAGES blocks.
+    for stage in gl.static_range(NUM_STAGES):
+        block_n = block_start + stage
+        if block_n < block_end:
+            start_n = block_n * BLOCK_N
+            stage_kt_ptrs = kt_ptrs + stage * BLOCK_N * stride_kn
+            stage_v_ptrs = v_ptrs + stage * BLOCK_N * stride_vk
+            issue_async_load(
+                kt_smem_stages[stage], v_smem_stages[stage],
+                stage_kt_ptrs, stage_v_ptrs, start_n,
+                offs_n, offs_d, kt_offs_d, kt_offs_n,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            )
+
+    # Main loop: process blocks with full pipeline.
+    # Wait count is constant: (NUM_STAGES - 1) * 2 loads remain in flight.
+    WAIT_STAGES: gl.constexpr = (NUM_STAGES - 1) * 2
+    for block_n in range(block_start, block_end):
+        stage = block_n % NUM_STAGES
+        start_n = block_n * BLOCK_N
+
+        # Wait for this stage's loads to complete.
+        cdna4_async.async_wait(WAIT_STAGES)
+
+        # Compute attention for this block.
+        acc, l_i, m_i = compute_block(
+            acc, l_i, m_i, q_dot,
+            kt_smem_stages[stage], v_smem_stages[stage],
+            start_n, start_m,
+            qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+            kt_blocked_layout, blocked_layout,
+            kt_dot_layout, p_dot_layout, v_dot_layout,
+            mma_layout, mma_offs_n_col, mma_offs_m_row,
+        )
+
+        # Issue async load for future block (block_n + NUM_STAGES).
+        future_block = block_n + NUM_STAGES
+        if future_block < block_end:
+            future_start_n = future_block * BLOCK_N
+            future_kt_ptrs = kt_ptrs + (future_block - block_start) * BLOCK_N * stride_kn
+            future_v_ptrs = v_ptrs + (future_block - block_start) * BLOCK_N * stride_vk
+            issue_async_load(
+                kt_smem_stages[stage], v_smem_stages[stage],
+                future_kt_ptrs, future_v_ptrs, future_start_n,
+                offs_n, offs_d, kt_offs_d, kt_offs_n,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            )
+
+    # Final wait to ensure all loads are done.
+    cdna4_async.async_wait(0)
+
+    # Update pointers past all processed blocks.
+    blocks_processed = block_end - block_start
+    kt_ptrs = kt_ptrs + blocks_processed * BLOCK_N * stride_kn
+    v_ptrs = v_ptrs + blocks_processed * BLOCK_N * stride_vk
+
+    return acc, l_i, m_i, kt_ptrs, v_ptrs
+
+
 def get_gluon_cdna_autotune_configs():
     """Autotune configs for CDNA (MI series) GPUs."""
     return [
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'waves_per_eu': 2}, num_warps=8),
-        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': True}, num_warps=4),
-        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False}, num_warps=4),
-        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True}, num_warps=4),
-        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False}, num_warps=4),
-        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'PRE_LOAD_V': True}, num_warps=4),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': True}, num_warps=4),
+        # Pipelined configs with NUM_STAGES > 1 (CDNA4 only).
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 2, 'waves_per_eu': 2}, num_warps=8),
+        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 2}, num_warps=4),
+        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 3}, num_warps=4),
+        # Non-pipelined configs (NUM_STAGES=1).
+        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 1, 'waves_per_eu': 2}, num_warps=8),
+        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': True, 'NUM_STAGES': 1}, num_warps=4),
+        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=4),
+        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True, 'NUM_STAGES': 1}, num_warps=4),
+        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=4),
     ]
 
 
 def get_gluon_rdna_autotune_configs():
     """Autotune configs for RDNA (RX series) GPUs."""
     return [
-        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True}, num_warps=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False}, num_warps=4),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': True}, num_warps=2),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False}, num_warps=2),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'PRE_LOAD_V': True}, num_warps=2),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'PRE_LOAD_V': False}, num_warps=2),
-        # triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'PRE_LOAD_V': True}, num_warps=2),
-        # triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'PRE_LOAD_V': False}, num_warps=2),
+        # RDNA uses non-pipelined path (NUM_STAGES=1).
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=4),
+        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True, 'NUM_STAGES': 1}, num_warps=2),
+        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': True, 'NUM_STAGES': 1}, num_warps=2),
+        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=2),
     ]
 
 
@@ -228,7 +402,7 @@ def get_gluon_autotune_configs():
         return get_gluon_cdna_autotune_configs()
     else:
         # Fallback configs.
-        return [triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False}, num_warps=4)]
+        return [triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=4)]
 
 
 # Autotune keys: parameters that affect which config is best.
@@ -263,7 +437,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                    ENABLE_DROPOUT: gl.constexpr, RETURN_ENCODED_SOFTMAX: gl.constexpr,
                    USE_ALIBI: gl.constexpr, INT8: gl.constexpr,
                    USE_P_SCALE: gl.constexpr, INT8_KV: gl.constexpr,
-                   MMA_TYPE: gl.constexpr):
+                   MMA_TYPE: gl.constexpr, NUM_STAGES: gl.constexpr):
     """
     Gluon Flash Attention Forward Kernel with configurable AMD MMA.
     Grid: (num_heads_q, num_m_blocks, batch)
@@ -417,44 +591,118 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # Use SwizzledSharedLayout for bank conflict reduction.
     kt_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[0, 1])
     v_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[1, 0])
-    kt_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
-    v_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
 
-    # Process full blocks (no masking needed - faster).
-    if n_full_blocks > 0:
-        acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
-            acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
-            kt_offs_d, kt_offs_n, start_m,
-            stride_kn, stride_vk,
-            0, n_full_blocks,
-            kt_smem, v_smem,
-            qk_scale,
-            MAX_SEQLENS_Q, MAX_SEQLENS_K,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            PRE_LOAD_V, False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
-            MMA_TYPE,
-            kt_blocked_layout, blocked_layout,
-            kt_dot_layout, p_dot_layout, v_dot_layout,
-            mma_layout, mma_offs_n_col, mma_offs_m_row,
-        )
+    # Use pipelined path for CDNA4 with NUM_STAGES > 1.
+    USE_PIPELINED: gl.constexpr = (MMA_TYPE == "mfma_cdna4") and (NUM_STAGES > 1)
 
-    # Process masked blocks (need causal and/or boundary masking).
-    if masked_blocks > 0:
-        acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
-            acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
-            kt_offs_d, kt_offs_n, start_m,
-            stride_kn, stride_vk,
-            n_full_blocks, n_blocks,
-            kt_smem, v_smem,
-            qk_scale,
-            MAX_SEQLENS_Q, MAX_SEQLENS_K,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            PRE_LOAD_V, True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
-            MMA_TYPE,
-            kt_blocked_layout, blocked_layout,
-            kt_dot_layout, p_dot_layout, v_dot_layout,
-            mma_layout, mma_offs_n_col, mma_offs_m_row,
-        )
+    if USE_PIPELINED:
+        # Allocate multi-buffered shared memory for pipelining.
+        # Explicit allocation for each supported NUM_STAGES value.
+        if NUM_STAGES == 2:
+            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            kt_smem_stages = (kt_smem_0, kt_smem_1)
+            v_smem_stages = (v_smem_0, v_smem_1)
+        elif NUM_STAGES == 3:
+            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            kt_smem_stages = (kt_smem_0, kt_smem_1, kt_smem_2)
+            v_smem_stages = (v_smem_0, v_smem_1, v_smem_2)
+        elif NUM_STAGES == 4:
+            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            kt_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            v_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+            kt_smem_stages = (kt_smem_0, kt_smem_1, kt_smem_2, kt_smem_3)
+            v_smem_stages = (v_smem_0, v_smem_1, v_smem_2, v_smem_3)
+        else:
+            gl.static_assert(False, "NUM_STAGES must be 2, 3, or 4 for pipelined path")
+
+        # Process full blocks (no masking needed - faster).
+        if n_full_blocks > 0:
+            acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner_pipelined(
+                acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+                kt_offs_d, kt_offs_n, start_m,
+                stride_kn, stride_vk,
+                0, n_full_blocks,
+                kt_smem_stages, v_smem_stages,
+                qk_scale,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
+                NUM_STAGES,
+                kt_blocked_layout, blocked_layout,
+                kt_dot_layout, p_dot_layout, v_dot_layout,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
+            )
+
+        # Process masked blocks (need causal and/or boundary masking).
+        if masked_blocks > 0:
+            acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner_pipelined(
+                acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+                kt_offs_d, kt_offs_n, start_m,
+                stride_kn, stride_vk,
+                n_full_blocks, n_blocks,
+                kt_smem_stages, v_smem_stages,
+                qk_scale,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
+                NUM_STAGES,
+                kt_blocked_layout, blocked_layout,
+                kt_dot_layout, p_dot_layout, v_dot_layout,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
+            )
+    else:
+        # Non-pipelined path: single-buffered shared memory.
+        kt_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_smem_layout)
+        v_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_smem_layout)
+
+        # Process full blocks (no masking needed - faster).
+        if n_full_blocks > 0:
+            acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
+                acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+                kt_offs_d, kt_offs_n, start_m,
+                stride_kn, stride_vk,
+                0, n_full_blocks,
+                kt_smem, v_smem,
+                qk_scale,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                PRE_LOAD_V, False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
+                MMA_TYPE,
+                kt_blocked_layout, blocked_layout,
+                kt_dot_layout, p_dot_layout, v_dot_layout,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
+            )
+
+        # Process masked blocks (need causal and/or boundary masking).
+        if masked_blocks > 0:
+            acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner(
+                acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
+                kt_offs_d, kt_offs_n, start_m,
+                stride_kn, stride_vk,
+                n_full_blocks, n_blocks,
+                kt_smem, v_smem,
+                qk_scale,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                PRE_LOAD_V, True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
+                MMA_TYPE,
+                kt_blocked_layout, blocked_layout,
+                kt_dot_layout, p_dot_layout, v_dot_layout,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
+            )
 
     # Normalize by softmax sum.
     acc = acc / l_i[:, None]
