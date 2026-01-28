@@ -196,21 +196,50 @@ def attn_fwd_inner(
 
 @gluon.jit
 def issue_async_load(
-    kt_smem, v_smem, kt_ptrs, v_ptrs, start_n,
-    offs_n, offs_d, kt_offs_d, kt_offs_n,
+    kt_smem, v_smem, k_base, v_base, start_n,
+    stride_kn, stride_kk, stride_vk, stride_vn,
     MASK_STEPS: gl.constexpr,
     MAX_SEQLENS_K: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr, ACTUAL_BLOCK_DMODEL: gl.constexpr,
+    BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr, ACTUAL_BLOCK_DMODEL: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
-    """Issue async loads for K^T and V into shared memory."""
+    """Issue async loads for K^T and V into shared memory.
+
+    Uses layouts compatible with async copy (size_per_thread * bits = 128).
+    For fp16, size_per_thread=8 gives 128 bits.
+    """
+    # K^T layout [BLOCK_DMODEL, BLOCK_N]: size_per_thread=[1, 8] for 128 bits with fp16.
+    kt_async_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8], threads_per_warp=[8, 8],
+        warps_per_cta=[num_warps, 1], order=[1, 0])
+    kt_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kt_async_layout)
+    kt_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=kt_async_layout)
+
+    # V layout [BLOCK_N, BLOCK_DMODEL]: size_per_thread=[1, 8] for 128 bits with fp16.
+    v_async_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8], threads_per_warp=[8, 8],
+        warps_per_cta=[num_warps, 1], order=[1, 0])
+    v_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=v_async_layout)
+    v_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=v_async_layout)
+
+    # Construct K^T pointers [BLOCK_DMODEL, BLOCK_N].
+    kt_offs_d = gl.arange(0, BLOCK_DMODEL, layout=kt_offs_d_layout)
+    kt_offs_n = gl.arange(0, BLOCK_N, layout=kt_offs_n_layout)
+    kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + (start_n + kt_offs_n[None, :]) * stride_kn
+
+    # Construct V pointers [BLOCK_N, BLOCK_DMODEL].
+    v_offs_n = gl.arange(0, BLOCK_N, layout=v_offs_n_layout)
+    v_offs_d = gl.arange(0, BLOCK_DMODEL, layout=v_offs_d_layout)
+    v_ptrs = v_base + (start_n + v_offs_n[:, None]) * stride_vk + v_offs_d[None, :] * stride_vn
+
     if MASK_STEPS:
         kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
         if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
             kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
         cdna4_async.global_load_to_shared(kt_smem, kt_ptrs, mask=kt_mask, other=0.0)
-        v_mask = (start_n + offs_n[:, None]) < MAX_SEQLENS_K
+        v_mask = (start_n + v_offs_n[:, None]) < MAX_SEQLENS_K
         if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+            v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
         cdna4_async.global_load_to_shared(v_smem, v_ptrs, mask=v_mask, other=0.0)
     else:
         cdna4_async.global_load_to_shared(kt_smem, kt_ptrs)
@@ -288,9 +317,8 @@ def compute_block(
 
 @gluon.jit
 def attn_fwd_inner_pipelined(
-    acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
-    kt_offs_d, kt_offs_n, start_m,
-    stride_kn, stride_vk,
+    acc, l_i, m_i, q_dot, k_base, v_base, start_m,
+    stride_kn, stride_kk, stride_vk, stride_vn,
     block_start, block_end,
     kt_smem_stages, v_smem_stages,
     qk_scale: gl.constexpr,
@@ -298,7 +326,7 @@ def attn_fwd_inner_pipelined(
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
-    NUM_STAGES: gl.constexpr,
+    NUM_STAGES: gl.constexpr, num_warps: gl.constexpr,
     kt_blocked_layout: gl.constexpr, blocked_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
@@ -312,13 +340,12 @@ def attn_fwd_inner_pipelined(
         block_n = block_start + stage
         if block_n < block_end:
             start_n = block_n * BLOCK_N
-            stage_kt_ptrs = kt_ptrs + stage * BLOCK_N * stride_kn
-            stage_v_ptrs = v_ptrs + stage * BLOCK_N * stride_vk
             issue_async_load(
                 kt_smem_stages[stage], v_smem_stages[stage],
-                stage_kt_ptrs, stage_v_ptrs, start_n,
-                offs_n, offs_d, kt_offs_d, kt_offs_n,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                k_base, v_base, start_n,
+                stride_kn, stride_kk, stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                num_warps,
             )
 
     # Main loop: process blocks with full pipeline.
@@ -353,24 +380,18 @@ def attn_fwd_inner_pipelined(
         future_block = block_n + NUM_STAGES
         if future_block < block_end:
             future_start_n = future_block * BLOCK_N
-            future_kt_ptrs = kt_ptrs + (future_block - block_start) * BLOCK_N * stride_kn
-            future_v_ptrs = v_ptrs + (future_block - block_start) * BLOCK_N * stride_vk
             issue_async_load(
                 kt_smem_stage, v_smem_stage,
-                future_kt_ptrs, future_v_ptrs, future_start_n,
-                offs_n, offs_d, kt_offs_d, kt_offs_n,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                k_base, v_base, future_start_n,
+                stride_kn, stride_kk, stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                num_warps,
             )
 
     # Final wait to ensure all loads are done.
     cdna4_async.async_wait(0)
 
-    # Update pointers past all processed blocks.
-    blocks_processed = block_end - block_start
-    kt_ptrs = kt_ptrs + blocks_processed * BLOCK_N * stride_kn
-    v_ptrs = v_ptrs + blocks_processed * BLOCK_N * stride_vk
-
-    return acc, l_i, m_i, kt_ptrs, v_ptrs
+    return acc, l_i, m_i
 
 
 def get_gluon_cdna_autotune_configs():
@@ -636,17 +657,16 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
 
         # Process full blocks (no masking needed - faster).
         if n_full_blocks > 0:
-            acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner_pipelined(
-                acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
-                kt_offs_d, kt_offs_n, start_m,
-                stride_kn, stride_vk,
+            acc, l_i, m_i = attn_fwd_inner_pipelined(
+                acc, l_i, m_i, q_dot, k_base, v_base, start_m,
+                stride_kn, stride_kk, stride_vk, stride_vn,
                 0, n_full_blocks,
                 kt_smem_stages, v_smem_stages,
                 qk_scale,
                 MAX_SEQLENS_Q, MAX_SEQLENS_K,
                 BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
                 False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
-                NUM_STAGES,
+                NUM_STAGES, num_warps,
                 kt_blocked_layout, blocked_layout,
                 kt_dot_layout, p_dot_layout, v_dot_layout,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
@@ -654,17 +674,16 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
 
         # Process masked blocks (need causal and/or boundary masking).
         if masked_blocks > 0:
-            acc, l_i, m_i, kt_ptrs, v_ptrs = attn_fwd_inner_pipelined(
-                acc, l_i, m_i, q_dot, kt_ptrs, v_ptrs, offs_n, offs_d,
-                kt_offs_d, kt_offs_n, start_m,
-                stride_kn, stride_vk,
+            acc, l_i, m_i = attn_fwd_inner_pipelined(
+                acc, l_i, m_i, q_dot, k_base, v_base, start_m,
+                stride_kn, stride_kk, stride_vk, stride_vn,
                 n_full_blocks, n_blocks,
                 kt_smem_stages, v_smem_stages,
                 qk_scale,
                 MAX_SEQLENS_Q, MAX_SEQLENS_K,
                 BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
                 True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
-                NUM_STAGES,
+                NUM_STAGES, num_warps,
                 kt_blocked_layout, blocked_layout,
                 kt_dot_layout, p_dot_layout, v_dot_layout,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
