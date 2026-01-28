@@ -347,18 +347,12 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     k_base = K + off_z * stride_kz + off_h_k * stride_kh
     v_base = V + off_z * stride_vz + off_h_k * stride_vh
 
-    # Allocate shared memory for Q [BLOCK_M, BLOCK_DMODEL].
-    q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-    q_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_M, BLOCK_DMODEL], layout=q_smem_layout)
-
-    # Load Q tile: global -> shared -> registers.
+    # Load Q tile [BLOCK_M, BLOCK_DMODEL] directly (only loaded once, no need for shared memory).
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q_mask = offs_m[:, None] < MAX_SEQLENS_Q
     if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
         q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-    q_global = gl.load(q_ptrs, mask=q_mask, other=0.0)
-    q_smem.store(q_global)
-    q = q_smem.load(blocked_layout)
+    q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
     # Convert Q to dot operand layout once (hoisted from loop).
     q_dot = gl.convert_layout(q, q_dot_layout)
