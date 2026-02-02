@@ -203,7 +203,7 @@ def issue_async_load(
     BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr, ACTUAL_BLOCK_DMODEL: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    """Issue async loads for K^T and V into shared memory.
+    """Issue async loads for K^T and V into shared memory using buffer_load_to_shared.
 
     Uses layouts compatible with async copy (size_per_thread * bits = 128).
     For fp16, size_per_thread=8 gives 128 bits.
@@ -222,28 +222,28 @@ def issue_async_load(
     v_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=v_async_layout)
     v_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=v_async_layout)
 
-    # Construct K^T pointers [BLOCK_DMODEL, BLOCK_N].
+    # Construct K^T offsets [BLOCK_DMODEL, BLOCK_N] (element offsets from base).
     kt_offs_d = gl.arange(0, BLOCK_DMODEL, layout=kt_offs_d_layout)
     kt_offs_n = gl.arange(0, BLOCK_N, layout=kt_offs_n_layout)
-    kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + (start_n + kt_offs_n[None, :]) * stride_kn
+    kt_offsets = kt_offs_d[:, None] * stride_kk + (start_n + kt_offs_n[None, :]) * stride_kn
 
-    # Construct V pointers [BLOCK_N, BLOCK_DMODEL].
+    # Construct V offsets [BLOCK_N, BLOCK_DMODEL].
     v_offs_n = gl.arange(0, BLOCK_N, layout=v_offs_n_layout)
     v_offs_d = gl.arange(0, BLOCK_DMODEL, layout=v_offs_d_layout)
-    v_ptrs = v_base + (start_n + v_offs_n[:, None]) * stride_vk + v_offs_d[None, :] * stride_vn
+    v_offsets = (start_n + v_offs_n[:, None]) * stride_vk + v_offs_d[None, :] * stride_vn
 
     if MASK_STEPS:
         kt_mask = (start_n + kt_offs_n[None, :]) < MAX_SEQLENS_K
         if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
             kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
-        cdna4_async.global_load_to_shared(kt_smem, kt_ptrs, mask=kt_mask, other=0.0)
+        cdna4_async.buffer_load_to_shared(kt_smem, k_base, kt_offsets, mask=kt_mask, other=0.0)
         v_mask = (start_n + v_offs_n[:, None]) < MAX_SEQLENS_K
         if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
             v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-        cdna4_async.global_load_to_shared(v_smem, v_ptrs, mask=v_mask, other=0.0)
+        cdna4_async.buffer_load_to_shared(v_smem, v_base, v_offsets, mask=v_mask, other=0.0)
     else:
-        cdna4_async.global_load_to_shared(kt_smem, kt_ptrs)
-        cdna4_async.global_load_to_shared(v_smem, v_ptrs)
+        cdna4_async.buffer_load_to_shared(kt_smem, k_base, kt_offsets)
+        cdna4_async.buffer_load_to_shared(v_smem, v_base, v_offsets)
 
 
 @gluon.jit
