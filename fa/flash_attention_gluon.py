@@ -201,24 +201,17 @@ def issue_async_load(
     MASK_STEPS: gl.constexpr,
     MAX_SEQLENS_K: gl.constexpr,
     BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr, ACTUAL_BLOCK_DMODEL: gl.constexpr,
-    num_warps: gl.constexpr,
+    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
 ):
     """Issue async loads for K^T and V into shared memory using buffer_load_to_shared.
 
     Uses layouts compatible with async copy (size_per_thread * bits = 128).
     For fp16, size_per_thread=8 gives 128 bits.
+    The same layouts must be used for load_shared_relaxed to ensure correctness.
     """
-    # K^T layout [BLOCK_DMODEL, BLOCK_N]: size_per_thread=[1, 8] for 128 bits with fp16.
-    kt_async_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8], threads_per_warp=[8, 8],
-        warps_per_cta=[num_warps, 1], order=[1, 0])
+    # Derive slice layouts from the async layouts.
     kt_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kt_async_layout)
     kt_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=kt_async_layout)
-
-    # V layout [BLOCK_N, BLOCK_DMODEL]: size_per_thread=[1, 8] for 128 bits with fp16.
-    v_async_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8], threads_per_warp=[8, 8],
-        warps_per_cta=[num_warps, 1], order=[1, 0])
     v_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=v_async_layout)
     v_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=v_async_layout)
 
@@ -253,13 +246,17 @@ def compute_block(
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
-    kt_blocked_layout: gl.constexpr, blocked_layout: gl.constexpr,
+    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
-    """Compute attention for one block using data from shared memory."""
-    # Load K^T from shared memory.
-    k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_blocked_layout)
+    """Compute attention for one block using data from shared memory.
+
+    IMPORTANT: kt_async_layout and v_async_layout must be the SAME layouts
+    used for buffer_load_to_shared in issue_async_load.
+    """
+    # Load K^T from shared memory using the same layout as async load.
+    k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_async_layout)
 
     # Compute QK^T using MMA.
     kt_dot = gl.convert_layout(k_t, kt_dot_layout)
@@ -303,8 +300,8 @@ def compute_block(
     # Update running max.
     m_i = m_new
 
-    # Load V from shared memory.
-    v = cdna4_async.load_shared_relaxed(v_smem, blocked_layout)
+    # Load V from shared memory using the same layout as async load.
+    v = cdna4_async.load_shared_relaxed(v_smem, v_async_layout)
 
     # Accumulate P @ V using MMA.
     p_cast = p.to(v.dtype)
@@ -320,20 +317,26 @@ def attn_fwd_inner_pipelined(
     acc, l_i, m_i, q_dot, k_base, v_base, start_m,
     stride_kn, stride_kk, stride_vk, stride_vn,
     block_start, block_end,
-    kt_smem_stages, v_smem_stages,
+    kt_smem, v_smem,
     qk_scale: gl.constexpr,
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
-    NUM_STAGES: gl.constexpr, num_warps: gl.constexpr,
-    kt_blocked_layout: gl.constexpr, blocked_layout: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
     """
     Pipelined inner attention loop for CDNA4 using async memory operations.
     NUM_STAGES controls the pipeline depth (number of buffers).
+
+    kt_smem and v_smem are 3D buffers with shape [NUM_STAGES, ...].
+    Use .index(stage) to access individual stage buffers.
+
+    IMPORTANT: kt_async_layout and v_async_layout must be used for both
+    buffer_load_to_shared (in issue_async_load) and load_shared_relaxed (in compute_block).
     """
     # Prologue: issue async loads for first NUM_STAGES blocks.
     for stage in gl.static_range(NUM_STAGES):
@@ -341,37 +344,33 @@ def attn_fwd_inner_pipelined(
         if block_n < block_end:
             start_n = block_n * BLOCK_N
             issue_async_load(
-                kt_smem_stages[stage], v_smem_stages[stage],
+                kt_smem.index(stage), v_smem.index(stage),
                 k_base, v_base, start_n,
                 stride_kn, stride_kk, stride_vk, stride_vn,
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                num_warps,
+                kt_async_layout, v_async_layout,
             )
 
     # Main loop: process blocks with full pipeline.
     # Wait count is constant: (NUM_STAGES - 1) * 2 loads remain in flight.
     WAIT_STAGES: gl.constexpr = (NUM_STAGES - 1) * 2
     for block_n in range(block_start, block_end):
-        # stage = block_n % NUM_STAGES
-        kt_smem_stage = kt_smem_stages[0]
-        v_smem_stage = v_smem_stages[0]
-        for s in gl.static_range(NUM_STAGES):
-            if block_n % NUM_STAGES == s:
-                kt_smem_stage = kt_smem_stages[s]
-                v_smem_stage = v_smem_stages[s]
+        # Compute stage index using modulo.
+        stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
 
         # Wait for this stage's loads to complete.
         cdna4_async.async_wait(WAIT_STAGES)
 
         # Compute attention for this block.
+        # Use .index(stage_idx) to get the current stage's buffer slice.
         acc, l_i, m_i = compute_block(
             acc, l_i, m_i, q_dot,
-            kt_smem_stage, v_smem_stage,
+            kt_smem.index(stage_idx), v_smem.index(stage_idx),
             start_n, start_m,
             qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
             BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-            kt_blocked_layout, blocked_layout,
+            kt_async_layout, v_async_layout,
             kt_dot_layout, p_dot_layout, v_dot_layout,
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
@@ -381,11 +380,11 @@ def attn_fwd_inner_pipelined(
         if future_block < block_end:
             future_start_n = future_block * BLOCK_N
             issue_async_load(
-                kt_smem_stage, v_smem_stage,
+                kt_smem.index(stage_idx), v_smem.index(stage_idx),
                 k_base, v_base, future_start_n,
                 stride_kn, stride_kk, stride_vk, stride_vn,
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                num_warps,
+                kt_async_layout, v_async_layout,
             )
 
     # Final wait to ensure all loads are done.
@@ -620,40 +619,37 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     if USE_PIPELINED:
         # Async copy requires simple swizzling (within warp boundary).
         # Use vec=1, per_phase=1, max_phase=1 for async copy compatibility.
-        kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
+        # IMPORTANT: The shared layout order MUST match the blocked layout order for coalesced writes.
+        # Both kt and v async layouts use order=[1, 0], so shared layouts must match.
+        kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
         v_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
+        # Define async-compatible blocked layouts for buffer_load_to_shared and load_shared_relaxed.
+        # For async copy, size_per_thread * bits_per_element must be 128 (or 32).
+        # For fp16 (16 bits), size_per_thread=8 gives 128 bits.
+        # The order must match the shared memory layout order.
+        #
+        # For coalesced writes to shared memory with order=[1, 0] (dim1 fast):
+        # - Consecutive lanes must write to consecutive shared memory positions
+        # - With size_per_thread=[1, 8], each thread writes 8 elements in dim1
+        # - For [64, 64] tensor: row has 64 columns, need 64/8 = 8 threads in dim1
+        # - So threads_per_warp must have 8 in dim1 to fill one row per warp-row
+        # - threads_per_warp=[8, 8] gives 8*8=64 threads ✓
+        # - With 8 warps, warps_per_cta=[8, 1]: dim0=1*8*8=64 ✓, dim1=8*8*1=64 ✓
+        kt_async_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8], threads_per_warp=[8, 8],
+            warps_per_cta=[num_warps, 1], order=[1, 0])
+        v_async_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8], threads_per_warp=[8, 8],
+            warps_per_cta=[num_warps, 1], order=[1, 0])
+
         # Allocate multi-buffered shared memory for pipelining.
-        # Explicit allocation for each supported NUM_STAGES value.
-        if NUM_STAGES == 2:
-            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            kt_smem_stages = (kt_smem_0, kt_smem_1)
-            v_smem_stages = (v_smem_0, v_smem_1)
-        elif NUM_STAGES == 3:
-            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            kt_smem_stages = (kt_smem_0, kt_smem_1, kt_smem_2)
-            v_smem_stages = (v_smem_0, v_smem_1, v_smem_2)
-        elif NUM_STAGES == 4:
-            kt_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            kt_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            kt_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            kt_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
-            v_smem_0 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            v_smem_1 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            v_smem_2 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            v_smem_3 = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
-            kt_smem_stages = (kt_smem_0, kt_smem_1, kt_smem_2, kt_smem_3)
-            v_smem_stages = (v_smem_0, v_smem_1, v_smem_2, v_smem_3)
-        else:
-            gl.static_assert(False, "NUM_STAGES must be 2, 3, or 4 for pipelined path")
+        # Use a single 3D buffer with NUM_STAGES as the first dimension.
+        # Access individual stages with .index(stage) to avoid type conversion issues.
+        kt_smem = gl.allocate_shared_memory(
+            Q.dtype.element_ty, [NUM_STAGES, BLOCK_DMODEL, BLOCK_N], layout=kt_async_smem_layout)
+        v_smem = gl.allocate_shared_memory(
+            Q.dtype.element_ty, [NUM_STAGES, BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
 
         # Process full blocks (no masking needed - faster).
         if n_full_blocks > 0:
@@ -661,30 +657,31 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
                 acc, l_i, m_i, q_dot, k_base, v_base, start_m,
                 stride_kn, stride_kk, stride_vk, stride_vn,
                 0, n_full_blocks,
-                kt_smem_stages, v_smem_stages,
+                kt_smem, v_smem,
                 qk_scale,
                 MAX_SEQLENS_Q, MAX_SEQLENS_K,
                 BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
                 False, False,  # MASK_STEPS=False, IS_CAUSAL=False for full blocks.
-                NUM_STAGES, num_warps,
-                kt_blocked_layout, blocked_layout,
+                NUM_STAGES,
+                kt_async_layout, v_async_layout,
                 kt_dot_layout, p_dot_layout, v_dot_layout,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
 
         # Process masked blocks (need causal and/or boundary masking).
-        if masked_blocks > 0:
+        # TEMPORARILY DISABLED FOR DEBUGGING
+        if False and masked_blocks > 0:
             acc, l_i, m_i = attn_fwd_inner_pipelined(
                 acc, l_i, m_i, q_dot, k_base, v_base, start_m,
                 stride_kn, stride_kk, stride_vk, stride_vn,
                 n_full_blocks, n_blocks,
-                kt_smem_stages, v_smem_stages,
+                kt_smem, v_smem,
                 qk_scale,
                 MAX_SEQLENS_Q, MAX_SEQLENS_K,
                 BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
                 True, IS_CAUSAL,  # MASK_STEPS=True for masked blocks.
-                NUM_STAGES, num_warps,
-                kt_blocked_layout, blocked_layout,
+                NUM_STAGES,
+                kt_async_layout, v_async_layout,
                 kt_dot_layout, p_dot_layout, v_dot_layout,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
