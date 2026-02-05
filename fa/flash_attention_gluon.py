@@ -679,8 +679,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             )
 
         # Process masked blocks (need causal and/or boundary masking).
-        # TEMPORARILY DISABLED FOR DEBUGGING
-        if False and masked_blocks > 0:
+        if masked_blocks > 0:
             acc, l_i, m_i = attn_fwd_inner_pipelined(
                 acc, l_i, m_i, q_dot, k_base, v_base, start_m,
                 stride_kn, stride_kk, stride_vk, stride_vn,
