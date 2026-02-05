@@ -629,25 +629,28 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         v_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
         # Define async-compatible blocked layouts for buffer_load_to_shared and load_shared_relaxed.
-        # For async copy, size_per_thread * bits_per_element must be 128 (or 32).
-        # For fp16 (16 bits), size_per_thread=8 gives 128 bits.
-        # The order must match the shared memory layout order.
+        # For coalesced direct-to-LDS writes, ALL lane bits must map to the fast dimension.
+        # This requires threads_per_warp to concentrate all threads in the fast dimension.
         #
-        # For K^T with order=[0, 1] (dim0 fast, contiguous along head_dim):
-        # - size_per_thread=[8, 1]: 8 contiguous elements in dim0
-        # - threads_per_warp=[8, 8]: 64 threads per warp
-        # - warps_per_cta=[1, num_warps]: cover dim1 with warps
-        # - dim0: 8 * 8 * 1 = 64 ✓, dim1: 1 * 8 * num_warps = 64 (for num_warps=8) ✓
+        # For CDNA4 with fp16, supported vector sizes are 2 (32 bits) or 8 (128 bits).
+        # Using vec=2: each warp writes 64 threads * 2 elements = 128 consecutive elements.
+        # This fits exactly in the fast dimension when it has 128 elements.
+        #
+        # For K^T [BLOCK_DMODEL, BLOCK_N] with order=[0, 1] (dim0 fast):
+        # - BLOCK_DMODEL=128, BLOCK_N=64 -> shape [128, 64]
+        # - size_per_thread=[2, 8]: 2 in fast dim (vec=2), 8 in slow dim
+        # - threads_per_warp=[64, 1]: all 64 lanes in dim0 (fast) -> 64*2=128 ✓
+        # - warps_per_cta=[1, num_warps]: warps cover dim1 -> 1*8*8=64 ✓
         kt_async_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[8, 1], threads_per_warp=[8, 8],
+            size_per_thread=[2, 8], threads_per_warp=[64, 1],
             warps_per_cta=[1, num_warps], order=[0, 1])
-        # For V with order=[1, 0] (dim1 fast, contiguous along head_dim):
-        # - size_per_thread=[1, 8]: 8 contiguous elements in dim1
-        # - threads_per_warp=[8, 8]: 64 threads per warp
-        # - warps_per_cta=[num_warps, 1]: cover dim0 with warps
-        # - dim0: 1 * 8 * num_warps = 64 ✓, dim1: 8 * 8 * 1 = 64 ✓
+        # For V [BLOCK_N, BLOCK_DMODEL] with order=[1, 0] (dim1 fast):
+        # - BLOCK_N=64, BLOCK_DMODEL=128 -> shape [64, 128]
+        # - size_per_thread=[8, 2]: 8 in slow dim, 2 in fast dim (vec=2)
+        # - threads_per_warp=[1, 64]: all 64 lanes in dim1 (fast) -> 64*2=128 ✓
+        # - warps_per_cta=[num_warps, 1]: warps cover dim0 -> 8*8*1=64 ✓
         v_async_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 8], threads_per_warp=[8, 8],
+            size_per_thread=[8, 2], threads_per_warp=[1, 64],
             warps_per_cta=[num_warps, 1], order=[1, 0])
 
         # Allocate multi-buffered shared memory for pipelining.
