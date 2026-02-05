@@ -420,15 +420,14 @@ def attn_fwd_inner_pipelined(
                 v_async_layout,
             )
 
-    # Wait counts for chained dot pattern.
-    # After prologue: 2*NUM_STAGES loads in flight (K0,V0,K1,V1,...).
-    # Loads complete in issue order, so K[i] completes before V[i].
-    # To consume K[i]: wait until 2*NUM_STAGES - 1 remain.
-    # To consume V[i]: wait until 2*NUM_STAGES - 2 remain.
+    # Chained dot wait counts (loads complete in issue order: K0,V0,K1,V1,...).
+    # After prologue: 2*NUM_STAGES loads in flight.
+    # wait(2*NUM_STAGES - 1): K[current] ready (1 load done).
+    # wait(2*NUM_STAGES - 2): V[current] ready (2 loads done, K and V for current block).
     WAIT_K: gl.constexpr = 2 * NUM_STAGES - 1
     WAIT_V: gl.constexpr = 2 * NUM_STAGES - 2
 
-    # Main loop with chained dot structure.
+    # Main loop with chained dot structure for pingpong.
     for block_n in range(block_start, block_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
@@ -445,27 +444,22 @@ def attn_fwd_inner_pipelined(
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
 
-        # Compute future block info for issuing next loads.
-        future_block = block_n + NUM_STAGES
-        future_start_n = future_block * BLOCK_N
-
-        # Issue future K load (between Dot1 and Dot2).
-        if future_block < block_end:
-            issue_async_load_k(
-                kt_smem.index(stage_idx), k_base, future_start_n,
-                stride_kn, stride_kk,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                kt_async_layout,
-            )
-
         # Memory cluster 2: wait for V.
         cdna4_async.async_wait(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
         acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
-        # Issue future V load (after Dot2).
+        # Issue future K and V after both dots (keeps pipeline balanced).
+        future_block = block_n + NUM_STAGES
         if future_block < block_end:
+            future_start_n = future_block * BLOCK_N
+            issue_async_load_k(
+                kt_smem.index(stage_idx), k_base, future_start_n,
+                stride_kn, stride_kk,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                kt_async_layout,
+            )
             issue_async_load_v(
                 v_smem.index(stage_idx), v_base, future_start_n,
                 stride_vk, stride_vn,
