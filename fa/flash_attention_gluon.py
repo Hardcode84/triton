@@ -613,42 +613,30 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     kt_ptrs = k_base + kt_offs_d[:, None] * stride_kk + kt_offs_n[None, :] * stride_kn
     v_ptrs = v_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
 
-    # Use pipelined path for CDNA4 with NUM_STAGES > 1.
-    USE_PIPELINED: gl.constexpr = (MMA_TYPE == "mfma_cdna4") and (NUM_STAGES > 1)
+    # Use pipelined path for CDNA4 with NUM_STAGES > 1 and BLOCK_DMODEL >= 128.
+    # The BLOCK_DMODEL constraint exists because direct-to-LDS async copy requires
+    # coalesced writes where all 64 lane bits map to the fast dimension.
+    # With vec=2 (32-bit writes) and 64 threads: 2*64=128 consecutive elements per warp.
+    # The fast dimension (BLOCK_DMODEL) must be >= 128 to satisfy this constraint.
+    USE_PIPELINED: gl.constexpr = (MMA_TYPE == "mfma_cdna4") and (NUM_STAGES > 1) and (BLOCK_DMODEL >= 128)
 
     if USE_PIPELINED:
-        # Async copy requires simple swizzling (within warp boundary).
-        # Use vec=1, per_phase=1, max_phase=1 for async copy compatibility.
-        # IMPORTANT: The shared layout order MUST match the blocked layout order for coalesced writes.
+        # Async copy layout configuration for direct-to-LDS writes.
+        # Use non-swizzled shared memory (vec=1, per_phase=1, max_phase=1) for
+        # strict coalescing which is required by canCoalesceWriteIntoSharedMemory.
         #
-        # For K^T [BLOCK_DMODEL, BLOCK_N]: stride_kk=1 (dim0), stride_kn=head_dim (dim1)
-        # -> Contiguous access is along dim0, so use order=[0, 1]
-        # For V [BLOCK_N, BLOCK_DMODEL]: stride_vk=head_dim (dim0), stride_vn=1 (dim1)
-        # -> Contiguous access is along dim1, so use order=[1, 0]
+        # Memory layout:
+        # - K^T [BLOCK_DMODEL, BLOCK_N]: stride_kk=1 (dim0 fast), order=[0, 1]
+        # - V [BLOCK_N, BLOCK_DMODEL]: stride_vn=1 (dim1 fast), order=[1, 0]
         kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
         v_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
-        # Define async-compatible blocked layouts for buffer_load_to_shared and load_shared_relaxed.
-        # For coalesced direct-to-LDS writes, ALL lane bits must map to the fast dimension.
-        # This requires threads_per_warp to concentrate all threads in the fast dimension.
-        #
-        # For CDNA4 with fp16, supported vector sizes are 2 (32 bits) or 8 (128 bits).
-        # Using vec=2: each warp writes 64 threads * 2 elements = 128 consecutive elements.
-        # This fits exactly in the fast dimension when it has 128 elements.
-        #
-        # For K^T [BLOCK_DMODEL, BLOCK_N] with order=[0, 1] (dim0 fast):
-        # - BLOCK_DMODEL=128, BLOCK_N=64 -> shape [128, 64]
-        # - size_per_thread=[2, 8]: 2 in fast dim (vec=2), 8 in slow dim
-        # - threads_per_warp=[64, 1]: all 64 lanes in dim0 (fast) -> 64*2=128 ✓
-        # - warps_per_cta=[1, num_warps]: warps cover dim1 -> 1*8*8=64 ✓
+        # Blocked layouts: all 64 lanes map to fast dimension for coalesced writes.
+        # K^T [128, BLOCK_N]: 64 lanes * vec=2 = 128 elements in dim0.
         kt_async_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[2, 8], threads_per_warp=[64, 1],
             warps_per_cta=[1, num_warps], order=[0, 1])
-        # For V [BLOCK_N, BLOCK_DMODEL] with order=[1, 0] (dim1 fast):
-        # - BLOCK_N=64, BLOCK_DMODEL=128 -> shape [64, 128]
-        # - size_per_thread=[8, 2]: 8 in slow dim, 2 in fast dim (vec=2)
-        # - threads_per_warp=[1, 64]: all 64 lanes in dim1 (fast) -> 64*2=128 ✓
-        # - warps_per_cta=[num_warps, 1]: warps cover dim0 -> 8*8*1=64 ✓
+        # V [BLOCK_N, 128]: 64 lanes * vec=2 = 128 elements in dim1.
         v_async_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[8, 2], threads_per_warp=[1, 64],
             warps_per_cta=[num_warps, 1], order=[1, 0])
