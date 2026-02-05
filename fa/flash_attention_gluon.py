@@ -396,7 +396,7 @@ def attn_fwd_inner_pipelined(
 def get_gluon_cdna_autotune_configs():
     """Autotune configs for CDNA (MI series) GPUs."""
     return [
-        # Pipelined configs with NUM_STAGES > 1 (CDNA4 only).
+        # Pipelined config with NUM_STAGES=2 (CDNA4 only).
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 2, 'waves_per_eu': 2}, num_warps=8),
         # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 2}, num_warps=4),
         # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 3}, num_warps=4),
@@ -620,8 +620,12 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         # Async copy requires simple swizzling (within warp boundary).
         # Use vec=1, per_phase=1, max_phase=1 for async copy compatibility.
         # IMPORTANT: The shared layout order MUST match the blocked layout order for coalesced writes.
-        # Both kt and v async layouts use order=[1, 0], so shared layouts must match.
-        kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+        #
+        # For K^T [BLOCK_DMODEL, BLOCK_N]: stride_kk=1 (dim0), stride_kn=head_dim (dim1)
+        # -> Contiguous access is along dim0, so use order=[0, 1]
+        # For V [BLOCK_N, BLOCK_DMODEL]: stride_vk=head_dim (dim0), stride_vn=1 (dim1)
+        # -> Contiguous access is along dim1, so use order=[1, 0]
+        kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
         v_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
         # Define async-compatible blocked layouts for buffer_load_to_shared and load_shared_relaxed.
@@ -629,16 +633,19 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         # For fp16 (16 bits), size_per_thread=8 gives 128 bits.
         # The order must match the shared memory layout order.
         #
-        # For coalesced writes to shared memory with order=[1, 0] (dim1 fast):
-        # - Consecutive lanes must write to consecutive shared memory positions
-        # - With size_per_thread=[1, 8], each thread writes 8 elements in dim1
-        # - For [64, 64] tensor: row has 64 columns, need 64/8 = 8 threads in dim1
-        # - So threads_per_warp must have 8 in dim1 to fill one row per warp-row
-        # - threads_per_warp=[8, 8] gives 8*8=64 threads ✓
-        # - With 8 warps, warps_per_cta=[8, 1]: dim0=1*8*8=64 ✓, dim1=8*8*1=64 ✓
+        # For K^T with order=[0, 1] (dim0 fast, contiguous along head_dim):
+        # - size_per_thread=[8, 1]: 8 contiguous elements in dim0
+        # - threads_per_warp=[8, 8]: 64 threads per warp
+        # - warps_per_cta=[1, num_warps]: cover dim1 with warps
+        # - dim0: 8 * 8 * 1 = 64 ✓, dim1: 1 * 8 * num_warps = 64 (for num_warps=8) ✓
         kt_async_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 8], threads_per_warp=[8, 8],
-            warps_per_cta=[num_warps, 1], order=[1, 0])
+            size_per_thread=[8, 1], threads_per_warp=[8, 8],
+            warps_per_cta=[1, num_warps], order=[0, 1])
+        # For V with order=[1, 0] (dim1 fast, contiguous along head_dim):
+        # - size_per_thread=[1, 8]: 8 contiguous elements in dim1
+        # - threads_per_warp=[8, 8]: 64 threads per warp
+        # - warps_per_cta=[num_warps, 1]: cover dim0 with warps
+        # - dim0: 1 * 8 * num_warps = 64 ✓, dim1: 8 * 8 * 1 = 64 ✓
         v_async_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 8], threads_per_warp=[8, 8],
             warps_per_cta=[num_warps, 1], order=[1, 0])
