@@ -273,25 +273,21 @@ def issue_async_load(
 
 
 @gluon.jit
-def compute_block(
-    acc, l_i, m_i, q_dot, kt_smem, v_smem, start_n, start_m,
+def compute_dot1_qk_softmax(
+    acc, l_i, m_i, q_dot, kt_smem, start_n, start_m,
     qk_scale: gl.constexpr,
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
-    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
-    kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
+    kt_async_layout: gl.constexpr,
+    kt_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
-    """Compute attention for one block using data from shared memory.
-
-    IMPORTANT: kt_async_layout and v_async_layout must be the SAME layouts
-    used for buffer_load_to_shared in issue_async_load.
-    """
-    # Load K^T from shared memory using the same layout as async load.
+    """Dot1: Compute QK^T and softmax. Returns P for Dot2."""
+    # Load K^T from shared memory.
     k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_async_layout)
 
-    # Compute QK^T using MMA.
+    # Compute QK^T using MMA (Dot1).
     kt_dot = gl.convert_layout(k_t, kt_dot_layout)
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
     qk = do_mma("mfma_cdna4", q_dot, kt_dot, qk)
@@ -333,15 +329,50 @@ def compute_block(
     # Update running max.
     m_i = m_new
 
-    # Load V from shared memory using the same layout as async load.
+    return acc, l_i, m_i, p
+
+
+@gluon.jit
+def compute_dot2_pv(
+    acc, p, v_smem,
+    v_async_layout: gl.constexpr,
+    p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
+):
+    """Dot2: Compute P @ V and accumulate."""
+    # Load V from shared memory.
     v = cdna4_async.load_shared_relaxed(v_smem, v_async_layout)
 
-    # Accumulate P @ V using MMA.
+    # Accumulate P @ V using MMA (Dot2).
     p_cast = p.to(v.dtype)
     p_dot = gl.convert_layout(p_cast, p_dot_layout)
     v_dot = gl.convert_layout(v, v_dot_layout)
     acc = do_mma("mfma_cdna4", p_dot, v_dot, acc)
 
+    return acc
+
+
+@gluon.jit
+def compute_block(
+    acc, l_i, m_i, q_dot, kt_smem, v_smem, start_n, start_m,
+    qk_scale: gl.constexpr,
+    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
+    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+    MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
+    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
+    kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
+    mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
+):
+    """Compute attention for one block using data from shared memory.
+    Calls compute_dot1_qk_softmax then compute_dot2_pv.
+    """
+    acc, l_i, m_i, p = compute_dot1_qk_softmax(
+        acc, l_i, m_i, q_dot, kt_smem, start_n, start_m,
+        qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
+        BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+        kt_async_layout, kt_dot_layout,
+        mma_layout, mma_offs_n_col, mma_offs_m_row,
+    )
+    acc = compute_dot2_pv(acc, p, v_smem, v_async_layout, p_dot_layout, v_dot_layout)
     return acc, l_i, m_i
 
 
@@ -362,62 +393,84 @@ def attn_fwd_inner_pipelined(
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
     """
-    Pipelined inner attention loop for CDNA4 using async memory operations.
-    NUM_STAGES controls the pipeline depth (number of buffers).
+    Pipelined inner attention loop for CDNA4 with chained dot pattern.
 
-    kt_smem and v_smem are 3D buffers with shape [NUM_STAGES, ...].
-    Use .index(stage) to access individual stage buffers.
+    Structure for pingpong optimization:
+    - async_wait(K) -> Dot1 (QK^T) + softmax -> issue future K
+    - async_wait(V) -> Dot2 (PV) -> issue future V
 
-    IMPORTANT: kt_async_layout and v_async_layout must be used for both
-    buffer_load_to_shared (in issue_async_load) and load_shared_relaxed (in compute_block).
+    This creates two compute clusters (Dot1, Dot2) with memory clusters between them.
     """
     # Prologue: issue async loads for first NUM_STAGES blocks.
+    # Issue K then V for each stage to maintain ordering: K0,V0,K1,V1,...
     for stage in gl.static_range(NUM_STAGES):
         block_n = block_start + stage
         if block_n < block_end:
             start_n = block_n * BLOCK_N
-            issue_async_load(
-                kt_smem.index(stage), v_smem.index(stage),
-                k_base, v_base, start_n,
-                stride_kn, stride_kk, stride_vk, stride_vn,
+            issue_async_load_k(
+                kt_smem.index(stage), k_base, start_n,
+                stride_kn, stride_kk,
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                kt_async_layout, v_async_layout,
+                kt_async_layout,
+            )
+            issue_async_load_v(
+                v_smem.index(stage), v_base, start_n,
+                stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                v_async_layout,
             )
 
-    # Main loop: process blocks with full pipeline.
-    # Wait count is constant: (NUM_STAGES - 1) * 2 loads remain in flight.
-    WAIT_STAGES: gl.constexpr = (NUM_STAGES - 1) * 2
+    # Wait counts for chained dot pattern.
+    # After prologue: 2*NUM_STAGES loads in flight (K0,V0,K1,V1,...).
+    # Loads complete in issue order, so K[i] completes before V[i].
+    # To consume K[i]: wait until 2*NUM_STAGES - 1 remain.
+    # To consume V[i]: wait until 2*NUM_STAGES - 2 remain.
+    WAIT_K: gl.constexpr = 2 * NUM_STAGES - 1
+    WAIT_V: gl.constexpr = 2 * NUM_STAGES - 2
+
+    # Main loop with chained dot structure.
     for block_n in range(block_start, block_end):
-        # Compute stage index using modulo.
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
 
-        # Wait for this stage's loads to complete.
-        cdna4_async.async_wait(WAIT_STAGES)
+        # Memory cluster 1: wait for K.
+        cdna4_async.async_wait(WAIT_K)
 
-        # Compute attention for this block.
-        # Use .index(stage_idx) to get the current stage's buffer slice.
-        acc, l_i, m_i = compute_block(
-            acc, l_i, m_i, q_dot,
-            kt_smem.index(stage_idx), v_smem.index(stage_idx),
-            start_n, start_m,
+        # Compute cluster 1: Dot1 (QK^T) + softmax.
+        acc, l_i, m_i, p = compute_dot1_qk_softmax(
+            acc, l_i, m_i, q_dot, kt_smem.index(stage_idx), start_n, start_m,
             qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
             BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-            kt_async_layout, v_async_layout,
-            kt_dot_layout, p_dot_layout, v_dot_layout,
+            kt_async_layout, kt_dot_layout,
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
 
-        # Issue async load for future block (block_n + NUM_STAGES).
+        # Compute future block info for issuing next loads.
         future_block = block_n + NUM_STAGES
+        future_start_n = future_block * BLOCK_N
+
+        # Issue future K load (between Dot1 and Dot2).
         if future_block < block_end:
-            future_start_n = future_block * BLOCK_N
-            issue_async_load(
-                kt_smem.index(stage_idx), v_smem.index(stage_idx),
-                k_base, v_base, future_start_n,
-                stride_kn, stride_kk, stride_vk, stride_vn,
+            issue_async_load_k(
+                kt_smem.index(stage_idx), k_base, future_start_n,
+                stride_kn, stride_kk,
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                kt_async_layout, v_async_layout,
+                kt_async_layout,
+            )
+
+        # Memory cluster 2: wait for V.
+        cdna4_async.async_wait(WAIT_V)
+
+        # Compute cluster 2: Dot2 (PV).
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
+
+        # Issue future V load (after Dot2).
+        if future_block < block_end:
+            issue_async_load_v(
+                v_smem.index(stage_idx), v_base, future_start_n,
+                stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                v_async_layout,
             )
 
     # Final wait to ensure all loads are done.
