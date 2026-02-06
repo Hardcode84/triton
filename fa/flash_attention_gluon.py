@@ -435,9 +435,11 @@ def attn_fwd_inner_pipelined(
     main_loop_end = block_end - NUM_STAGES
 
     # Main loop: process blocks and issue future loads (no control flow).
+    # Interleave memory and compute: issue K after Dot1, issue V after Dot2.
     for block_n in range(block_start, main_loop_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
+        future_start_n = (block_n + NUM_STAGES) * BLOCK_N
 
         # Wait for K.
         cdna4_async.wait_group(WAIT_K)
@@ -451,20 +453,21 @@ def attn_fwd_inner_pipelined(
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
 
-        # Wait for V.
-        cdna4_async.wait_group(WAIT_V)
-
-        # Compute cluster 2: Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
-
-        # Issue future K and V (always executed, no conditional).
-        future_start_n = (block_n + NUM_STAGES) * BLOCK_N
+        # Issue future K (interleaved - start fetching while waiting for V).
         issue_async_load_k(
             kt_smem.index(stage_idx), k_base, future_start_n,
             stride_kn, stride_kk,
             MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
+
+        # Wait for V.
+        cdna4_async.wait_group(WAIT_V)
+
+        # Compute cluster 2: Dot2 (PV).
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
+
+        # Issue future V.
         issue_async_load_v(
             v_smem.index(stage_idx), v_base, future_start_n,
             stride_vk, stride_vn,
