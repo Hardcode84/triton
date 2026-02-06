@@ -430,51 +430,44 @@ def attn_fwd_inner_pipelined(
     WAIT_V: gl.constexpr = 2 * NUM_STAGES - 2
 
     # Main loop with chained dot structure for pingpong.
-    # Uses warp_pipeline_stage to mark clusters:
-    # - wait_group calls OUTSIDE stages (they're "ignorable" ops in WarpPipeliner)
-    # - Compute clusters (MFMA) get LOW priority (0) - MFMA runs for many cycles
-    # - Memory clusters (issue) get HIGH priority (3) - quickly issue address ops
     for block_n in range(block_start, block_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
 
-        # Wait for K (outside any stage - ignorable op).
+        # Memory cluster 1: wait for K.
         cdna4_async.wait_group(WAIT_K)
 
         # Compute cluster 1: Dot1 (QK^T) + softmax.
-        with warp_pipeline_stage("dot1", priority=0):
-            acc, l_i, m_i, p = compute_dot1_qk_softmax(
-                acc, l_i, m_i, q_dot, kt_smem.index(stage_idx), start_n, start_m,
-                qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
-                BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-                kt_async_layout, kt_dot_layout,
-                mma_layout, mma_offs_n_col, mma_offs_m_row,
-            )
+        acc, l_i, m_i, p = compute_dot1_qk_softmax(
+            acc, l_i, m_i, q_dot, kt_smem.index(stage_idx), start_n, start_m,
+            qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+            kt_async_layout, kt_dot_layout,
+            mma_layout, mma_offs_n_col, mma_offs_m_row,
+        )
 
-        # Wait for V (outside any stage - ignorable op).
+        # Memory cluster 2: wait for V.
         cdna4_async.wait_group(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
-        with warp_pipeline_stage("dot2", priority=0):
-            acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
-        # Memory cluster: issue future loads (high priority for address ops).
-        with warp_pipeline_stage("issue", priority=3):
-            future_block = block_n + NUM_STAGES
-            if future_block < block_end:
-                future_start_n = future_block * BLOCK_N
-                issue_async_load_k(
-                    kt_smem.index(stage_idx), k_base, future_start_n,
-                    stride_kn, stride_kk,
-                    MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                    kt_async_layout,
-                )
-                issue_async_load_v(
-                    v_smem.index(stage_idx), v_base, future_start_n,
-                    stride_vk, stride_vn,
-                    MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                    v_async_layout,
-                )
+        # Issue future K and V after both dots (keeps pipeline balanced).
+        future_block = block_n + NUM_STAGES
+        if future_block < block_end:
+            future_start_n = future_block * BLOCK_N
+            issue_async_load_k(
+                kt_smem.index(stage_idx), k_base, future_start_n,
+                stride_kn, stride_kk,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                kt_async_layout,
+            )
+            issue_async_load_v(
+                v_smem.index(stage_idx), v_base, future_start_n,
+                stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                v_async_layout,
+            )
 
     # Final wait to ensure all loads are done.
     cdna4_async.wait_group(0)
