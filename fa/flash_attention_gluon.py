@@ -218,6 +218,7 @@ def issue_async_load_k(
         cdna4_async.buffer_load_to_shared(kt_smem, k_base, kt_offsets, mask=kt_mask, other=0.0)
     else:
         cdna4_async.buffer_load_to_shared(kt_smem, k_base, kt_offsets)
+    cdna4_async.commit_group()
 
 
 @gluon.jit
@@ -244,6 +245,7 @@ def issue_async_load_v(
         cdna4_async.buffer_load_to_shared(v_smem, v_base, v_offsets, mask=v_mask, other=0.0)
     else:
         cdna4_async.buffer_load_to_shared(v_smem, v_base, v_offsets)
+    cdna4_async.commit_group()
 
 
 @gluon.jit
@@ -433,7 +435,7 @@ def attn_fwd_inner_pipelined(
         start_n = block_n * BLOCK_N
 
         # Memory cluster 1: wait for K.
-        cdna4_async.async_wait(WAIT_K)
+        cdna4_async.wait_group(WAIT_K)
 
         # Compute cluster 1: Dot1 (QK^T) + softmax.
         acc, l_i, m_i, p = compute_dot1_qk_softmax(
@@ -445,7 +447,7 @@ def attn_fwd_inner_pipelined(
         )
 
         # Memory cluster 2: wait for V.
-        cdna4_async.async_wait(WAIT_V)
+        cdna4_async.wait_group(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
         acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
@@ -468,7 +470,7 @@ def attn_fwd_inner_pipelined(
             )
 
     # Final wait to ensure all loads are done.
-    cdna4_async.async_wait(0)
+    cdna4_async.wait_group(0)
 
     return acc, l_i, m_i
 
