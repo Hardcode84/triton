@@ -429,12 +429,17 @@ def attn_fwd_inner_pipelined(
     WAIT_K: gl.constexpr = 2 * NUM_STAGES - 1
     WAIT_V: gl.constexpr = 2 * NUM_STAGES - 2
 
-    # Main loop with chained dot structure for pingpong.
-    for block_n in range(block_start, block_end):
+    # Split into main loop + tail loop to eliminate control flow.
+    # Main loop: always issues future loads (no conditional).
+    # Tail loop: last NUM_STAGES iterations, no future loads to issue.
+    main_loop_end = block_end - NUM_STAGES
+
+    # Main loop: process blocks and issue future loads (no control flow).
+    for block_n in range(block_start, main_loop_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
 
-        # Memory cluster 1: wait for K.
+        # Wait for K.
         cdna4_async.wait_group(WAIT_K)
 
         # Compute cluster 1: Dot1 (QK^T) + softmax.
@@ -446,31 +451,60 @@ def attn_fwd_inner_pipelined(
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
 
-        # Memory cluster 2: wait for V.
+        # Wait for V.
         cdna4_async.wait_group(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
         acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
-        # Issue future K and V after both dots (keeps pipeline balanced).
-        future_block = block_n + NUM_STAGES
-        if future_block < block_end:
-            future_start_n = future_block * BLOCK_N
-            issue_async_load_k(
-                kt_smem.index(stage_idx), k_base, future_start_n,
-                stride_kn, stride_kk,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                kt_async_layout,
-            )
-            issue_async_load_v(
-                v_smem.index(stage_idx), v_base, future_start_n,
-                stride_vk, stride_vn,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                v_async_layout,
+        # Issue future K and V (always executed, no conditional).
+        future_start_n = (block_n + NUM_STAGES) * BLOCK_N
+        issue_async_load_k(
+            kt_smem.index(stage_idx), k_base, future_start_n,
+            stride_kn, stride_kk,
+            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            kt_async_layout,
+        )
+        issue_async_load_v(
+            v_smem.index(stage_idx), v_base, future_start_n,
+            stride_vk, stride_vn,
+            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            v_async_layout,
+        )
+
+    # Tail loop: last NUM_STAGES iterations, no future loads to issue.
+    # Wait counts decrease each iteration since we consume but don't issue.
+    # Use static_range so wait counts can be constexpr.
+    # Iteration i: 2*(NUM_STAGES - i) loads in flight before consuming.
+    #   WAIT_K = 2*(NUM_STAGES - i) - 1
+    #   WAIT_V = 2*(NUM_STAGES - i) - 2
+    for i in gl.static_range(NUM_STAGES):
+        block_n = main_loop_end + i
+        if block_n < block_end:
+            stage_idx = block_n % NUM_STAGES
+            start_n = block_n * BLOCK_N
+
+            # Wait counts decrease as we drain the pipeline.
+            TAIL_WAIT_K: gl.constexpr = 2 * (NUM_STAGES - i) - 1
+            TAIL_WAIT_V: gl.constexpr = 2 * (NUM_STAGES - i) - 2
+
+            # Wait for K.
+            cdna4_async.wait_group(TAIL_WAIT_K)
+
+            # Compute cluster 1: Dot1 (QK^T) + softmax.
+            acc, l_i, m_i, p = compute_dot1_qk_softmax(
+                acc, l_i, m_i, q_dot, kt_smem.index(stage_idx), start_n, start_m,
+                qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+                kt_async_layout, kt_dot_layout,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
 
-    # Final wait to ensure all loads are done.
-    cdna4_async.wait_group(0)
+            # Wait for V.
+            cdna4_async.wait_group(TAIL_WAIT_V)
+
+            # Compute cluster 2: Dot2 (PV).
+            acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
     return acc, l_i, m_i
 
