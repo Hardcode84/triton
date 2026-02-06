@@ -605,12 +605,12 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     elif MMA_TYPE == "mfma_cdna3":
         mma_layout: gl.constexpr = AMDMFMALayout(version=3, instr_shape=[16, 16, 16],
                                                   transposed=True, warps_per_cta=[num_warps, 1])
-        k_width: gl.constexpr = 4
+        k_width: gl.constexpr = 32
         threads_per_warp: gl.constexpr = 64
     elif MMA_TYPE == "mfma_cdna4":
         mma_layout: gl.constexpr = AMDMFMALayout(version=4, instr_shape=[32, 32, 16],
                                                   transposed=True, warps_per_cta=[num_warps, 1])
-        k_width: gl.constexpr = 4
+        k_width: gl.constexpr = 32
         threads_per_warp: gl.constexpr = 64
     else:
         gl.static_assert(False, "Unknown MMA_TYPE")
