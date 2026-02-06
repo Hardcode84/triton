@@ -29,7 +29,7 @@ import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd import AMDWMMALayout, AMDMFMALayout
+from triton.experimental.gluon.language.amd import AMDWMMALayout, AMDMFMALayout, warp_pipeline_stage
 from triton.experimental.gluon.language.amd.rdna3 import wmma as wmma_rdna3
 from triton.experimental.gluon.language.amd.rdna4 import wmma as wmma_rdna4
 from triton.experimental.gluon.language.amd.cdna3 import mfma as mfma_cdna3
