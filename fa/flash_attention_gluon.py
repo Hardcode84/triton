@@ -275,17 +275,15 @@ def issue_async_load(
 
 
 @gluon.jit
-def compute_dot1_qk_softmax(
-    acc, l_i, m_i, q_dot, kt_smem, start_n, start_m,
+def compute_dot1_qk(
+    q_dot, kt_smem,
     qk_scale: gl.constexpr,
-    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
-    MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
     kt_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr,
-    mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
+    mma_layout: gl.constexpr,
 ):
-    """Dot1: Compute QK^T and softmax. Returns P for Dot2."""
+    """Dot1: Compute QK^T only. Returns scaled qk scores."""
     # Load K^T from shared memory.
     k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_async_layout)
 
@@ -297,6 +295,18 @@ def compute_dot1_qk_softmax(
     # Scale QK scores.
     qk = qk * qk_scale
 
+    return qk
+
+
+@gluon.jit
+def compute_softmax(
+    acc, l_i, m_i, qk, start_n, start_m,
+    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
+    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+    MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
+    mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
+):
+    """Online softmax: mask, compute max, exp, sum, scale accumulator."""
     # Apply causal mask (only for masked blocks).
     if MASK_STEPS and IS_CAUSAL:
         causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
@@ -365,13 +375,17 @@ def compute_block(
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
     """Compute attention for one block using data from shared memory.
-    Calls compute_dot1_qk_softmax then compute_dot2_pv.
+    Calls compute_dot1_qk, compute_softmax, then compute_dot2_pv.
     """
-    acc, l_i, m_i, p = compute_dot1_qk_softmax(
-        acc, l_i, m_i, q_dot, kt_smem, start_n, start_m,
-        qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
+    qk = compute_dot1_qk(
+        q_dot, kt_smem,
+        qk_scale, BLOCK_M, BLOCK_N,
+        kt_async_layout, kt_dot_layout, mma_layout,
+    )
+    acc, l_i, m_i, p = compute_softmax(
+        acc, l_i, m_i, qk, start_n, start_m,
+        MAX_SEQLENS_Q, MAX_SEQLENS_K,
         BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-        kt_async_layout, kt_dot_layout,
         mma_layout, mma_offs_n_col, mma_offs_m_row,
     )
     acc = compute_dot2_pv(acc, p, v_smem, v_async_layout, p_dot_layout, v_dot_layout)
@@ -435,7 +449,7 @@ def attn_fwd_inner_pipelined(
     main_loop_end = block_end - NUM_STAGES
 
     # Main loop: process blocks and issue future loads (no control flow).
-    # Interleave memory and compute: issue K after Dot1, issue V after Dot2.
+    # Interleave memory and compute: issue K after Dot1 (before softmax), issue V after Dot2.
     for block_n in range(block_start, main_loop_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
@@ -444,21 +458,27 @@ def attn_fwd_inner_pipelined(
         # Wait for K.
         cdna4_async.wait_group(WAIT_K)
 
-        # Compute cluster 1: Dot1 (QK^T) + softmax.
-        acc, l_i, m_i, p = compute_dot1_qk_softmax(
-            acc, l_i, m_i, q_dot, kt_smem.index(stage_idx), start_n, start_m,
-            qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
-            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-            kt_async_layout, kt_dot_layout,
-            mma_layout, mma_offs_n_col, mma_offs_m_row,
+        # Compute Dot1 (QK^T) only.
+        qk = compute_dot1_qk(
+            q_dot, kt_smem.index(stage_idx),
+            qk_scale, BLOCK_M, BLOCK_N,
+            kt_async_layout, kt_dot_layout, mma_layout,
         )
 
-        # Issue future K (interleaved - start fetching while waiting for V).
+        # Issue future K (interleaved - start fetching while computing softmax).
         issue_async_load_k(
             kt_smem.index(stage_idx), k_base, future_start_n,
             stride_kn, stride_kk,
             MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
+        )
+
+        # Compute softmax (overlaps with K load).
+        acc, l_i, m_i, p = compute_softmax(
+            acc, l_i, m_i, qk, start_n, start_m,
+            MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+            mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
 
         # Wait for V.
@@ -494,12 +514,18 @@ def attn_fwd_inner_pipelined(
             # Wait for K.
             cdna4_async.wait_group(TAIL_WAIT_K)
 
-            # Compute cluster 1: Dot1 (QK^T) + softmax.
-            acc, l_i, m_i, p = compute_dot1_qk_softmax(
-                acc, l_i, m_i, q_dot, kt_smem.index(stage_idx), start_n, start_m,
-                qk_scale, MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            # Compute Dot1 (QK^T) only.
+            qk = compute_dot1_qk(
+                q_dot, kt_smem.index(stage_idx),
+                qk_scale, BLOCK_M, BLOCK_N,
+                kt_async_layout, kt_dot_layout, mma_layout,
+            )
+
+            # Compute softmax (no K load to overlap with in tail, but keeps structure consistent).
+            acc, l_i, m_i, p = compute_softmax(
+                acc, l_i, m_i, qk, start_n, start_m,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
                 BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-                kt_async_layout, kt_dot_layout,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
 
