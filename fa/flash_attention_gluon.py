@@ -419,22 +419,22 @@ def attn_fwd_inner_pipelined(
     """
     # Prologue: issue async loads for first NUM_STAGES blocks.
     # Issue K then V for each stage to maintain ordering: K0,V0,K1,V1,...
+    # NOTE: No conditional here - caller must ensure block_end - block_start >= NUM_STAGES.
+    # This is required for UpdateAsyncWaitCount pass to compute correct wait counts.
     for stage in gl.static_range(NUM_STAGES):
-        block_n = block_start + stage
-        if block_n < block_end:
-            start_n = block_n * BLOCK_N
-            issue_async_load_k(
-                kt_smem.index(stage), k_base, start_n,
-                stride_kn, stride_kk,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                kt_async_layout,
-            )
-            issue_async_load_v(
-                v_smem.index(stage), v_base, start_n,
-                stride_vk, stride_vn,
-                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-                v_async_layout,
-            )
+        start_n = (block_start + stage) * BLOCK_N
+        issue_async_load_k(
+            kt_smem.index(stage), k_base, start_n,
+            stride_kn, stride_kk,
+            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            kt_async_layout,
+        )
+        issue_async_load_v(
+            v_smem.index(stage), v_base, start_n,
+            stride_vk, stride_vn,
+            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            v_async_layout,
+        )
 
     # Chained dot wait counts (loads complete in issue order: K0,V0,K1,V1,...).
     # After prologue: 2*NUM_STAGES loads in flight.
@@ -795,7 +795,8 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             Q.dtype.element_ty, [NUM_STAGES, BLOCK_N, BLOCK_DMODEL], layout=v_async_smem_layout)
 
         # Process full blocks (no masking needed - faster).
-        if n_full_blocks > 0:
+        # Pipelined prologue requires at least NUM_STAGES blocks.
+        if n_full_blocks >= NUM_STAGES:
             acc, l_i, m_i = attn_fwd_inner_pipelined(
                 acc, l_i, m_i, q_dot, k_base, v_base, start_m,
                 stride_kn, stride_kk, stride_vk, stride_vn,
@@ -812,11 +813,14 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             )
 
         # Process masked blocks (need causal and/or boundary masking).
-        if masked_blocks > 0:
+        # If n_full_blocks < NUM_STAGES, include those in masked path (start from 0).
+        masked_start = n_full_blocks if n_full_blocks >= NUM_STAGES else 0
+        remaining_blocks = n_blocks - masked_start
+        if remaining_blocks >= NUM_STAGES:
             acc, l_i, m_i = attn_fwd_inner_pipelined(
                 acc, l_i, m_i, q_dot, k_base, v_base, start_m,
                 stride_kn, stride_kk, stride_vk, stride_vn,
-                n_full_blocks, n_blocks,
+                masked_start, n_blocks,
                 kt_smem, v_smem,
                 qk_scale,
                 MAX_SEQLENS_Q, MAX_SEQLENS_K,
