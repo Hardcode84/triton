@@ -279,13 +279,16 @@ def compute_dot1_qk(
     q_dot, kt_smem,
     qk_scale: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+    kt_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr,
 ):
     """Dot1: Compute QK^T only. Returns scaled qk scores."""
-    # Load K^T from shared memory directly to dot_op layout.
-    # This avoids convert_layout which causes LDS shuffle with vmcnt(0).
-    kt_dot = cdna4_async.load_shared_relaxed(kt_smem, kt_dot_layout)
+    # Load K^T from shared memory to blocked layout.
+    k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_async_layout)
+
+    # Convert to dot_op layout for MMA.
+    kt_dot = gl.convert_layout(k_t, kt_dot_layout)
 
     # Compute QK^T using MMA (Dot1).
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
@@ -346,12 +349,15 @@ def compute_softmax(
 @gluon.jit
 def compute_dot2_pv(
     acc, p, v_smem,
+    v_async_layout: gl.constexpr,
     p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
 ):
     """Dot2: Compute P @ V and accumulate."""
-    # Load V from shared memory directly to dot_op layout.
-    # This avoids convert_layout which causes LDS shuffle with vmcnt(0).
-    v_dot = cdna4_async.load_shared_relaxed(v_smem, v_dot_layout)
+    # Load V from shared memory to blocked layout.
+    v = cdna4_async.load_shared_relaxed(v_smem, v_async_layout)
+
+    # Convert to dot_op layout for MMA.
+    v_dot = gl.convert_layout(v, v_dot_layout)
 
     # Accumulate P @ V using MMA (Dot2).
     p_cast = p.to(v_dot.dtype)
@@ -368,6 +374,7 @@ def compute_block(
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
+    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
@@ -377,7 +384,7 @@ def compute_block(
     qk = compute_dot1_qk(
         q_dot, kt_smem,
         qk_scale, BLOCK_M, BLOCK_N,
-        kt_dot_layout, mma_layout,
+        kt_async_layout, kt_dot_layout, mma_layout,
     )
     acc, l_i, m_i, p = compute_softmax(
         acc, l_i, m_i, qk, start_n, start_m,
@@ -385,7 +392,7 @@ def compute_block(
         BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
         mma_layout, mma_offs_n_col, mma_offs_m_row,
     )
-    acc = compute_dot2_pv(acc, p, v_smem, p_dot_layout, v_dot_layout)
+    acc = compute_dot2_pv(acc, p, v_smem, v_async_layout, p_dot_layout, v_dot_layout)
     return acc, l_i, m_i
 
 
@@ -459,7 +466,7 @@ def attn_fwd_inner_pipelined(
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
             qk_scale, BLOCK_M, BLOCK_N,
-            kt_dot_layout, mma_layout,
+            kt_async_layout, kt_dot_layout, mma_layout,
         )
 
         # Issue future K (interleaved - start fetching while computing softmax).
@@ -482,7 +489,7 @@ def attn_fwd_inner_pipelined(
         cdna4_async.wait_group(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
         # Issue future V.
         issue_async_load_v(
@@ -506,7 +513,7 @@ def attn_fwd_inner_pipelined(
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
             qk_scale, BLOCK_M, BLOCK_N,
-            kt_dot_layout, mma_layout,
+            kt_async_layout, kt_dot_layout, mma_layout,
         )
 
         # Compute softmax.
@@ -518,7 +525,7 @@ def attn_fwd_inner_pipelined(
         )
 
         # Compute Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
     return acc, l_i, m_i
 
