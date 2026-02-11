@@ -448,16 +448,16 @@ def attn_fwd_inner_pipelined(
     # Main loop: process blocks and issue future loads (no control flow).
     # Interleave memory and compute: issue K after Dot1 (before softmax), issue V after Dot2.
     # Use warp_pipeline_stage for pingpong scheduling between memory and compute clusters.
+    # Note: async_wait must be OUTSIDE pipeline stages (the WarpPipeliner requires this).
     for block_n in range(block_start, main_loop_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
         future_start_n = (block_n + NUM_STAGES) * BLOCK_N
 
-        # Memory cluster 1: Wait for K data to be ready.
-        with warp_pipeline_stage("mem1", priority=1):
-            cdna4_async.wait_group(WAIT_K)
+        # Wait for K (must be outside cluster).
+        cdna4_async.wait_group(WAIT_K)
 
-        # Compute cluster 1: Dot1 (QK^T).
+        # Compute cluster 1: Dot1 (QK^T) + issue K + softmax.
         with warp_pipeline_stage("dot1", priority=0):
             qk = compute_dot1_qk(
                 q_dot, kt_smem.index(stage_idx),
@@ -465,7 +465,8 @@ def attn_fwd_inner_pipelined(
                 kt_dot_layout, mma_layout,
             )
 
-            # Issue future K (interleaved - start fetching while computing softmax).
+        # Memory cluster 1: Issue future K (higher priority for memory ops).
+        with warp_pipeline_stage("mem1", priority=1):
             issue_async_load_k(
                 kt_smem.index(stage_idx), k_base, future_start_n,
                 stride_kn, stride_kk,
@@ -481,15 +482,15 @@ def attn_fwd_inner_pipelined(
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
 
-        # Memory cluster 2: Wait for V data to be ready.
-        with warp_pipeline_stage("mem2", priority=1):
-            cdna4_async.wait_group(WAIT_V)
+        # Wait for V (must be outside cluster).
+        cdna4_async.wait_group(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
         with warp_pipeline_stage("dot2", priority=0):
             acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
 
-            # Issue future V.
+        # Memory cluster 2: Issue future V (higher priority for memory ops).
+        with warp_pipeline_stage("mem2", priority=1):
             issue_async_load_v(
                 v_smem.index(stage_idx), v_base, future_start_n,
                 stride_vk, stride_vn,
