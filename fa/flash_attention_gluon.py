@@ -698,15 +698,21 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     k_base = K + off_z * stride_kz + off_h_k * stride_kh
     v_base = V + off_z * stride_vz + off_h_k * stride_vh
 
-    # Load Q tile [BLOCK_M, BLOCK_DMODEL] directly (only loaded once, no need for shared memory).
+    # Load Q tile [BLOCK_M, BLOCK_DMODEL].
+    # We load through shared memory to avoid LDS shuffle when converting to dot_op layout.
+    # This matches Triton's approach: load to blocked -> store to swizzled shared -> load to dot_op.
+    q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[1, 0])
+    q_smem = gl.allocate_shared_memory(Q.dtype.element_ty, [BLOCK_M, BLOCK_DMODEL], layout=q_smem_layout)
+
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q_mask = offs_m[:, None] < MAX_SEQLENS_Q
     if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
         q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
-    # Convert Q to dot operand layout once (hoisted from loop).
-    q_dot = gl.convert_layout(q, q_dot_layout)
+    # Store Q to shared memory and load directly to dot operand layout (no LDS shuffle needed).
+    q_smem.store(q)
+    q_dot = q_smem.load(q_dot_layout)
 
     # Initialize accumulators.
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
