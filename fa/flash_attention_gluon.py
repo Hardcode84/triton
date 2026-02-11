@@ -496,44 +496,32 @@ def attn_fwd_inner_pipelined(
         )
 
     # Tail loop: last NUM_STAGES iterations, no future loads to issue.
-    # Wait counts decrease each iteration since we consume but don't issue.
-    # Use static_range so wait counts can be constexpr.
-    # Iteration i: 2*(NUM_STAGES - i) loads in flight before consuming.
-    #   WAIT_K = 2*(NUM_STAGES - i) - 1
-    #   WAIT_V = 2*(NUM_STAGES - i) - 2
-    for i in gl.static_range(NUM_STAGES):
-        block_n = main_loop_end + i
-        if block_n < block_end:
-            stage_idx = block_n % NUM_STAGES
-            start_n = block_n * BLOCK_N
+    # Drain all outstanding async loads first, then process without pipelining.
+    # This avoids static_range unrolling which causes massive code bloat.
+    cdna4_async.wait_group(0)
 
-            # Wait counts decrease as we drain the pipeline.
-            TAIL_WAIT_K: gl.constexpr = 2 * (NUM_STAGES - i) - 1
-            TAIL_WAIT_V: gl.constexpr = 2 * (NUM_STAGES - i) - 2
+    for block_n in range(main_loop_end, block_end):
+        stage_idx = block_n % NUM_STAGES
+        start_n = block_n * BLOCK_N
 
-            # Wait for K.
-            cdna4_async.wait_group(TAIL_WAIT_K)
+        # K and V data already in shared memory from prologue/main loop.
+        # Compute Dot1 (QK^T).
+        qk = compute_dot1_qk(
+            q_dot, kt_smem.index(stage_idx),
+            qk_scale, BLOCK_M, BLOCK_N,
+            kt_async_layout, kt_dot_layout, mma_layout,
+        )
 
-            # Compute Dot1 (QK^T) only.
-            qk = compute_dot1_qk(
-                q_dot, kt_smem.index(stage_idx),
-                qk_scale, BLOCK_M, BLOCK_N,
-                kt_async_layout, kt_dot_layout, mma_layout,
-            )
+        # Compute softmax.
+        acc, l_i, m_i, p = compute_softmax(
+            acc, l_i, m_i, qk, start_n, start_m,
+            MAX_SEQLENS_Q, MAX_SEQLENS_K,
+            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+            mma_layout, mma_offs_n_col, mma_offs_m_row,
+        )
 
-            # Compute softmax (no K load to overlap with in tail, but keeps structure consistent).
-            acc, l_i, m_i, p = compute_softmax(
-                acc, l_i, m_i, qk, start_n, start_m,
-                MAX_SEQLENS_Q, MAX_SEQLENS_K,
-                BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-                mma_layout, mma_offs_n_col, mma_offs_m_row,
-            )
-
-            # Wait for V.
-            cdna4_async.wait_group(TAIL_WAIT_V)
-
-            # Compute cluster 2: Dot2 (PV).
-            acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
+        # Compute Dot2 (PV).
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
 
     return acc, l_i, m_i
 
