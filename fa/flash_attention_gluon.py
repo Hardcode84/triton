@@ -35,7 +35,7 @@ from triton.experimental.gluon.language.amd.rdna4 import wmma as wmma_rdna4
 from triton.experimental.gluon.language.amd.cdna3 import mfma as mfma_cdna3
 from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
-from triton.experimental.gluon.language._layouts import DotOperandLayout
+from triton.experimental.gluon.language._layouts import DotOperandLayout, DistributedLinearLayout, PaddedSharedLayout
 
 
 def is_hip():
@@ -279,16 +279,13 @@ def compute_dot1_qk(
     q_dot, kt_smem,
     qk_scale: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
-    kt_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr,
 ):
     """Dot1: Compute QK^T only. Returns scaled qk scores."""
-    # Load K^T from shared memory to blocked layout.
-    k_t = cdna4_async.load_shared_relaxed(kt_smem, kt_async_layout)
-
-    # Convert to dot_op layout for MMA.
-    kt_dot = gl.convert_layout(k_t, kt_dot_layout)
+    # Load K^T from shared memory directly to DotOperandLayout.
+    # PaddedSharedLayout ensures bank-conflict-free access.
+    kt_dot = cdna4_async.load_shared_relaxed(kt_smem, kt_dot_layout)
 
     # Compute QK^T using MMA (Dot1).
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
@@ -349,15 +346,12 @@ def compute_softmax(
 @gluon.jit
 def compute_dot2_pv(
     acc, p, v_smem,
-    v_async_layout: gl.constexpr,
     p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
 ):
     """Dot2: Compute P @ V and accumulate."""
-    # Load V from shared memory to blocked layout.
-    v = cdna4_async.load_shared_relaxed(v_smem, v_async_layout)
-
-    # Convert to dot_op layout for MMA.
-    v_dot = gl.convert_layout(v, v_dot_layout)
+    # Load V from shared memory directly to DotOperandLayout.
+    # PaddedSharedLayout ensures bank-conflict-free access.
+    v_dot = cdna4_async.load_shared_relaxed(v_smem, v_dot_layout)
 
     # Accumulate P @ V using MMA (Dot2).
     p_cast = p.to(v_dot.dtype)
@@ -374,7 +368,6 @@ def compute_block(
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
-    kt_async_layout: gl.constexpr, v_async_layout: gl.constexpr,
     kt_dot_layout: gl.constexpr, p_dot_layout: gl.constexpr, v_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
@@ -384,7 +377,7 @@ def compute_block(
     qk = compute_dot1_qk(
         q_dot, kt_smem,
         qk_scale, BLOCK_M, BLOCK_N,
-        kt_async_layout, kt_dot_layout, mma_layout,
+        kt_dot_layout, mma_layout,
     )
     acc, l_i, m_i, p = compute_softmax(
         acc, l_i, m_i, qk, start_n, start_m,
@@ -392,7 +385,7 @@ def compute_block(
         BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
         mma_layout, mma_offs_n_col, mma_offs_m_row,
     )
-    acc = compute_dot2_pv(acc, p, v_smem, v_async_layout, p_dot_layout, v_dot_layout)
+    acc = compute_dot2_pv(acc, p, v_smem, p_dot_layout, v_dot_layout)
     return acc, l_i, m_i
 
 
@@ -466,7 +459,7 @@ def attn_fwd_inner_pipelined(
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
             qk_scale, BLOCK_M, BLOCK_N,
-            kt_async_layout, kt_dot_layout, mma_layout,
+            kt_dot_layout, mma_layout,
         )
 
         # Issue future K (interleaved - start fetching while computing softmax).
@@ -489,7 +482,7 @@ def attn_fwd_inner_pipelined(
         cdna4_async.wait_group(WAIT_V)
 
         # Compute cluster 2: Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
 
         # Issue future V.
         issue_async_load_v(
@@ -513,7 +506,7 @@ def attn_fwd_inner_pipelined(
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
             qk_scale, BLOCK_M, BLOCK_N,
-            kt_async_layout, kt_dot_layout, mma_layout,
+            kt_dot_layout, mma_layout,
         )
 
         # Compute softmax.
@@ -525,7 +518,7 @@ def attn_fwd_inner_pipelined(
         )
 
         # Compute Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), v_async_layout, p_dot_layout, v_dot_layout)
+        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
 
     return acc, l_i, m_i
 
@@ -758,25 +751,62 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     USE_PIPELINED: gl.constexpr = (MMA_TYPE == "mfma_cdna4") and (NUM_STAGES > 1) and (BLOCK_DMODEL >= 128)
 
     if USE_PIPELINED:
-        # Async copy layout configuration for direct-to-LDS writes.
-        # Use non-swizzled shared memory (vec=1, per_phase=1, max_phase=1) for
-        # strict coalescing which is required by canCoalesceWriteIntoSharedMemory.
+        # Async copy layout configuration using PaddedSharedLayout for bank conflict-free access.
+        # This matches Triton's FA layout which uses row permutation (high bits before low bits
+        # for the non-fast dimension) to spread accesses across different banks.
         #
         # Memory layout:
-        # - K^T [BLOCK_DMODEL, BLOCK_N]: stride_kk=1 (dim0 fast), order=[0, 1]
-        # - V [BLOCK_N, BLOCK_DMODEL]: stride_vn=1 (dim1 fast), order=[1, 0]
-        kt_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0, 1])
-        v_async_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+        # - K^T [BLOCK_DMODEL, BLOCK_N] = [128, 64]: dim0 fast, order=[0, 1]
+        # - V [BLOCK_N, BLOCK_DMODEL] = [64, 128]: dim1 fast, order=[1, 0]
+        #
+        # Triton uses #ttg.padded_shared with [512:+8] for K^T and [512:+32] for V.
+        # The offset_bases follow a row permutation pattern for bank conflict avoidance.
 
-        # Blocked layouts: all 64 lanes map to fast dimension for coalesced writes.
-        # K^T [128, BLOCK_N]: 64 lanes * vec=2 = 128 elements in dim0.
-        kt_async_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[2, 8], threads_per_warp=[64, 1],
-            warps_per_cta=[1, num_warps], order=[0, 1])
-        # V [BLOCK_N, 128]: 64 lanes * vec=2 = 128 elements in dim1.
-        v_async_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[8, 2], threads_per_warp=[1, 64],
-            warps_per_cta=[num_warps, 1], order=[1, 0])
+        # K^T offset_bases: 7 bases for dim0 (128), then 6 reordered bases for dim1 (64).
+        # Reordering: high bits [0,16], [0,32] come before low bits [0,1], [0,2], [0,4], [0,8].
+        kt_offset_bases: gl.constexpr = [
+            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],  # dim0 (7 bases)
+            [0, 16], [0, 32],  # dim1 high bits
+            [0, 1], [0, 2], [0, 4], [0, 8]  # dim1 low bits
+        ]
+        kt_async_smem_layout: gl.constexpr = PaddedSharedLayout(
+            interval_padding_pairs=[[512, 8]],
+            offset_bases=kt_offset_bases,
+            cga_layout=[],
+            shape=[BLOCK_DMODEL, BLOCK_N])
+
+        # V offset_bases: 7 bases for dim1 (128), then 6 reordered bases for dim0 (64).
+        v_offset_bases: gl.constexpr = [
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],  # dim1 (7 bases)
+            [16, 0], [32, 0],  # dim0 high bits
+            [1, 0], [2, 0], [4, 0], [8, 0]  # dim0 low bits
+        ]
+        v_async_smem_layout: gl.constexpr = PaddedSharedLayout(
+            interval_padding_pairs=[[512, 32]],
+            offset_bases=v_offset_bases,
+            cga_layout=[],
+            shape=[BLOCK_N, BLOCK_DMODEL])
+
+        # DistributedLinearLayout for async copy offsets.
+        # Following CoalesceAsyncCopy algorithm: distribute offset_bases to reg/lane/warp.
+        # For vec=8 (3 reg bases), threads_per_warp=64 (6 lane bases), num_warps=8 (3 warp bases).
+        # Remaining bases go to additional registers.
+        #
+        # K^T: 13 bases total -> reg(3+1), lane(6), warp(3)
+        kt_async_layout: gl.constexpr = DistributedLinearLayout(
+            reg_bases=[[1, 0], [2, 0], [4, 0], [0, 8]],
+            lane_bases=[[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]],
+            warp_bases=[[0, 1], [0, 2], [0, 4]],
+            block_bases=[],
+            shape=[BLOCK_DMODEL, BLOCK_N])
+
+        # V: 13 bases total -> reg(3+1), lane(6), warp(3)
+        v_async_layout: gl.constexpr = DistributedLinearLayout(
+            reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]],
+            lane_bases=[[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]],
+            warp_bases=[[1, 0], [2, 0], [4, 0]],
+            block_bases=[],
+            shape=[BLOCK_N, BLOCK_DMODEL])
 
         # Allocate multi-buffered shared memory for pipelining.
         # Use a single 3D buffer with NUM_STAGES as the first dimension.
