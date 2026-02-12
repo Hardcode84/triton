@@ -447,53 +447,55 @@ def attn_fwd_inner_pipelined(
 
     # Main loop: process blocks and issue future loads (no control flow).
     # Interleave memory and compute: issue K after Dot1 (before softmax), issue V after Dot2.
-    # NOTE: warp_pipeline_stage is not used here because ConvertWarpPipeline doesn't support
-    # async_wait ops between clusters (Triton limitation). The async copy pipelining still
-    # provides good performance through overlapping memory and compute.
+    # Use warp_pipeline_stage for pingpong scheduling between memory and compute clusters.
     for block_n in range(block_start, main_loop_end):
-        stage_idx = block_n % NUM_STAGES
-        start_n = block_n * BLOCK_N
-        future_start_n = (block_n + NUM_STAGES) * BLOCK_N
+        # Init cluster: index calculations.
+        with warp_pipeline_stage("init", priority=1):
+            stage_idx = block_n % NUM_STAGES
+            start_n = block_n * BLOCK_N
+            future_start_n = (block_n + NUM_STAGES) * BLOCK_N
 
-        # Wait for K.
+        # Wait for K (between clusters - should be handled by ConvertWarpPipeline).
         cdna4_async.wait_group(WAIT_K)
 
-        # Compute Dot1 (QK^T).
-        qk = compute_dot1_qk(
-            q_dot, kt_smem.index(stage_idx),
-            qk_scale, BLOCK_M, BLOCK_N,
-            kt_dot_layout, mma_layout,
-        )
+        # Compute cluster 1: Dot1 (QK^T).
+        with warp_pipeline_stage("dot1", priority=0):
+            qk = compute_dot1_qk(
+                q_dot, kt_smem.index(stage_idx),
+                qk_scale, BLOCK_M, BLOCK_N,
+                kt_dot_layout, mma_layout,
+            )
 
-        # Issue future K (interleaved - start fetching while computing softmax).
-        issue_async_load_k(
-            kt_smem.index(stage_idx), k_base, future_start_n,
-            stride_kn, stride_kk,
-            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            kt_async_layout,
-        )
+        # Memory cluster 1: Issue future K + softmax.
+        with warp_pipeline_stage("mem1", priority=1):
+            issue_async_load_k(
+                kt_smem.index(stage_idx), k_base, future_start_n,
+                stride_kn, stride_kk,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                kt_async_layout,
+            )
+            acc, l_i, m_i, p = compute_softmax(
+                acc, l_i, m_i, qk, start_n, start_m,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
+            )
 
-        # Compute softmax (overlaps with K load).
-        acc, l_i, m_i, p = compute_softmax(
-            acc, l_i, m_i, qk, start_n, start_m,
-            MAX_SEQLENS_Q, MAX_SEQLENS_K,
-            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-            mma_layout, mma_offs_n_col, mma_offs_m_row,
-        )
-
-        # Wait for V.
+        # Wait for V (between clusters).
         cdna4_async.wait_group(WAIT_V)
 
-        # Compute Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
+        # Compute cluster 2: Dot2 (PV).
+        with warp_pipeline_stage("dot2", priority=0):
+            acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
 
-        # Issue future V.
-        issue_async_load_v(
-            v_smem.index(stage_idx), v_base, future_start_n,
-            stride_vk, stride_vn,
-            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            v_async_layout,
-        )
+        # Memory cluster 2: Issue future V.
+        with warp_pipeline_stage("mem2", priority=1):
+            issue_async_load_v(
+                v_smem.index(stage_idx), v_base, future_start_n,
+                stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                v_async_layout,
+            )
 
     # Tail loop: last NUM_STAGES iterations, no future loads to issue.
     # Drain all outstanding async loads first, then process without pipelining.
