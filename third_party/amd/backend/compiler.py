@@ -434,8 +434,10 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_loop_aware_cse(pm)
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-        passes.ttir.add_loop_unroll(pm)  # Enable loop unrolling for Gluon kernels.
+        # WarpPipeliner must run BEFORE loop unrolling to preserve pipeline structure.
+        # Unrolling after pipelining replicates the s_setprio hints correctly.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        passes.ttir.add_loop_unroll(pm)  # Enable loop unrolling for Gluon kernels.
         passes.ttgpuir.add_allocate_warp_groups(pm)
 
         if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):

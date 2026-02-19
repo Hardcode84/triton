@@ -470,7 +470,7 @@ def attn_fwd_inner_pipelined(
     # Pattern: wait -> dot1 (compute) -> mem1 (softmax+issue K) -> wait -> dot2 (compute) -> mem2 (issue V)
     # NOTE: Loop bookkeeping (stage_idx, offsets) must be inside a stage, not before async_wait,
     # because WarpPipeliner fails if non-ignorable ops appear before ignorable ops (async_wait).
-    # Use tl.range with loop_unroll_factor to enable loop unrolling for better performance.
+    # NOTE: WarpPipeliner must run BEFORE loop unrolling (configured in compiler.py).
     for block_n in tl.range(block_start, main_loop_end, loop_unroll_factor=4):
         # Wait for K (between stages, must come FIRST in loop body).
         cdna4_async.wait_group(WAIT_K)
