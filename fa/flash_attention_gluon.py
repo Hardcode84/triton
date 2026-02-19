@@ -428,11 +428,14 @@ def attn_fwd_inner_pipelined(
     """
     Pipelined inner attention loop for CDNA4 with chained dot pattern.
 
-    Structure for pingpong optimization:
-    - async_wait(K) -> Dot1 (QK^T) + softmax -> issue future K
-    - async_wait(V) -> Dot2 (PV) -> issue future V
+    Structure for pingpong optimization (6 stages):
+    - async_wait(K) -> lds_k (LDS read K) -> dot1 (pure MMA QK^T)
+    - mem1 (softmax + issue future K) -> async_wait(V)
+    - lds_v (LDS read V) -> dot2 (pure MMA PV) -> mem2 (issue future V)
 
-    This creates two compute clusters (Dot1, Dot2) with memory clusters between them.
+    LDS reads are separated from MMA compute so the warp pipeliner can
+    properly assign priorities: memory stages get high priority (1),
+    compute stages get low priority (0).
     """
     # Prologue: issue async loads for first NUM_STAGES blocks.
     # Issue K then V for each stage to maintain ordering: K0,V0,K1,V1,...
@@ -467,7 +470,10 @@ def attn_fwd_inner_pipelined(
 
     # Main loop: process blocks and issue future loads (no control flow).
     # Uses warp_pipeline_stage for pingpong scheduling with s_setprio hints.
-    # Pattern: wait -> dot1 (compute) -> mem1 (softmax+issue K) -> wait -> dot2 (compute) -> mem2 (issue V)
+    # Pattern: wait -> lds_k (LDS read) -> dot1 (pure MMA) -> mem1 (softmax+issue K)
+    #       -> wait -> lds_v (LDS read) -> dot2 (pure MMA) -> mem2 (issue V)
+    # LDS reads are separated from MMA compute so the pipeliner can properly
+    # distinguish memory and compute regions for pingpong scheduling.
     # NOTE: Loop bookkeeping (stage_idx, offsets) must be inside a stage, not before async_wait,
     # because WarpPipeliner fails if non-ignorable ops appear before ignorable ops (async_wait).
     # NOTE: WarpPipeliner must run BEFORE loop unrolling (configured in compiler.py).
@@ -475,17 +481,18 @@ def attn_fwd_inner_pipelined(
         # Wait for K (between stages, must come FIRST in loop body).
         cdna4_async.wait_group(WAIT_K)
 
-        # Dot1: Compute QK^T (compute-heavy, low priority).
-        # Loop bookkeeping is included here to keep it inside a pipeline stage.
-        with warp_pipeline_stage("dot1", priority=0):
+        # LDS K: Load K^T from shared memory (memory, high priority).
+        # Bookkeeping is here to keep it inside a pipeline stage.
+        with warp_pipeline_stage("lds_k", priority=1):
             stage_idx = block_n % NUM_STAGES
             start_n = block_n * BLOCK_N
             future_start_n = (block_n + NUM_STAGES) * BLOCK_N
-            qk = compute_dot1_qk(
-                q_dot, kt_smem.index(stage_idx),
-                qk_scale, BLOCK_M, BLOCK_N,
-                kt_dot_layout, mma_layout,
-            )
+            kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(stage_idx), kt_dot_layout)
+
+        # Dot1: Pure MMA for QK^T (compute, low priority).
+        with warp_pipeline_stage("dot1", priority=0):
+            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+            qk = do_mma("mfma_cdna4", q_dot, kt_dot, qk)
 
         # Mem1: Issue future K + softmax (memory + ALU, high priority).
         with warp_pipeline_stage("mem1", priority=1):
@@ -506,9 +513,15 @@ def attn_fwd_inner_pipelined(
         # Wait for V (between stages).
         cdna4_async.wait_group(WAIT_V)
 
-        # Dot2: Compute PV (compute-heavy, low priority).
+        # LDS V: Load V from shared memory + prepare P operand (memory, high priority).
+        with warp_pipeline_stage("lds_v", priority=1):
+            v_dot = cdna4_async.load_shared_relaxed(v_smem.index(stage_idx), v_dot_layout)
+
+        # Dot2: Pure MMA for PV (compute, low priority).
         with warp_pipeline_stage("dot2", priority=0):
-            acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
+            p_cast = p.to(v_dot.dtype)
+            p_dot = gl.convert_layout(p_cast, p_dot_layout)
+            acc = do_mma("mfma_cdna4", p_dot, v_dot, acc)
 
         # Mem2: Issue future V (memory, high priority).
         with warp_pipeline_stage("mem2", priority=1):
