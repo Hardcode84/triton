@@ -700,10 +700,14 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
         gl.static_assert(False, "Unknown MMA_TYPE")
 
     # Layouts for dot operands and blocked loads/stores.
+    # Use smaller k_width for P@V dot to reduce permlanes in MMA→DotOperand conversion.
+    # Triton uses kWidth=4 for P@V operands on CDNA4.
+    # Q@K^T uses larger k_width for efficient memory loads.
+    pv_k_width: gl.constexpr = 4 if MMA_TYPE == "mfma_cdna4" else k_width
     q_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=mma_layout, k_width=k_width)
     kt_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=mma_layout, k_width=k_width)
-    p_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=mma_layout, k_width=k_width)
-    v_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=mma_layout, k_width=k_width)
+    p_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=mma_layout, k_width=pv_k_width)
+    v_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=mma_layout, k_width=pv_k_width)
 
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8], threads_per_warp=[threads_per_warp // 4, 4],
