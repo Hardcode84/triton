@@ -27,6 +27,7 @@ Optimizations applied:
 
 import torch
 import triton
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import AMDWMMALayout, AMDMFMALayout, warp_pipeline_stage
@@ -450,7 +451,8 @@ def attn_fwd_inner_pipelined(
     # Pattern: wait -> dot1 (compute) -> mem1 (softmax+issue K) -> wait -> dot2 (compute) -> mem2 (issue V)
     # NOTE: Loop bookkeeping (stage_idx, offsets) must be inside a stage, not before async_wait,
     # because WarpPipeliner fails if non-ignorable ops appear before ignorable ops (async_wait).
-    for block_n in range(block_start, main_loop_end):
+    # Use tl.range with loop_unroll_factor to enable loop unrolling for better performance.
+    for block_n in tl.range(block_start, main_loop_end, loop_unroll_factor=4):
         # Wait for K (between stages, must come FIRST in loop body).
         cdna4_async.wait_group(WAIT_K)
 
