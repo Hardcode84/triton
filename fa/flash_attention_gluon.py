@@ -406,18 +406,19 @@ def attn_fwd_inner_pipelined(
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
     """
-    Pipelined inner attention loop for CDNA4 with chained dot pattern.
+    Pipelined inner attention loop for CDNA4 with pingpong warp scheduling.
 
-    Structure for pingpong optimization:
-    - async_wait(K) -> Dot1 (QK^T) + softmax -> issue future K
-    - async_wait(V) -> Dot2 (PV) -> issue future V
+    Structure with 4 pipeline stages following gfx1250 FA pattern:
+    - stage0 (priority=0): Compute QK (Dot1)
+    - wait for K
+    - stage1 (priority=1): Softmax + LDS load V + issue future K
+    - stage2 (priority=0): Compute PV (Dot2)
+    - wait for V
+    - stage3 (priority=1): Issue future V
 
-    This creates two compute clusters (Dot1, Dot2) with memory clusters between them.
+    Priority 0 = compute-heavy (MMA), Priority 1 = memory-heavy (LDS/async).
     """
     # Prologue: issue async loads for first NUM_STAGES blocks.
-    # Issue K then V for each stage to maintain ordering: K0,V0,K1,V1,...
-    # NOTE: No conditional here - caller must ensure block_end - block_start >= NUM_STAGES.
-    # This is required for UpdateAsyncWaitCount pass to compute correct wait counts.
     for stage in gl.static_range(NUM_STAGES):
         start_n = (block_start + stage) * BLOCK_N
         issue_async_load_k(
@@ -433,86 +434,73 @@ def attn_fwd_inner_pipelined(
             v_async_layout,
         )
 
-    # Chained dot wait counts (loads complete in issue order: K0,V0,K1,V1,...).
-    # After prologue: 2*NUM_STAGES loads in flight.
-    # wait(2*NUM_STAGES - 1): K[current] ready (1 load done).
-    # wait(2*NUM_STAGES - 2): V[current] ready (2 loads done, K and V for current block).
+    # Wait counts for chained dot pattern.
     WAIT_K: gl.constexpr = 2 * NUM_STAGES - 1
     WAIT_V: gl.constexpr = 2 * NUM_STAGES - 2
 
-    # Split into main loop + tail loop to eliminate control flow.
-    # Main loop: always issues future loads (no conditional).
-    # Tail loop: last NUM_STAGES iterations, no future loads to issue.
     main_loop_end = block_end - NUM_STAGES
 
-    # Main loop: process blocks and issue future loads (no control flow).
-    # Interleave memory and compute: issue K after Dot1 (before softmax), issue V after Dot2.
-    # NOTE: warp_pipeline_stage is not used here because ConvertWarpPipeline doesn't support
-    # async_wait ops between clusters (Triton limitation). The async copy pipelining still
-    # provides good performance through overlapping memory and compute.
+    # Main loop with warp_pipeline_stage for pingpong scheduling.
     for block_n in range(block_start, main_loop_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
         future_start_n = (block_n + NUM_STAGES) * BLOCK_N
 
-        # Wait for K.
+        # Stage 0: Compute QK (low priority - compute heavy).
+        with warp_pipeline_stage("dot1", priority=0):
+            qk = compute_dot1_qk(
+                q_dot, kt_smem.index(stage_idx),
+                qk_scale, BLOCK_M, BLOCK_N,
+                kt_dot_layout, mma_layout,
+            )
+
+        # Wait for K between stages.
         cdna4_async.wait_group(WAIT_K)
 
-        # Compute Dot1 (QK^T).
-        qk = compute_dot1_qk(
-            q_dot, kt_smem.index(stage_idx),
-            qk_scale, BLOCK_M, BLOCK_N,
-            kt_dot_layout, mma_layout,
-        )
+        # Stage 1: Softmax + issue future K (high priority - memory).
+        with warp_pipeline_stage("softmax_mem", priority=1):
+            acc, l_i, m_i, p = compute_softmax(
+                acc, l_i, m_i, qk, start_n, start_m,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K,
+                BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
+                mma_layout, mma_offs_n_col, mma_offs_m_row,
+            )
+            issue_async_load_k(
+                kt_smem.index(stage_idx), k_base, future_start_n,
+                stride_kn, stride_kk,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                kt_async_layout,
+            )
 
-        # Issue future K (interleaved - start fetching while computing softmax).
-        issue_async_load_k(
-            kt_smem.index(stage_idx), k_base, future_start_n,
-            stride_kn, stride_kk,
-            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            kt_async_layout,
-        )
+        # Stage 2: Compute PV (low priority - compute heavy).
+        with warp_pipeline_stage("dot2", priority=0):
+            acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
 
-        # Compute softmax (overlaps with K load).
-        acc, l_i, m_i, p = compute_softmax(
-            acc, l_i, m_i, qk, start_n, start_m,
-            MAX_SEQLENS_Q, MAX_SEQLENS_K,
-            BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
-            mma_layout, mma_offs_n_col, mma_offs_m_row,
-        )
-
-        # Wait for V.
+        # Wait for V between stages.
         cdna4_async.wait_group(WAIT_V)
 
-        # Compute Dot2 (PV).
-        acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
+        # Stage 3: Issue future V (high priority - memory).
+        with warp_pipeline_stage("issue_v", priority=1):
+            issue_async_load_v(
+                v_smem.index(stage_idx), v_base, future_start_n,
+                stride_vk, stride_vn,
+                MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+                v_async_layout,
+            )
 
-        # Issue future V.
-        issue_async_load_v(
-            v_smem.index(stage_idx), v_base, future_start_n,
-            stride_vk, stride_vn,
-            MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            v_async_layout,
-        )
-
-    # Tail loop: last NUM_STAGES iterations, no future loads to issue.
-    # Drain all outstanding async loads first, then process without pipelining.
-    # This avoids static_range unrolling which causes massive code bloat.
+    # Tail loop: drain remaining without pipelining.
     cdna4_async.wait_group(0)
 
     for block_n in range(main_loop_end, block_end):
         stage_idx = block_n % NUM_STAGES
         start_n = block_n * BLOCK_N
 
-        # K and V data already in shared memory from prologue/main loop.
-        # Compute Dot1 (QK^T).
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
             qk_scale, BLOCK_M, BLOCK_N,
             kt_dot_layout, mma_layout,
         )
 
-        # Compute softmax.
         acc, l_i, m_i, p = compute_softmax(
             acc, l_i, m_i, qk, start_n, start_m,
             MAX_SEQLENS_Q, MAX_SEQLENS_K,
@@ -520,7 +508,6 @@ def attn_fwd_inner_pipelined(
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
 
-        # Compute Dot2 (PV).
         acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
 
     return acc, l_i, m_i
