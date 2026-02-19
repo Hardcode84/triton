@@ -522,14 +522,14 @@ def attn_fwd_inner_pipelined(
         # Mem2: Issue future V + LDS load K^T for next dot1 (memory, high priority).
         # Load from next iteration's buffer: mem1 already overwrote kt_smem[stage_idx].
         with warp_pipeline_stage("mem2", priority=1):
+            next_stage_idx = (block_n + 1) % NUM_STAGES
+            kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(next_stage_idx), kt_dot_layout)
             issue_async_load_v(
                 v_smem.index(stage_idx), v_base, future_start_n,
                 stride_vk, stride_vn,
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
                 v_async_layout,
             )
-            next_stage_idx = (block_n + 1) % NUM_STAGES
-            kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(next_stage_idx), kt_dot_layout)
 
     # Tail loop: last NUM_STAGES iterations, no future loads to issue.
     # Use gl.static_range to inline (unroll) tail iterations for better scheduling.
