@@ -520,15 +520,20 @@ def attn_fwd_inner_pipelined(
             )
 
     # Tail loop: last NUM_STAGES iterations, no future loads to issue.
-    # Drain all outstanding async loads first, then process without pipelining.
-    # This avoids static_range unrolling which causes massive code bloat.
-    cdna4_async.wait_group(0)
+    # Use gl.static_range to inline (unroll) tail iterations for better scheduling.
+    # Each iteration uses descending wait counts instead of conservative wait_group(0).
+    # At start of tail: 2*NUM_STAGES outstanding loads (K and V for each remaining block).
+    # Iteration i: wait(2*(NUM_STAGES-i)-1) for K, wait(2*(NUM_STAGES-i)-2) for V.
+    for tail_i in gl.static_range(NUM_STAGES):
+        # Wait for K to be ready with descending wait count.
+        # Outstanding loads decrease by 2 each iteration (consume K and V).
+        cdna4_async.wait_group(2 * (NUM_STAGES - tail_i) - 1)
 
-    for block_n in range(main_loop_end, block_end):
-        stage_idx = block_n % NUM_STAGES
-        start_n = block_n * BLOCK_N
+        # block_n = main_loop_end + tail_i = (block_end - NUM_STAGES) + tail_i
+        # stage_idx = tail_i (since block_end is typically a multiple of NUM_STAGES).
+        stage_idx = tail_i
+        start_n = (main_loop_end + tail_i) * BLOCK_N
 
-        # K and V data already in shared memory from prologue/main loop.
         # Compute Dot1 (QK^T).
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
@@ -544,6 +549,9 @@ def attn_fwd_inner_pipelined(
             BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
             mma_layout, mma_offs_n_col, mma_offs_m_row,
         )
+
+        # Wait for V to be ready with descending wait count.
+        cdna4_async.wait_group(2 * (NUM_STAGES - tail_i) - 2)
 
         # Compute Dot2 (PV).
         acc = compute_dot2_pv(acc, p, v_smem.index(stage_idx), p_dot_layout, v_dot_layout)
