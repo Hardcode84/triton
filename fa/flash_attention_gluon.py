@@ -283,7 +283,11 @@ def compute_dot1_qk(
     kt_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr,
 ):
-    """Dot1: Compute QK^T only. Returns scaled qk scores."""
+    """Dot1: Compute QK^T only. Returns UNSCALED qk scores.
+
+    Scaling is deferred to compute_softmax to enable FMA fusion:
+    qk * qk_scale - m_new can be compiled to a single FMA instruction.
+    """
     # Load K^T from shared memory directly to DotOperandLayout.
     # PaddedSharedLayout ensures bank-conflict-free access.
     kt_dot = cdna4_async.load_shared_relaxed(kt_smem, kt_dot_layout)
@@ -292,43 +296,57 @@ def compute_dot1_qk(
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
     qk = do_mma("mfma_cdna4", q_dot, kt_dot, qk)
 
-    # Scale QK scores.
-    qk = qk * qk_scale
-
+    # NOTE: Scaling deferred to compute_softmax for FMA fusion.
     return qk
 
 
 @gluon.jit
 def compute_softmax(
     acc, l_i, m_i, qk, start_n, start_m,
+    qk_scale: gl.constexpr,
     MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     MASK_STEPS: gl.constexpr, IS_CAUSAL: gl.constexpr,
     mma_layout: gl.constexpr, mma_offs_n_col: gl.constexpr, mma_offs_m_row: gl.constexpr,
 ):
-    """Online softmax: mask, compute max, exp, sum, scale accumulator."""
-    # Apply causal mask (only for masked blocks).
-    if MASK_STEPS and IS_CAUSAL:
-        causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
-        causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
-        causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
-        causal_mask = causal_offs_m[:, None] >= causal_boundary
-        qk = gl.where(causal_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
-                                                dtype=gl.float32, layout=mma_layout))
+    """Online softmax: mask, compute max, exp, sum, scale accumulator.
 
-    # Mask out-of-bounds K positions (only for masked blocks).
+    Takes UNSCALED qk and applies qk_scale during computation to enable FMA fusion.
+    Pattern: qk * qk_scale - m_new compiles to FMA instruction.
+    """
     if MASK_STEPS:
+        # For masked steps, scale qk first, then apply masks.
+        qk_scaled = qk * qk_scale
+
+        # Apply causal mask.
+        if IS_CAUSAL:
+            causal_offs_n = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
+            causal_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
+            causal_boundary = causal_offs_n[None, :] + MAX_SEQLENS_Q - MAX_SEQLENS_K
+            causal_mask = causal_offs_m[:, None] >= causal_boundary
+            qk_scaled = gl.where(causal_mask, qk_scaled, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
+                                                    dtype=gl.float32, layout=mma_layout))
+
+        # Mask out-of-bounds K positions.
         bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
         bound_mask = bound_offs[None, :] < MAX_SEQLENS_K
-        qk = gl.where(bound_mask, qk, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
-                                               dtype=gl.float32, layout=mma_layout))
+        qk_scaled = gl.where(bound_mask, qk_scaled, gl.full([BLOCK_M, BLOCK_N], float("-inf"),
+                                                            dtype=gl.float32, layout=mma_layout))
 
-    # Online softmax: compute new running max.
-    m_ij = gl.max(qk, axis=1)
-    m_new = gl.maximum(m_i, m_ij)
+        # Compute max of scaled qk.
+        m_ij = gl.max(qk_scaled, axis=1)
+        m_new = gl.maximum(m_i, m_ij)
 
-    # Compute exp2(qk - m_new) for numerical stability.
-    p = gl.exp2(qk - m_new[:, None])
+        # Compute exp2(qk_scaled - m_new).
+        p = gl.exp2(qk_scaled - m_new[:, None])
+    else:
+        # Unmasked path: use FMA pattern for qk * qk_scale - m_new.
+        # Compute max of unscaled qk, then scale the result.
+        m_ij = gl.max(qk, axis=1) * qk_scale
+        m_new = gl.maximum(m_i, m_ij)
+
+        # FMA: qk * qk_scale - m_new[:, None] in one operation.
+        p = gl.exp2(qk * qk_scale - m_new[:, None])
 
     # Update running sum.
     l_ij = gl.sum(p, axis=1)
@@ -382,6 +400,7 @@ def compute_block(
     )
     acc, l_i, m_i, p = compute_softmax(
         acc, l_i, m_i, qk, start_n, start_m,
+        qk_scale,
         MAX_SEQLENS_Q, MAX_SEQLENS_K,
         BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
         mma_layout, mma_offs_n_col, mma_offs_m_row,
@@ -478,6 +497,7 @@ def attn_fwd_inner_pipelined(
             )
             acc, l_i, m_i, p = compute_softmax(
                 acc, l_i, m_i, qk, start_n, start_m,
+                qk_scale,
                 MAX_SEQLENS_Q, MAX_SEQLENS_K,
                 BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
@@ -519,6 +539,7 @@ def attn_fwd_inner_pipelined(
         # Compute softmax.
         acc, l_i, m_i, p = compute_softmax(
             acc, l_i, m_i, qk, start_n, start_m,
+            qk_scale,
             MAX_SEQLENS_Q, MAX_SEQLENS_K,
             BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
             mma_layout, mma_offs_n_col, mma_offs_m_row,
