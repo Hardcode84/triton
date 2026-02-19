@@ -479,7 +479,7 @@ def attn_fwd_inner_pipelined(
     # Main loop: 4 stages with LDS reads absorbed into memory stages.
     # kt_dot is loop-carried (loaded in mem2, consumed in dot1).
     # NOTE: WarpPipeliner must run BEFORE loop unrolling (configured in compiler.py).
-    for block_n in tl.range(block_start, main_loop_end, loop_unroll_factor=4):
+    for block_n in tl.range(block_start, main_loop_end, loop_unroll_factor=2):
         # Dot1: Pure MMA for QK^T (compute, low priority).
         # Uses kt_dot loaded in previous mem2 (or prologue for first iteration).
         with warp_pipeline_stage("dot1", priority=0):
@@ -501,6 +501,10 @@ def attn_fwd_inner_pipelined(
                 MASK_STEPS, MAX_SEQLENS_K, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
                 kt_async_layout,
             )
+
+        # Dot2: Pure MMA for PV (compute, low priority).
+        # Uses v_dot loaded in mem1.
+        with warp_pipeline_stage("dot2", priority=0):
             acc, l_i, m_i, p = compute_softmax(
                 acc, l_i, m_i, qk, start_n, start_m,
                 qk_scale,
@@ -508,10 +512,6 @@ def attn_fwd_inner_pipelined(
                 BLOCK_M, BLOCK_N, MASK_STEPS, IS_CAUSAL,
                 mma_layout, mma_offs_n_col, mma_offs_m_row,
             )
-
-        # Dot2: Pure MMA for PV (compute, low priority).
-        # Uses v_dot loaded in mem1.
-        with warp_pipeline_stage("dot2", priority=0):
             p_cast = p.to(v_dot.dtype)
             p_dot = gl.convert_layout(p_cast, p_dot_layout)
             acc = do_mma("mfma_cdna4", p_dot, v_dot, acc)
