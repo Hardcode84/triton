@@ -910,7 +910,10 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
             )
 
     # Normalize by softmax sum.
-    acc = acc / l_i[:, None]
+    # Compute reciprocal first to avoid 256*128 element-wise divisions.
+    # This reduces divisions from O(BLOCK_M * BLOCK_DMODEL) to O(BLOCK_M).
+    l_recip = 1.0 / l_i
+    acc = acc * l_recip[:, None]
 
     # Store output.
     o_base = Out + off_z * stride_oz + off_h_q * stride_oh
