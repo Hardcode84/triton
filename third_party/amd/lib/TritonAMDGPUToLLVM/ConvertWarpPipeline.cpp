@@ -266,6 +266,26 @@ private:
       }
     }
 
+    // Helper: check if a cluster is a high-priority (memory) stage.
+    auto isHighPrioCluster = [&](int idx) -> bool {
+      if (auto pAttr = clusterOps[idx]->getAttrOfType<IntegerAttr>(
+              "triton.warp_pipeline.priority"))
+        return pAttr.getInt() > 0;
+      return false;
+    };
+
+    // Helper: emit ds waitcnt to ensure LDS reads from a preceding memory
+    // stage are complete before the next compute stage begins.  Matches the
+    // memory_counter_wait ds(0) that BlockPingpong emits.
+    auto emitDsWaitIfNeeded = [&](int clusterIdx) {
+      int prev = (clusterIdx + numClusters - 1) % numClusters;
+      if (!isHighPrioCluster(prev))
+        return;
+      auto dsAttr = b.getI32IntegerAttr(0);
+      mlir::triton::amdgpu::MemoryCounterWaitOp::create(
+          b, loc, /*load=*/nullptr, /*store=*/nullptr, /*ds=*/dsAttr);
+    };
+
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
     //  • If there is a pre-existing barrier at that location, we wrap it with
     //    sched_barriers so that backend scheduling cannot move operations
@@ -277,12 +297,16 @@ private:
     //  • Cluster 0 is a special case: if no top-of-loop barrier existed,
     //    the first cluster barrier must be inserted just before the loop’s
     //    terminator, forming the wrap-around dependency.
+    //  • At memory→compute transitions, a memory_counter_wait ds(0) is
+    //    emitted to ensure LDS reads from the memory stage are complete
+    //    before the compute stage begins (prevents MFMA pipeline stalls).
     for (int i = 0; i < numClusters; i++) {
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
         auto exBarOp = exBar->second;
         b.setInsertionPoint(exBarOp);
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+        emitDsWaitIfNeeded(i);
         ROCDL::SchedBarrier::create(b, loc, 0);
         b.setInsertionPointAfter(exBarOp);
         ROCDL::SchedBarrier::create(b, loc, 0);
@@ -297,6 +321,7 @@ private:
           b.setInsertionPoint(terminatorOp);
         }
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+        emitDsWaitIfNeeded(i);
         emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
       }
     }
