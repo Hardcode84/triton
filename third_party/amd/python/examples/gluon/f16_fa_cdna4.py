@@ -1,8 +1,7 @@
 """
 This file implements a BSHD Flash Attention for CDNA4 (gfx950) and tests against torch reference.
 
-Supports: basic forward pass with optional causal masking.
-Does NOT support: VARLEN, INT8, dropout, ALiBi, bias, persistent mode.
+Supports: basic forward pass with optional causal masking and GQA.
 
 Kernel variants:
 - Non-pipelined: single-buffered shared memory with swizzled layouts.
@@ -563,29 +562,17 @@ GLUON_AUTOTUNE_KEYS = ['IS_CAUSAL', 'MAX_SEQLENS_Q', 'MAX_SEQLENS_K', 'ACTUAL_BL
     key=GLUON_AUTOTUNE_KEYS,
 )
 @gluon.jit
-def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
+def gluon_attn_fwd(Q, K, V, SM_SCALE: gl.constexpr, L, Out,
                    stride_qz, stride_qh, stride_qm, stride_qk,
                    stride_kz, stride_kh, stride_kn, stride_kk,
                    stride_vz, stride_vh, stride_vk, stride_vn,
                    stride_oz, stride_oh, stride_om, stride_on,
-                   stride_bz, stride_bh, stride_bm, stride_bn,
-                   stride_az, stride_ah,
-                   Q_descale, K_descale, P_scale, P_descale, V_descale,
-                   cu_seqlens_q, cu_seqlens_k,
-                   dropout_p, philox_seed,
-                   PERSISTENT: gl.constexpr, PERSISTENT_DYNAMIC: gl.constexpr,
-                   atomic_counter,
-                   NUM_CU: gl.constexpr, GRID_CU_MULTIP: gl.constexpr, B: gl.constexpr,
-                   philox_offset_base, encoded_softmax, alibi_slopes,
                    HQ: gl.constexpr, HK: gl.constexpr,
                    ACTUAL_BLOCK_DMODEL: gl.constexpr,
                    MAX_SEQLENS_Q: gl.constexpr, MAX_SEQLENS_K: gl.constexpr,
-                   VARLEN: gl.constexpr, IS_CAUSAL: gl.constexpr,
+                   IS_CAUSAL: gl.constexpr,
                    BLOCK_M: gl.constexpr, BLOCK_DMODEL: gl.constexpr, BLOCK_N: gl.constexpr,
-                   PRE_LOAD_V: gl.constexpr, USE_BIAS: gl.constexpr,
-                   ENABLE_DROPOUT: gl.constexpr, RETURN_ENCODED_SOFTMAX: gl.constexpr,
-                   USE_ALIBI: gl.constexpr, INT8: gl.constexpr,
-                   USE_P_SCALE: gl.constexpr, INT8_KV: gl.constexpr,
+                   PRE_LOAD_V: gl.constexpr,
                    MMA_TYPE: gl.constexpr, NUM_STAGES: gl.constexpr):
     """
     Gluon Flash Attention Forward Kernel with configurable AMD MMA.
@@ -595,13 +582,6 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     """
     # Get num_warps from runtime (set by autotune).
     num_warps: gl.constexpr = gl.num_warps()
-    # Validate unsupported features at compile time.
-    gl.static_assert(not VARLEN, "VARLEN not supported in Gluon implementation")
-    gl.static_assert(not INT8, "INT8 not supported in Gluon implementation")
-    gl.static_assert(not ENABLE_DROPOUT, "Dropout not supported in Gluon implementation")
-    gl.static_assert(not USE_ALIBI, "ALiBi not supported in Gluon implementation")
-    gl.static_assert(not USE_BIAS, "Bias not supported in Gluon implementation")
-    gl.static_assert(not PERSISTENT, "Persistent mode not supported in Gluon implementation")
 
     gl.assume(stride_qz >= 0)
     gl.assume(stride_qh >= 0)
@@ -611,10 +591,6 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     gl.assume(stride_kh >= 0)
     gl.assume(stride_kn >= 0)
     gl.assume(stride_kk >= 0)
-    gl.assume(stride_bz >= 0)
-    gl.assume(stride_bh >= 0)
-    gl.assume(stride_bm >= 0)
-    gl.assume(stride_bn >= 0)
     gl.assume(stride_vz >= 0)
     gl.assume(stride_vh >= 0)
     gl.assume(stride_vk >= 0)
@@ -987,25 +963,15 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
         return (NUM_Q_HEADS, triton.cdiv(SEQLEN_Q, META['BLOCK_M']), BATCH)
 
     gluon_attn_fwd[grid](
-        q, k, v, None, sm_scale, L, o,
+        q, k, v, sm_scale, L, o,
         *_kernel_strides(q, layout),
         *_kernel_strides(k, layout),
         *_kernel_strides(v, layout),
         *_kernel_strides(o, layout),
-        0, 0, 0, 0,  # bias strides
-        0, 0,  # alibi strides
-        None, None, None, None, None,  # descales
-        None, None,  # cu_seqlens
-        dropout_p=0.0, philox_seed=0,
-        PERSISTENT=False, PERSISTENT_DYNAMIC=False,
-        atomic_counter=None, NUM_CU=1, GRID_CU_MULTIP=2, B=BATCH,
-        philox_offset_base=0, encoded_softmax=None, alibi_slopes=None,
         HQ=NUM_Q_HEADS, HK=NUM_K_HEADS, ACTUAL_BLOCK_DMODEL=HEAD_SZ,
         MAX_SEQLENS_Q=SEQLEN_Q, MAX_SEQLENS_K=SEQLEN_K,
-        VARLEN=False, IS_CAUSAL=IS_CAUSAL,
+        IS_CAUSAL=IS_CAUSAL,
         BLOCK_DMODEL=padded_head_dim,
-        USE_BIAS=False, ENABLE_DROPOUT=False, RETURN_ENCODED_SOFTMAX=False,
-        USE_ALIBI=False, INT8=False, USE_P_SCALE=False, INT8_KV=False,
         MMA_TYPE=mma_type,
     )
     return L
