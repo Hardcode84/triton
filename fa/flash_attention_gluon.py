@@ -531,6 +531,7 @@ def attn_fwd_inner_pipelined(
                 v_async_layout,
             )
 
+
     # Tail loop: last NUM_STAGES iterations, no future loads to issue.
     # Use gl.static_range to inline (unroll) tail iterations for better scheduling.
     # Each iteration uses descending wait counts instead of conservative wait_group(0).
