@@ -962,7 +962,7 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
     def grid(META):
         return (NUM_Q_HEADS, triton.cdiv(SEQLEN_Q, META['BLOCK_M']), BATCH)
 
-    gluon_attn_fwd[grid](
+    compiled_kernel = gluon_attn_fwd[grid](
         q, k, v, sm_scale, L, o,
         *_kernel_strides(q, layout),
         *_kernel_strides(k, layout),
@@ -974,7 +974,7 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
         BLOCK_DMODEL=padded_head_dim,
         MMA_TYPE=mma_type,
     )
-    return L
+    return L, compiled_kernel
 
 
 def _make_tensors(config):
@@ -1037,12 +1037,14 @@ def run_attention(config, check=True):
         ref = torch.nn.functional.scaled_dot_product_attention(
             q_ref, k_ref, v_ref, is_causal=IS_CAUSAL)
 
-    run_prefill_attention(config, q, k, v, o, sm_scale)
+    L, compiled_kernel = run_prefill_attention(config, q, k, v, o, sm_scale)
     torch.cuda.synchronize()
 
     if check:
         o_ref = _to_bhsd(o, layout)
         torch.testing.assert_close(o_ref.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+    return compiled_kernel
 
 
 @pytest.mark.parametrize("config", generate_configs())
@@ -1050,6 +1052,20 @@ def run_attention(config, check=True):
 def test_attention(config, layout):
     cfg = {**config, "LAYOUT": layout}
     run_attention(cfg)
+
+
+@pytest.mark.parametrize("config", generate_configs())
+def test_asm_setprio(config):
+    """Verify that pipelined configs emit s_setprio and non-pipelined do not."""
+    cfg = {**config, "LAYOUT": "bshd"}
+    compiled_kernel = run_attention(cfg, check=False)
+    amdgcn = compiled_kernel.asm['amdgcn']
+    is_pipelined = config["HEAD_SZ"] >= 128
+    setprio_count = amdgcn.count("s_setprio")
+    if is_pipelined:
+        assert setprio_count > 0, "Pipelined kernel must emit s_setprio instructions"
+    else:
+        assert setprio_count == 0, "Non-pipelined kernel should not emit s_setprio"
 
 
 if __name__ == "__main__":
