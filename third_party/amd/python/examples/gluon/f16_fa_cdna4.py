@@ -5,7 +5,7 @@ Supports: basic forward pass with optional causal masking.
 Does NOT support: VARLEN, INT8, dropout, ALiBi, bias, persistent mode.
 
 Kernel variants:
-- Non-pipelined: single-buffered shared memory with swizzled layouts (CDNA3/RDNA).
+- Non-pipelined: single-buffered shared memory with swizzled layouts.
 - Pipelined: multi-stage async copy with pingpong warp scheduling (CDNA4 only).
 """
 
@@ -15,36 +15,16 @@ import triton.language as tl
 import pytest
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd import AMDWMMALayout, AMDMFMALayout, warp_pipeline_stage
-from triton.experimental.gluon.language.amd.rdna3 import wmma as wmma_rdna3
-from triton.experimental.gluon.language.amd.rdna4 import wmma as wmma_rdna4
+from triton.experimental.gluon.language.amd import AMDMFMALayout, warp_pipeline_stage
 from triton.experimental.gluon.language.amd.cdna3 import mfma as mfma_cdna3
 from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
 from triton.experimental.gluon.language._layouts import DotOperandLayout, DistributedLinearLayout, PaddedSharedLayout
 
 
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-def is_cdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
-        'gfx950', 'gfx940', 'gfx941', 'gfx942', 'gfx90a', 'gfx908')
-
-
-def is_rdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
-        "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201")
-
-
 def get_mma_type_for_arch(arch: str) -> str:
     """Get the appropriate MMA type for the given GPU architecture."""
-    if arch.startswith("gfx110"):
-        return "wmma_rdna3"
-    elif arch.startswith("gfx120"):
-        return "wmma_rdna4"
-    elif arch in ("gfx940", "gfx941", "gfx942"):
+    if arch in ("gfx940", "gfx941", "gfx942"):
         return "mfma_cdna3"
     elif arch == "gfx950":
         return "mfma_cdna4"
@@ -55,11 +35,7 @@ def get_mma_type_for_arch(arch: str) -> str:
 @gluon.jit
 def do_mma(MMA_TYPE: gl.constexpr, a, b, c):
     """Dispatch to the appropriate MMA function based on MMA_TYPE."""
-    if MMA_TYPE == "wmma_rdna3":
-        return wmma_rdna3(a, b, c)
-    elif MMA_TYPE == "wmma_rdna4":
-        return wmma_rdna4(a, b, c)
-    elif MMA_TYPE == "mfma_cdna3":
+    if MMA_TYPE == "mfma_cdna3":
         return mfma_cdna3(a, b, c)
     elif MMA_TYPE == "mfma_cdna4":
         return mfma_cdna4(a, b, c)
@@ -573,26 +549,9 @@ def get_gluon_cdna_autotune_configs():
     ]
 
 
-def get_gluon_rdna_autotune_configs():
-    """Autotune configs for RDNA (RX series) GPUs."""
-    return [
-        # RDNA uses non-pipelined path (NUM_STAGES=1).
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=4),
-        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'PRE_LOAD_V': True, 'NUM_STAGES': 1}, num_warps=2),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': True, 'NUM_STAGES': 1}, num_warps=2),
-        # triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=2),
-    ]
-
-
 def get_gluon_autotune_configs():
-    """Get autotune configs based on current GPU architecture."""
-    if is_rdna():
-        return get_gluon_rdna_autotune_configs()
-    elif is_cdna():
-        return get_gluon_cdna_autotune_configs()
-    else:
-        # Fallback configs.
-        return [triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'PRE_LOAD_V': False, 'NUM_STAGES': 1}, num_warps=4)]
+    """Get autotune configs for CDNA3/CDNA4."""
+    return get_gluon_cdna_autotune_configs()
 
 
 # Autotune keys: parameters that affect which config is best.
@@ -674,33 +633,19 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     off_h_k = off_h_q * HK // HQ
 
     # Configure MMA layout based on MMA_TYPE.
-    if MMA_TYPE == "wmma_rdna3":
-        mma_layout: gl.constexpr = AMDWMMALayout(version=1, transposed=True,
-                                                  warps_per_cta=[num_warps, 1], instr_shape=[16, 16, 16])
-        k_width: gl.constexpr = 16
-        threads_per_warp: gl.constexpr = 32
-    elif MMA_TYPE == "wmma_rdna4":
-        mma_layout: gl.constexpr = AMDWMMALayout(version=2, transposed=True,
-                                                  warps_per_cta=[num_warps, 1], instr_shape=[16, 16, 16])
-        k_width: gl.constexpr = 16
-        threads_per_warp: gl.constexpr = 32
-    elif MMA_TYPE == "mfma_cdna3":
+    if MMA_TYPE == "mfma_cdna3":
         mma_layout: gl.constexpr = AMDMFMALayout(version=3, instr_shape=[16, 16, 16],
                                                   transposed=True, warps_per_cta=[num_warps, 1])
-        k_width: gl.constexpr = 32
-        threads_per_warp: gl.constexpr = 64
     elif MMA_TYPE == "mfma_cdna4":
         mma_layout: gl.constexpr = AMDMFMALayout(version=4, instr_shape=[32, 32, 16],
                                                   transposed=True, warps_per_cta=[num_warps, 1])
-        k_width: gl.constexpr = 32
-        threads_per_warp: gl.constexpr = 64
     else:
         gl.static_assert(False, "Unknown MMA_TYPE")
+    k_width: gl.constexpr = 32
+    threads_per_warp: gl.constexpr = 64
 
     # Layouts for dot operands and blocked loads/stores.
     # Use smaller k_width for P@V dot to reduce permlanes in MMA→DotOperand conversion.
-    # Triton uses kWidth=4 for P@V operands on CDNA4.
-    # Q@K^T uses larger k_width for efficient memory loads.
     pv_k_width: gl.constexpr = 4 if MMA_TYPE == "mfma_cdna4" else k_width
     q_dot_layout: gl.constexpr = DotOperandLayout(operand_index=0, parent=mma_layout, k_width=k_width)
     kt_dot_layout: gl.constexpr = DotOperandLayout(operand_index=1, parent=mma_layout, k_width=k_width)
@@ -792,7 +737,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     # coalesced writes where all 64 lane bits map to the fast dimension.
     # With vec=2 (32-bit writes) and 64 threads: 2*64=128 consecutive elements per warp.
     # The fast dimension (BLOCK_DMODEL) must be >= 128 to satisfy this constraint.
-    USE_PIPELINED: gl.constexpr = (MMA_TYPE == "mfma_cdna4") and (NUM_STAGES > 1) and (BLOCK_DMODEL >= 128)
+    USE_PIPELINED: gl.constexpr = (NUM_STAGES > 1) and (BLOCK_DMODEL >= 128)
 
     if USE_PIPELINED:
         # Async copy layout configuration using PaddedSharedLayout for bank conflict-free access.
@@ -961,7 +906,7 @@ def gluon_attn_fwd(Q, K, V, bias, SM_SCALE: gl.constexpr, L, Out,
     l_mask = offs_m < MAX_SEQLENS_Q
     # Convert from log2 scale back to natural log.
     lse = m_i / 1.44269504089 + gl.log2(l_i) / 1.44269504089
-    # Convert from WMMA slice layout to blocked slice layout for store.
+    # Convert from MMA slice layout to blocked slice layout for store.
     lse_blocked = gl.convert_layout(lse, offs_m_layout)
     gl.store(l_ptrs, lse_blocked, mask=l_mask)
 
