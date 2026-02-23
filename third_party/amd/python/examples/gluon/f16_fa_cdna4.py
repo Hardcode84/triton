@@ -942,8 +942,8 @@ def _kernel_strides(t, layout):
         raise ValueError(f"Unsupported layout: {layout}")
 
 
-def run_prefill_attention(config, q, k, v, o, sm_scale):
-    """Launch the gluon flash attention kernel."""
+def _launch_kernel(config, q, k, v, o, sm_scale):
+    """Launch the Gluon FA forward kernel and return (L, compiled_kernel)."""
     SEQLEN_Q = config["SEQLEN_Q"]
     SEQLEN_K = config["SEQLEN_K"]
     NUM_Q_HEADS = config["NUM_Q_HEADS"]
@@ -1037,7 +1037,7 @@ def run_attention(config, check=True):
         ref = torch.nn.functional.scaled_dot_product_attention(
             q_ref, k_ref, v_ref, is_causal=IS_CAUSAL)
 
-    L, compiled_kernel = run_prefill_attention(config, q, k, v, o, sm_scale)
+    L, compiled_kernel = _launch_kernel(config, q, k, v, o, sm_scale)
     torch.cuda.synchronize()
 
     if check:
