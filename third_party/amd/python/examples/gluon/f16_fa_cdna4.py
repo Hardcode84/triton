@@ -1,7 +1,6 @@
 """
-This file implements a BSHD Flash Attention for CDNA4 (gfx950) and tests against torch reference.
-
-Supports: basic forward pass with optional causal masking and GQA.
+Flash Attention forward for CDNA3/CDNA4 (gfx94x/gfx950). Supports BHSD and BSHD
+layouts, optional causal masking, and GQA.
 
 Kernel variants:
 - Non-pipelined: single-buffered shared memory with swizzled layouts.
@@ -238,15 +237,13 @@ def issue_async_load(
 @gluon.jit
 def compute_dot1_qk(
     q_dot, kt_smem,
-    qk_scale: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     kt_dot_layout: gl.constexpr,
     mma_layout: gl.constexpr,
 ):
-    """Dot1: Compute QK^T only. Returns UNSCALED qk scores.
+    """Dot1: Compute QK^T only. Returns unscaled qk scores.
 
-    Scaling is deferred to compute_softmax to enable FMA fusion:
-    qk * qk_scale - m_new can be compiled to a single FMA instruction.
+    Scaling is deferred to compute_softmax to enable FMA fusion.
     """
     # Load K^T from shared memory directly to DotOperandLayout.
     # PaddedSharedLayout ensures bank-conflict-free access.
@@ -355,7 +352,7 @@ def compute_block(
     """
     qk = compute_dot1_qk(
         q_dot, kt_smem,
-        qk_scale, BLOCK_M, BLOCK_N,
+        BLOCK_M, BLOCK_N,
         kt_dot_layout, mma_layout,
     )
     acc, l_i, m_i, p = compute_softmax(
@@ -510,7 +507,7 @@ def attn_fwd_inner_pipelined(
         # Compute Dot1 (QK^T).
         qk = compute_dot1_qk(
             q_dot, kt_smem.index(stage_idx),
-            qk_scale, BLOCK_M, BLOCK_N,
+            BLOCK_M, BLOCK_N,
             kt_dot_layout, mma_layout,
         )
 
@@ -535,7 +532,7 @@ def attn_fwd_inner_pipelined(
 def get_gluon_cdna_autotune_configs():
     """Autotune configs for CDNA (MI series) GPUs."""
     return [
-        # Pipelined config with NUM_STAGES=2 (CDNA4 only).
+        # Pipelined config (CDNA4 only).
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 4, 'waves_per_eu': 2}, num_warps=8),
         # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 2}, num_warps=4),
         # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'PRE_LOAD_V': False, 'NUM_STAGES': 3}, num_warps=4),
@@ -877,7 +874,7 @@ def gluon_attn_fwd(Q, K, V, SM_SCALE: gl.constexpr, L, Out,
     acc_blocked = gl.convert_layout(acc, blocked_layout)
     gl.store(o_ptrs, acc_blocked.to(Out.dtype.element_ty), mask=o_mask)
 
-    # Store log-sum-exp for backward pass.
+    # Store log-sum-exp (useful for debugging / backward pass).
     l_ptrs = L + off_z * HQ * MAX_SEQLENS_Q + off_h_q * MAX_SEQLENS_Q + offs_m
     l_mask = offs_m < MAX_SEQLENS_Q
     # Convert from log2 scale back to natural log.
