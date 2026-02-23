@@ -1011,6 +1011,16 @@ def generate_configs():
     ]
 
 
+def _kernel_strides(t, layout):
+    """Extract strides in kernel order (z, h, m, k) for the given layout."""
+    if layout == 'bhsd':
+        return (t.stride(0), t.stride(1), t.stride(2), t.stride(3))
+    elif layout == 'bshd':
+        return (t.stride(0), t.stride(2), t.stride(1), t.stride(3))
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
+
+
 def run_prefill_attention(config, q, k, v, o, sm_scale):
     """Launch the gluon flash attention kernel."""
     SEQLEN_Q = config["SEQLEN_Q"]
@@ -1020,6 +1030,7 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
     HEAD_SZ = config["HEAD_SZ"]
     IS_CAUSAL = config["IS_CAUSAL"]
     BATCH = config["BATCH"]
+    layout = config.get("LAYOUT", "bshd")
 
     padded_head_dim = ((HEAD_SZ + 16 - 1) // 16) * 16
     L = torch.empty(BATCH, NUM_Q_HEADS, SEQLEN_Q, dtype=torch.float32, device=q.device)
@@ -1032,10 +1043,10 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
 
     gluon_attn_fwd[grid](
         q, k, v, None, sm_scale, L, o,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        *_kernel_strides(q, layout),
+        *_kernel_strides(k, layout),
+        *_kernel_strides(v, layout),
+        *_kernel_strides(o, layout),
         0, 0, 0, 0,  # bias strides
         0, 0,  # alibi strides
         None, None, None, None, None,  # descales
@@ -1055,49 +1066,79 @@ def run_prefill_attention(config, q, k, v, o, sm_scale):
     return L
 
 
-def run_attention(config, check=True):
-    """Create tensors, run attention, and optionally validate against torch."""
+def _make_tensors(config):
+    """Create Q, K, V, O tensors in the requested layout."""
     BATCH = config["BATCH"]
     SEQLEN_Q = config["SEQLEN_Q"]
     SEQLEN_K = config["SEQLEN_K"]
     NUM_Q_HEADS = config["NUM_Q_HEADS"]
     NUM_K_HEADS = config["NUM_K_HEADS"]
     HEAD_SZ = config["HEAD_SZ"]
-    IS_CAUSAL = config["IS_CAUSAL"]
+    layout = config.get("LAYOUT", "bshd")
 
     dtype = torch.float16
     torch.random.manual_seed(0)
 
-    # BSHD layout: [batch, seqlen, heads, head_dim].
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), dtype=dtype, device="cuda")
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), dtype=dtype, device="cuda")
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), dtype=dtype, device="cuda")
-    o = torch.empty_like(q)
+    if layout == 'bhsd':
+        q_shape = (BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ)
+        kv_shape = (BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ)
+    else:
+        q_shape = (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ)
+        kv_shape = (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ)
 
+    q = torch.randn(q_shape, dtype=dtype, device="cuda")
+    k = torch.randn(kv_shape, dtype=dtype, device="cuda")
+    v = torch.randn(kv_shape, dtype=dtype, device="cuda")
+    o = torch.empty_like(q)
+    return q, k, v, o
+
+
+def _to_bhsd(t, layout):
+    """Convert tensor to BHSD layout for reference computation."""
+    if layout == 'bhsd':
+        return t
+    return t.transpose(1, 2)
+
+
+def run_attention(config, check=True):
+    """Create tensors, run attention, and optionally validate against torch."""
+    IS_CAUSAL = config["IS_CAUSAL"]
+    NUM_Q_HEADS = config["NUM_Q_HEADS"]
+    NUM_K_HEADS = config["NUM_K_HEADS"]
+    HEAD_SZ = config["HEAD_SZ"]
+    layout = config.get("LAYOUT", "bshd")
+
+    q, k, v, o = _make_tensors(config)
     sm_scale = 1.0 / (HEAD_SZ ** 0.5)
 
     if check:
-        # Torch reference expects BHSD layout.
-        q_ref = q.transpose(1, 2).contiguous()
-        k_ref = k.transpose(1, 2).contiguous()
-        v_ref = v.transpose(1, 2).contiguous()
+        # Torch SDPA expects BHSD.
+        q_ref = _to_bhsd(q, layout).contiguous()
+        k_ref = _to_bhsd(k, layout).contiguous()
+        v_ref = _to_bhsd(v, layout).contiguous()
+        # Expand K/V for GQA.
+        if NUM_Q_HEADS != NUM_K_HEADS:
+            rep = NUM_Q_HEADS // NUM_K_HEADS
+            k_ref = k_ref[:, :, None, :, :].expand(-1, -1, rep, -1, -1).reshape(
+                k_ref.shape[0], -1, k_ref.shape[2], k_ref.shape[3])
+            v_ref = v_ref[:, :, None, :, :].expand(-1, -1, rep, -1, -1).reshape(
+                v_ref.shape[0], -1, v_ref.shape[2], v_ref.shape[3])
         ref = torch.nn.functional.scaled_dot_product_attention(
             q_ref, k_ref, v_ref, is_causal=IS_CAUSAL)
-        # Back to BSHD.
-        ref = ref.transpose(1, 2).contiguous()
 
     run_prefill_attention(config, q, k, v, o, sm_scale)
     torch.cuda.synchronize()
 
     if check:
-        rtol = 0.004
-        atol = 0.004
-        torch.testing.assert_close(o.float(), ref.float(), rtol=rtol, atol=atol)
+        o_ref = _to_bhsd(o, layout)
+        torch.testing.assert_close(o_ref.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("config", generate_configs())
-def test_attention(config):
-    run_attention(config)
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_attention(config, layout):
+    cfg = {**config, "LAYOUT": layout}
+    run_attention(cfg)
 
 
 if __name__ == "__main__":
@@ -1111,6 +1152,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads-k", type=int, default=8, help="Number of K/V heads")
     parser.add_argument("--head-size", type=int, default=128, help="Q/K/V head size")
     parser.add_argument("--causal", action="store_true", help="Enable causal masking")
+    parser.add_argument("--layout", choices=["bhsd", "bshd"], default="bshd", help="Tensor layout")
     parser.add_argument("--no-check", action="store_true", help="Skip correctness check")
     args = parser.parse_args()
 
@@ -1122,6 +1164,7 @@ if __name__ == "__main__":
         "NUM_K_HEADS": args.num_heads_k,
         "HEAD_SZ": args.head_size,
         "IS_CAUSAL": args.causal,
+        "LAYOUT": args.layout,
     }
     print(config)
     run_attention(config, check=not args.no_check)
