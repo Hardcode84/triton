@@ -1,3 +1,4 @@
+import json
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ import pytest
 
 libtriton = pytest.importorskip("triton._C.libtriton")
 compiler_api = pytest.importorskip("triton.backends.compiler")
+triton_compiler = pytest.importorskip("triton.compiler.compiler")
 driver_api = pytest.importorskip("triton.backends.driver")
 wave_compiler = pytest.importorskip("triton.backends.wave_amd.compiler")
 wave_emission = pytest.importorskip("triton.backends.wave_amd.emission")
@@ -218,6 +220,84 @@ def test_wave_amd_make_hsaco_link_failure_has_clear_diagnostic(monkeypatch):
     assert "HSACO emission failed while linking" in message
     assert "gfx1100" in message
     assert "fake lld failure" in message
+
+
+def test_wave_amd_compiled_kernel_loads_hsaco_with_hip_runtime_contract(tmp_path, monkeypatch):
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    metadata = {
+        "hash": "hash",
+        "target": {
+            "backend": target.backend,
+            "arch": target.arch,
+            "warp_size": target.warp_size,
+        },
+        "num_warps": 1,
+        "num_ctas": 1,
+        "shared": 0,
+        "warp_size": 32,
+        "launch_cooperative_grid": False,
+        "global_scratch_size": 0,
+        "global_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "profile_scratch_align": 1,
+        "tensordesc_meta": {},
+        "name": "add_kernel",
+    }
+    metadata_path = tmp_path / "kernel.json"
+    hsaco_path = tmp_path / "kernel.hsaco"
+    metadata_path.write_text(json.dumps(metadata))
+    hsaco_path.write_bytes(b"fake hsaco")
+
+    load_calls = []
+
+    class FakeUtils:
+
+        def load_binary(self, name, kernel, shared, device):
+            load_calls.append((name, kernel, shared, device))
+            return "module", "function", 0, 0, 1024
+
+        def unload_module(self, module):
+            pass
+
+    class FakeLauncher:
+
+        def __init__(self, src, metadata):
+            self.src = src
+            self.metadata = metadata
+
+        def __call__(self, *args, **kwargs):
+            pass
+
+    class FakeDriver:
+        utils = FakeUtils()
+        launcher_cls = FakeLauncher
+
+        def get_current_device(self):
+            return 7
+
+        def get_current_target(self):
+            return target
+
+    monkeypatch.setattr(triton_compiler, "make_backend", lambda loaded_target: backend)
+    monkeypatch.setattr(triton_compiler, "max_shared_mem", lambda device: 1024)
+    monkeypatch.setattr(triton_compiler.driver, "active", FakeDriver())
+
+    src = SimpleNamespace(signature={}, constants={})
+    kernel = triton_compiler.CompiledKernel(
+        src,
+        {
+            "kernel.json": str(metadata_path),
+            "kernel.hsaco": str(hsaco_path),
+        },
+        "hash",
+    )
+    kernel._init_handles()
+
+    assert kernel.kernel == b"fake hsaco"
+    assert load_calls == [("add_kernel", b"fake hsaco", 0, 7)]
+    assert kernel.module == "module"
+    assert kernel.function == "function"
 
 
 def test_wave_amd_driver_exports_one_concrete_driver():

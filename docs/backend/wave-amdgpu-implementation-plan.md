@@ -253,6 +253,7 @@
   - missing packaged `wave-translate` diagnostic
   - HSACO emitted with fake AMD codegen helpers
   - HSACO linker failure diagnostic
+  - final HSACO bytes are passed to HIP `load_binary`
 
 - Runtime tests:
   - masked load/store
@@ -274,7 +275,7 @@
 - M1: compile a supported TTIR op subset from live module IR to builder-generated Wave MLIR; no TTIR assembly parsing or kernel-shape matching.
 - M2: done. Emit AMDGCN assembly from Wave MLIR through `wave-translate`.
 - M3: done. Emit HSACO bytes from AMDGCN assembly through Triton's packaged AMD assembler/linker helpers.
-- M4: load through HIP runtime and run masked load/store kernel end-to-end.
+- M4: in progress. HIP load contract covered; masked hardware run waits on mask/program-id lowering.
 - M5: add token threading for stores, volatile loads, barriers, and simple branches.
 - M6: add symbolic strided copy.
 - M7: add WaveAMD matmul path.
