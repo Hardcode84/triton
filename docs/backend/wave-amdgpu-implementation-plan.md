@@ -14,31 +14,38 @@
 
 ## Repo Layout
 
-- Create Triton backend root:
+- Implemented:
   - `third_party/wave_amd/`
-  - `third_party/wave_amd/backend/`
+  - `third_party/wave_amd/backend/name.conf`
+  - `third_party/wave_amd/backend/compiler.py`
+  - `third_party/wave_amd/backend/driver.py`
   - `third_party/wave_amd/CMakeLists.txt`
-  - `third_party/wave_amd/python/`
-  - `third_party/wave_amd/test/`
-- Add Wave submodule:
+  - `third_party/wave_amd/python/triton_wave_amd.cc`
   - `third_party/wave_amd/wave/`
-- Backend package files:
-  - `backend/name.conf`
-  - `backend/compiler.py`
-  - `backend/driver.py`
+  - `python/test/unit/runtime/test_wave_amd_backend.py`
+
+- Remaining:
+  - `third_party/wave_amd/test/`
   - `backend/lib/` if packaged runtime artifacts are needed
-- Triton setup changes:
-  - add `wave_amd` to `BackendInstaller.copy([...])`
-  - install `triton.backends.wave_amd`
+
+- Implemented Triton setup changes:
+  - added `wave_amd` to `BackendInstaller.copy([...])`
+  - installs `triton.backends.wave_amd`
+
+- Remaining Triton setup changes:
   - include backend package data
-- Triton CMake changes:
-  - build `third_party/wave_amd` through `TRITON_CODEGEN_BACKENDS`
+
+- Implemented Triton CMake changes:
+  - builds `third_party/wave_amd` through `TRITON_CODEGEN_BACKENDS`
+  - exposes empty native `init_triton_wave_amd` stub
+
+- Remaining Triton CMake changes:
   - link Wave submodule libraries or tools
   - expose native glue to Python if using in-process emission
 
 ## Backend Skeleton
 
-- `compiler.py`
+- Implemented `compiler.py`
   - Define `WaveAMDOptions`.
   - Define `WaveAMDBackend(BaseBackend)`.
   - Set `binary_ext = "hsaco"`.
@@ -50,13 +57,15 @@
   - Implement `get_module_map()`.
   - Implement `load_dialects(ctx)`.
   - Implement `add_stages(stages, options, language)`.
+  - Current `wave` stage raises `NotImplementedError`.
 
-- `driver.py`
+- Implemented `driver.py`
   - Reuse HIP utility loading where possible.
-  - Subclass or wrap `HIPDriver`.
+  - Subclass `HIPDriver`.
   - Return `GPUTarget("wave_amd", arch, warp_size)`.
   - Reuse `HIPLauncher` initially.
   - Keep argument ABI identical to HIP backend.
+  - Driver is inactive unless `TRITON_WAVE_AMD_ENABLE=1` and `TRITON_DEFAULT_BACKEND=wave_amd`.
 
 ## Compiler Stages
 
@@ -228,9 +237,12 @@
 
 ## Tests
 
+- Implemented tests:
+  - backend skeleton options/stages
+  - one concrete driver class
+  - explicit driver activation gate
+
 - Compile-only tests:
-  - backend discovery
-  - target selection
   - TTIR cleanup stops before TTGIR
   - Wave MLIR dump contains `wave.kernel`
   - Wave MLIR dump contains `wave.index_expr`
@@ -254,7 +266,7 @@
 
 ## Milestones
 
-- M0: backend discovered and selected as `wave_amd`.
+- M0: done. Backend skeleton registered as `wave_amd`; selection is gated behind explicit env vars.
 - M1: compile TTIR to dumped Wave MLIR for one elementwise kernel.
 - M2: emit AMDGCN from Wave MLIR.
 - M3: emit HSACO and load through HIP runtime.
