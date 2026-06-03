@@ -375,7 +375,7 @@ def test_wave_amd_compiled_kernel_loads_hsaco_with_hip_runtime_contract(tmp_path
 
     monkeypatch.setattr(triton_compiler, "make_backend", lambda loaded_target: backend)
     monkeypatch.setattr(triton_compiler, "max_shared_mem", lambda device: 1024)
-    monkeypatch.setattr(triton_compiler.driver, "active", FakeDriver())
+    monkeypatch.setattr(triton_compiler.driver, "_active", FakeDriver())
 
     src = SimpleNamespace(signature={}, constants={})
     kernel = triton_compiler.CompiledKernel(

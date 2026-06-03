@@ -50,10 +50,10 @@ class _TTIRToWaveLowerer:
 
         ops = self._collect_entry_ops(name)
         func_op = self.module.get_function(name)
-        arg_types = [self._signature_type(ty) for ty in self.module.get_function_signature(func_op)]
         target = f"amdgcn-amd-amdhsa--{self.options.arch}"
 
         with self.dsl.module() as module_builder:
+            arg_types = [self._signature_type(ty) for ty in self.module.get_function_signature(func_op)]
             module_builder.module.operation.attributes["waveamdmachine.target"] = self.dsl.StringAttr.get(target)
             with module_builder.gpu_module("kernels") as gpu_module:
                 with gpu_module.kernel(name, arg_types) as func:
@@ -63,25 +63,22 @@ class _TTIRToWaveLowerer:
             return str(module_builder), name
 
     def _collect_entry_ops(self, entry_name: str) -> Sequence[object]:
-        ops = []
+        pending_body_ops = []
+        entry_ops = []
 
         def visit(op):
-            ops.append(op)
-
-        self.module.walk(visit)
-
-        entry_ops = []
-        in_entry = False
-        for op in ops:
             name = op.get_name()
             if name == "builtin.module":
-                continue
+                return
             if name == "tt.func":
-                in_entry = op.get_str_attr("sym_name") == entry_name
-                continue
-            if in_entry:
-                entry_ops.append(op)
+                nonlocal entry_ops
+                if op.get_str_attr("sym_name") == entry_name:
+                    entry_ops = list(pending_body_ops)
+                pending_body_ops.clear()
+                return
+            pending_body_ops.append(op)
 
+        self.module.walk(visit)
         return entry_ops
 
     def _bind_arguments(self, func_op, wave_args) -> None:
