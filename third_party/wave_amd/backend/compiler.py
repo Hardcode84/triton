@@ -8,7 +8,7 @@ from typing import Any, Dict, Tuple
 from triton import knobs
 from triton._C.libtriton import ir, passes
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir
+from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn
 from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
 
 
@@ -66,7 +66,7 @@ class WaveAMDBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         assert isinstance(target.arch, str)
-        self.binary_ext = "amdgcn"
+        self.binary_ext = "hsaco"
 
     def get_target_name(self, options) -> str:
         return f"wave_amd:{options.arch}"
@@ -131,15 +131,20 @@ class WaveAMDBackend(BaseBackend):
     def make_amdgcn(src, metadata, options):
         return emit_amdgcn_from_wave_mlir(src, options)
 
+    @staticmethod
+    def make_hsaco(src, metadata, options):
+        return emit_hsaco_from_amdgcn(src, options)
+
     def add_stages(self, stages, options, language):
         if language != Language.TRITON:
-            raise NotImplementedError("wave_amd M2 only supports Triton TTIR input")
+            raise NotImplementedError("wave_amd M3 only supports Triton TTIR input")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
+        stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}-wave_amd-m2"
+        return f"{self.target}-wave_amd-m3"

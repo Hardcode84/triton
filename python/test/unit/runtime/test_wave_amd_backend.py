@@ -1,4 +1,5 @@
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -57,7 +58,7 @@ def test_wave_amd_backend_skeleton():
     options = backend.parse_options({})
 
     assert WaveAMDBackend.supports_target(target)
-    assert backend.binary_ext == "amdgcn"
+    assert backend.binary_ext == "hsaco"
     assert backend.get_target_name(options) == "wave_amd:gfx1100"
     assert options.backend_name == "wave_amd"
     assert options.warp_size == 32
@@ -65,7 +66,7 @@ def test_wave_amd_backend_skeleton():
 
     stages = {}
     backend.add_stages(stages, options, Language.TRITON)
-    assert list(stages) == ["ttir", "wave", "amdgcn"]
+    assert list(stages) == ["ttir", "wave", "amdgcn", "hsaco"]
 
 
 def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
@@ -149,6 +150,74 @@ def test_wave_amd_make_amdgcn_missing_tool_has_clear_diagnostic(tmp_path, monkey
     assert "wave-translate" in message
     assert str(missing_tool) in message
     assert "Rebuild Triton" in message
+
+
+def test_wave_amd_make_hsaco_uses_triton_amd_codegen_helpers(monkeypatch):
+
+    class FakeAMDCodegen:
+
+        def __init__(self):
+            self.assembled = None
+            self.linked = False
+
+        def assemble_amdgcn(self, amdgcn, arch, features):
+            self.assembled = (amdgcn, arch, features)
+            return b"fake object"
+
+        def link_hsaco(self, in_path, out_path):
+            assert Path(in_path).read_bytes() == b"fake object"
+            Path(out_path).write_bytes(b"fake hsaco")
+            self.linked = True
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({})
+    metadata = {
+        "name": "add_kernel",
+        "shared": 0,
+        "global_scratch_size": 0,
+        "global_scratch_align": 1,
+    }
+    fake_amd = FakeAMDCodegen()
+    monkeypatch.setattr(wave_emission, "_triton_amd_codegen", lambda: fake_amd)
+
+    hsaco = backend.make_hsaco("fake amdgcn", metadata, options)
+
+    assert isinstance(hsaco, bytes)
+    assert hsaco == b"fake hsaco"
+    assert fake_amd.assembled == ("fake amdgcn", "gfx1100", "")
+    assert fake_amd.linked
+    assert metadata == {
+        "name": "add_kernel",
+        "shared": 0,
+        "global_scratch_size": 0,
+        "global_scratch_align": 1,
+    }
+
+
+def test_wave_amd_make_hsaco_link_failure_has_clear_diagnostic(monkeypatch):
+
+    class FakeAMDCodegen:
+
+        def assemble_amdgcn(self, amdgcn, arch, features):
+            return b"fake object"
+
+        def link_hsaco(self, in_path, out_path):
+            raise RuntimeError("fake lld failure")
+
+    monkeypatch.setattr(wave_emission, "_triton_amd_codegen", lambda: FakeAMDCodegen())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        backend.make_hsaco("fake amdgcn", {"name": "add_kernel"}, options)
+
+    message = str(excinfo.value)
+    assert "HSACO emission failed while linking" in message
+    assert "gfx1100" in message
+    assert "fake lld failure" in message
 
 
 def test_wave_amd_driver_exports_one_concrete_driver():
