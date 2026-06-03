@@ -7,6 +7,7 @@ libtriton = pytest.importorskip("triton._C.libtriton")
 compiler_api = pytest.importorskip("triton.backends.compiler")
 driver_api = pytest.importorskip("triton.backends.driver")
 wave_compiler = pytest.importorskip("triton.backends.wave_amd.compiler")
+wave_emission = pytest.importorskip("triton.backends.wave_amd.emission")
 wave_driver = pytest.importorskip("triton.backends.wave_amd.driver")
 hip_driver = pytest.importorskip("triton.backends.amd.driver")
 
@@ -56,7 +57,7 @@ def test_wave_amd_backend_skeleton():
     options = backend.parse_options({})
 
     assert WaveAMDBackend.supports_target(target)
-    assert backend.binary_ext == "wave"
+    assert backend.binary_ext == "amdgcn"
     assert backend.get_target_name(options) == "wave_amd:gfx1100"
     assert options.backend_name == "wave_amd"
     assert options.warp_size == 32
@@ -64,7 +65,7 @@ def test_wave_amd_backend_skeleton():
 
     stages = {}
     backend.add_stages(stages, options, Language.TRITON)
-    assert list(stages) == ["ttir", "wave"]
+    assert list(stages) == ["ttir", "wave", "amdgcn"]
 
 
 def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
@@ -103,6 +104,51 @@ def test_wave_amd_make_wave_rejects_textual_ttir():
 
     with pytest.raises(TypeError, match="module object"):
         backend.make_wave(ELEMENTWISE_ADD_TTIR, {}, options)
+
+
+def test_wave_amd_make_amdgcn_uses_packaged_wave_translate(tmp_path, monkeypatch):
+    fake_wave_translate = tmp_path / "wave-translate"
+    fake_wave_translate.write_text("#!/bin/sh\nprintf 'fake amdgcn\\n'\n")
+    fake_wave_translate.chmod(0o755)
+    monkeypatch.setattr(wave_emission, "_packaged_wave_translate", lambda: fake_wave_translate)
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({})
+    metadata = {
+        "name": "add_kernel",
+        "shared": 0,
+        "global_scratch_size": 0,
+        "global_scratch_align": 1,
+    }
+
+    wave_mlir = ('module attributes {waveamdmachine.target = "amdgcn-amd-amdhsa--gfx1100"} {}')
+    amdgcn = backend.make_amdgcn(wave_mlir, metadata, options)
+
+    assert amdgcn == "fake amdgcn\n"
+    assert metadata == {
+        "name": "add_kernel",
+        "shared": 0,
+        "global_scratch_size": 0,
+        "global_scratch_align": 1,
+    }
+
+
+def test_wave_amd_make_amdgcn_missing_tool_has_clear_diagnostic(tmp_path, monkeypatch):
+    missing_tool = tmp_path / "missing-wave-translate"
+    monkeypatch.setattr(wave_emission, "_packaged_wave_translate", lambda: missing_tool)
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        backend.make_amdgcn("module {}", {"name": "add_kernel"}, options)
+
+    message = str(excinfo.value)
+    assert "wave-translate" in message
+    assert str(missing_tool) in message
+    assert "Rebuild Triton" in message
 
 
 def test_wave_amd_driver_exports_one_concrete_driver():

@@ -18,6 +18,7 @@
   - `third_party/wave_amd/`
   - `third_party/wave_amd/backend/name.conf`
   - `third_party/wave_amd/backend/compiler.py`
+  - `third_party/wave_amd/backend/emission.py`
   - `third_party/wave_amd/backend/driver.py`
   - `third_party/wave_amd/CMakeLists.txt`
   - `third_party/wave_amd/python/triton_wave_amd.cc`
@@ -38,9 +39,9 @@
 - Implemented Triton CMake changes:
   - builds `third_party/wave_amd` through `TRITON_CODEGEN_BACKENDS`
   - exposes empty native `init_triton_wave_amd` stub
+  - builds and packages `wave-translate` under `triton.backends.wave_amd/bin`
 
 - Remaining Triton CMake changes:
-  - link Wave submodule libraries or tools
   - expose native glue to Python if using in-process emission
 
 ## Backend Skeleton
@@ -48,7 +49,7 @@
 - Implemented `compiler.py`
   - Define `WaveAMDOptions`.
   - Define `WaveAMDBackend(BaseBackend)`.
-  - Set `binary_ext = "hsaco"`.
+  - Set `binary_ext = "amdgcn"` for the M2 compile-to-assembly slice.
   - Implement `supports_target(target)`.
   - Implement `parse_options(opts)`.
   - Implement `hash()`.
@@ -57,7 +58,7 @@
   - Implement `get_module_map()`.
   - Implement `load_dialects(ctx)`.
   - Implement `add_stages(stages, options, language)`.
-  - Current `wave` stage raises `NotImplementedError`.
+  - Implement `wave` and `amdgcn` stages.
 
 - Implemented `driver.py`
   - Reuse HIP utility loading where possible.
@@ -69,10 +70,12 @@
 
 ## Compiler Stages
 
-- Stage order:
+- Implemented stage order:
   - `ttir`
   - `wave`
   - `amdgcn`
+
+- Future stage:
   - `hsaco`
 
 - `make_ttir(mod, metadata, options)`
@@ -98,12 +101,12 @@
   - Set preliminary metadata.
 
 - `make_amdgcn(wave_module, metadata, options)`
-  - Initial:
-    - write Wave MLIR temp file
-    - invoke submodule-built `wave-translate --wave-to-amdgpu-asm`
+  - Implemented:
+    - invoke build-packaged `wave-translate --wave-to-amdgpu-asm`
+    - pass Wave MLIR text only as the external compiler artifact
   - Target:
     - call `translateWaveToAMDGPU()` in-process
-  - Set `metadata["name"]`.
+  - Preserve metadata from earlier stages.
 
 - `make_hsaco(amdgcn, metadata, options)`
   - Initial:
@@ -247,7 +250,8 @@
   - Wave MLIR dump contains `wave.kernel`
   - Wave MLIR dump contains `wave.index_expr`
   - Wave MLIR dump contains `wave.mem.token`
-  - AMDGCN emitted
+  - AMDGCN emitted with a packaged fake `wave-translate`
+  - missing packaged `wave-translate` diagnostic
   - HSACO emitted
 
 - Runtime tests:
@@ -268,7 +272,7 @@
 
 - M0: done. Backend skeleton registered as `wave_amd`; selection is gated behind explicit env vars.
 - M1: compile a supported TTIR op subset from live module IR to builder-generated Wave MLIR; no TTIR assembly parsing or kernel-shape matching.
-- M2: emit AMDGCN from Wave MLIR.
+- M2: done. Emit AMDGCN assembly from Wave MLIR through `wave-translate`.
 - M3: emit HSACO and load through HIP runtime.
 - M4: run masked load/store kernel end-to-end.
 - M5: add token threading for stores, volatile loads, barriers, and simple branches.
