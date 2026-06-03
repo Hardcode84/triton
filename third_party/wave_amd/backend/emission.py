@@ -66,11 +66,12 @@ def _packaged_wave_translate() -> Path:
 
 def _triton_amd_codegen():
     try:
-        from triton._C.libtriton import amd
+        from triton._C.libtriton import amd, llvm
     except (ImportError, AttributeError) as exc:
         raise RuntimeError("wave_amd HSACO emission requires Triton AMD codegen helpers "
                            "`assemble_amdgcn` and `link_hsaco`. Rebuild Triton with AMD backend support.") from exc
 
+    llvm.init_targets()
     missing = [name for name in ("assemble_amdgcn", "link_hsaco") if not hasattr(amd, name)]
     if missing:
         raise RuntimeError("wave_amd HSACO emission requires Triton AMD codegen helpers "

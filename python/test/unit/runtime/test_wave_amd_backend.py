@@ -193,6 +193,33 @@ def test_wave_amd_make_amdgcn_emits_masked_kernel_with_packaged_wave_translate(t
     assert "global_store_b32" in amdgcn
 
 
+def test_wave_amd_make_hsaco_emits_masked_kernel_elf(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_ADD_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+    hsaco = backend.make_hsaco(amdgcn, metadata, options)
+
+    assert metadata["name"] == "masked_add_kernel"
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert len(hsaco) > 0
+
+
 def test_wave_amd_make_wave_rejects_textual_ttir():
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
