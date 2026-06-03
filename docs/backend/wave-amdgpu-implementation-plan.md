@@ -267,7 +267,7 @@
 ## Milestones
 
 - M0: done. Backend skeleton registered as `wave_amd`; selection is gated behind explicit env vars.
-- M1: compile TTIR to dumped Wave MLIR for one elementwise kernel.
+- M1: compile a supported TTIR op subset from live module IR to builder-generated Wave MLIR; no TTIR assembly parsing or kernel-shape matching.
 - M2: emit AMDGCN from Wave MLIR.
 - M3: emit HSACO and load through HIP runtime.
 - M4: run masked load/store kernel end-to-end.

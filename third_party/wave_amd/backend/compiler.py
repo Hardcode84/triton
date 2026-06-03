@@ -8,6 +8,7 @@ from typing import Any, Dict, Tuple
 from triton import knobs
 from triton._C.libtriton import ir, passes
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
 
 
 def _warp_size_for_arch(arch: str) -> int:
@@ -64,7 +65,7 @@ class WaveAMDBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         assert isinstance(target.arch, str)
-        self.binary_ext = "hsaco"
+        self.binary_ext = "wave"
 
     def get_target_name(self, options) -> str:
         return f"wave_amd:{options.arch}"
@@ -95,7 +96,7 @@ class WaveAMDBackend(BaseBackend):
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
-        # M0 intentionally does not load Wave dialects or Python modules.
+        # M1 builds Wave MLIR through the Wave Python bindings.
         return
 
     @staticmethod
@@ -115,11 +116,19 @@ class WaveAMDBackend(BaseBackend):
 
     @staticmethod
     def make_wave(src, metadata, options):
-        raise NotImplementedError("TTIR-to-Wave lowering is not implemented yet for the wave_amd backend")
+        wave_mlir, name = lower_ttir_to_wave_mlir(src, options)
+        metadata["name"] = name
+        metadata["shared"] = 0
+        metadata["global_scratch_size"] = 0
+        metadata["global_scratch_align"] = 1
+        metadata["profile_scratch_size"] = 0
+        metadata["profile_scratch_align"] = 1
+        metadata["tensordesc_meta"] = {}
+        return wave_mlir
 
     def add_stages(self, stages, options, language):
         if language != Language.TRITON:
-            raise NotImplementedError("wave_amd M0 only supports Triton TTIR input")
+            raise NotImplementedError("wave_amd M1 only supports Triton TTIR input")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
         if knobs.runtime.add_stages_inspection_hook is not None:
@@ -127,4 +136,4 @@ class WaveAMDBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}-wave_amd-m0"
+        return f"{self.target}-wave_amd-m1"
