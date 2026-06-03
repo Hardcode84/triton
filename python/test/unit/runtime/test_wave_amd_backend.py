@@ -43,6 +43,35 @@ module {
 }
 """
 
+MASKED_ADD_TTIR = """
+module {
+  tt.func public @masked_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg3: i32) attributes {noinline = false} {
+    %c32 = arith.constant 32 : i32
+    %pid = tt.get_program_id x : i32
+    %block = arith.muli %pid, %c32 : i32
+    %block_vec = tt.splat %block : i32 -> tensor<32xi32>
+    %lane = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %offs = arith.addi %block_vec, %lane : tensor<32xi32>
+    %n_vec = tt.splat %arg3 : i32 -> tensor<32xi32>
+    %mask = arith.cmpi slt, %offs, %n_vec : tensor<32xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %a_ptr = tt.addptr %a_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %b_ptr = tt.addptr %b_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %c_ptr = tt.addptr %c_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %a = tt.load %a_ptr, %mask : tensor<32x!tt.ptr<f32>>
+    %b = tt.load %b_ptr, %mask : tensor<32x!tt.ptr<f32>>
+    %sum = arith.addf %a, %b : tensor<32xf32>
+    tt.store %c_ptr, %sum, %mask : tensor<32x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 
 def _parse_ttir(tmp_path, backend, ttir):
     context = ir.context()
@@ -99,6 +128,44 @@ def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
     assert "wave.fadd" in wave
     assert "wave.store" in wave
     assert "!wave.mem.token" in wave
+
+
+def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    class FakeNative:
+
+        def get_program_id_axis(self, op):
+            assert op.get_name() == "tt.get_program_id"
+            return 0
+
+        def get_cmpi_predicate(self, op):
+            assert op.get_name() == "arith.cmpi"
+            return "slt"
+
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_ADD_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "masked_add_kernel"
+    assert "wave.workgroup_id 0" in wave
+    assert "wave.cmpi" in wave
+    assert wave.count("wave.where") == 3
+    assert "-> !wave.simd<f32, 32>, !wave.mem.token" in wave
+    assert wave.count("wave.load") == 2
+    assert "wave.fadd" in wave
+    assert "wave.store" in wave
+    assert "pid_0" in wave
+    assert "lid" in wave
 
 
 def test_wave_amd_make_wave_rejects_textual_ttir():

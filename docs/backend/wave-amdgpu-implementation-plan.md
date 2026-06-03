@@ -134,6 +134,8 @@
   - pointer offset expressions -> `wave.index_expr`
   - `tt.load` -> `wave.load`
   - `tt.store` -> `wave.store`
+  - masked `tt.load` -> result-bearing `wave.where` yielding loaded value and token
+  - masked `tt.store` -> side-effecting `wave.where`
   - `tt.atomic_rmw` / `tt.atomic_cas` -> initially unsupported or Wave atomic extension
   - `tt.dot` -> `waveamd.mma`
   - `tt.splat` -> `wave.splat`

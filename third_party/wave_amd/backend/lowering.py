@@ -14,6 +14,7 @@ class _Value:
     index: object = None
     token: object = None
     ptr_base: object = None
+    mask_id: Optional[int] = None
 
 
 def lower_ttir_to_wave_mlir(src, options) -> Tuple[str, str]:
@@ -103,10 +104,6 @@ class _TTIRToWaveLowerer:
                 index += 1
                 continue
 
-            if self._memory_mask(op) is not None:
-                raise NotImplementedError(
-                    "wave_amd M1 does not lower predicated memory until mask/control-flow lowering is implemented")
-
             self._lower_op(op)
             index += 1
 
@@ -176,19 +173,21 @@ class _TTIRToWaveLowerer:
     def _lower_splat(self, op) -> None:
         src = self._value(op.get_operand(0))
         if src.ptr_base is not None:
-            state = _Value(wave=src.ptr_base, elem_type=src.elem_type, ptr_base=src.ptr_base)
+            state = _Value(wave=src.ptr_base, elem_type=src.elem_type, ptr_base=src.ptr_base, mask_id=src.mask_id)
         else:
             state = _Value(
                 wave=self.func.splat(src.wave, self._scalar_type(src.elem_type), self.width),
                 elem_type=src.elem_type,
                 expr=src.expr,
                 bindings=dict(src.bindings),
+                mask_id=src.mask_id,
             )
         self._set_result(op, state)
 
     def _lower_binary(self, op, expr_builder, wave_builder) -> None:
         lhs = self._value(op.get_operand(0))
         rhs = self._value(op.get_operand(1))
+        mask_id = _merge_mask_ids(lhs, rhs)
         wave = wave_builder(lhs.wave, rhs.wave)
         expr = None
         bindings = {}
@@ -205,6 +204,7 @@ class _TTIRToWaveLowerer:
                 elem_type=lhs.elem_type or rhs.elem_type,
                 expr=expr,
                 bindings=bindings,
+                mask_id=mask_id,
             ),
         )
 
@@ -230,15 +230,58 @@ class _TTIRToWaveLowerer:
         )
 
     def _lower_load(self, op) -> None:
+        mask = self._memory_mask(op)
+        if mask is not None:
+            if op.get_num_operands() != 2:
+                raise NotImplementedError("wave_amd masked tt.load does not support `other` values yet")
+            ptr = self._value(op.get_operand(0))
+            mask_value = self._value(mask)
+            if mask_value.wave is None:
+                raise NotImplementedError("wave_amd masked load requires a Wave mask value")
+            result_type = self._load_result_type(ptr)
+            with self.func.where(mask_value.wave, [result_type, self.dsl.mem_token_type()]) as where_op:
+                value, token = self._emit_load(ptr, result_type)
+                self.func.yield_([value, token])
+            value, token = where_op.results
+            self.load_tokens.append(token)
+            self._set_result(op, _Value(wave=value, elem_type=ptr.elem_type, token=token, mask_id=mask.id()))
+            return
+
         ptr = self._value(op.get_operand(0))
-        elem_type = ptr.elem_type
-        value, token = self.func.load(ptr.wave, self.dsl.simd_type(self._scalar_type(elem_type), self.width))
+        value, token = self._emit_load(ptr)
         self.load_tokens.append(token)
-        self._set_result(op, _Value(wave=value, elem_type=elem_type, token=token))
+        self._set_result(op, _Value(wave=value, elem_type=ptr.elem_type, token=token))
 
     def _lower_store(self, op) -> None:
         ptr = self._value(op.get_operand(0))
         value = self._value(op.get_operand(1))
+        mask = self._memory_mask(op)
+        if mask is not None:
+            if op.get_num_operands() != 3:
+                raise NotImplementedError("wave_amd masked tt.store supports pointer, value, and mask operands only")
+            if value.mask_id is not None and value.mask_id != mask.id():
+                raise NotImplementedError(
+                    "wave_amd masked load values must be stored under the same SSA mask that produced them")
+            mask_value = self._value(mask)
+            if mask_value.wave is None:
+                raise NotImplementedError("wave_amd masked store requires a Wave mask value")
+            with self.func.where(mask_value.wave):
+                self._emit_store(ptr, value)
+            self.load_tokens.clear()
+            return
+
+        if value.mask_id is not None:
+            raise NotImplementedError("wave_amd masked load value cannot be stored without its producing SSA mask")
+        self._emit_store(ptr, value)
+
+    def _load_result_type(self, ptr: _Value):
+        elem_type = ptr.elem_type
+        return self.dsl.simd_type(self._scalar_type(elem_type), self.width)
+
+    def _emit_load(self, ptr: _Value, result_type=None):
+        return self.func.load(ptr.wave, result_type or self._load_result_type(ptr))
+
+    def _emit_store(self, ptr: _Value, value: _Value) -> None:
         after = None
         if len(self.load_tokens) == 1:
             after = self.load_tokens[0]
@@ -327,6 +370,15 @@ def _signature_element_type(signature: str) -> Optional[str]:
     if signature.startswith("*"):
         return signature[1:]
     return signature
+
+
+def _merge_mask_ids(*states: _Value) -> Optional[int]:
+    mask_ids = {state.mask_id for state in states if state.mask_id is not None}
+    if not mask_ids:
+        return None
+    if len(mask_ids) != 1:
+        raise NotImplementedError("wave_amd masked values must share one SSA mask")
+    return next(iter(mask_ids))
 
 
 def _load_wave_dsl():
