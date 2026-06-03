@@ -11,6 +11,7 @@ triton_compiler = pytest.importorskip("triton.compiler.compiler")
 driver_api = pytest.importorskip("triton.backends.driver")
 wave_compiler = pytest.importorskip("triton.backends.wave_amd.compiler")
 wave_emission = pytest.importorskip("triton.backends.wave_amd.emission")
+wave_lowering = pytest.importorskip("triton.backends.wave_amd.lowering")
 wave_driver = pytest.importorskip("triton.backends.wave_amd.driver")
 hip_driver = pytest.importorskip("triton.backends.amd.driver")
 
@@ -107,6 +108,32 @@ def test_wave_amd_make_wave_rejects_textual_ttir():
 
     with pytest.raises(TypeError, match="module object"):
         backend.make_wave(ELEMENTWISE_ADD_TTIR, {}, options)
+
+
+def test_wave_amd_lowering_reads_structural_attrs_through_native_helpers(monkeypatch):
+
+    class FakeNative:
+
+        def __init__(self):
+            self.calls = []
+
+        def get_program_id_axis(self, op):
+            self.calls.append(("program_id", op))
+            return 1
+
+        def get_cmpi_predicate(self, op):
+            self.calls.append(("cmpi", op))
+            return "ult"
+
+    fake_native = FakeNative()
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: fake_native)
+    lowerer = wave_lowering._TTIRToWaveLowerer.__new__(wave_lowering._TTIRToWaveLowerer)
+    program_id_op = object()
+    cmpi_op = object()
+
+    assert lowerer._program_id_axis(program_id_op) == 1
+    assert lowerer._cmpi_predicate(cmpi_op) == "ult"
+    assert fake_native.calls == [("program_id", program_id_op), ("cmpi", cmpi_op)]
 
 
 def test_wave_amd_make_amdgcn_uses_packaged_wave_translate(tmp_path, monkeypatch):

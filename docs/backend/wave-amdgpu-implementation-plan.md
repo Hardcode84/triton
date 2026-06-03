@@ -38,7 +38,7 @@
 
 - Implemented Triton CMake changes:
   - builds `third_party/wave_amd` through `TRITON_CODEGEN_BACKENDS`
-  - exposes empty native `init_triton_wave_amd` stub
+  - exposes native `wave_amd` Python hooks for structural TTIR attribute reads
   - builds and packages `wave-translate` under `triton.backends.wave_amd/bin`
 
 - Remaining Triton CMake changes:

@@ -275,29 +275,12 @@ class _TTIRToWaveLowerer:
         return sym, {sym: state.wave}
 
     def _program_id_axis(self, op) -> Optional[int]:
-        axis = op.get_int_attr("axis")
-        if axis is not None:
-            return int(axis)
-
-        axis_name = op.get_str_attr("axis")
-        if axis_name is not None:
-            axes = {"x": 0, "y": 1, "z": 2}
-            if axis_name not in axes:
-                raise NotImplementedError(f"wave_amd M1 does not support program id axis {axis_name!r}")
-            return axes[axis_name]
-
-        return None
+        axis = _wave_amd_native().get_program_id_axis(op)
+        return None if axis is None else int(axis)
 
     def _cmpi_predicate(self, op) -> Optional[str]:
-        predicate = op.get_str_attr("predicate")
-        if predicate is not None:
-            return predicate
-
-        predicate = op.get_str_attr("pred")
-        if predicate is not None:
-            return predicate
-
-        return None
+        predicate = _wave_amd_native().get_cmpi_predicate(op)
+        return None if predicate is None else str(predicate)
 
     def _sym(self, name: str):
         if name not in self.symbols:
@@ -363,3 +346,18 @@ def _load_wave_dsl():
                 "wave_amd M1 lowering requires the Wave Python MLIR builder bindings. "
                 "Build/install the Wave submodule Python bindings so `mlir.dialects.wave_dsl` "
                 "can be imported; this backend intentionally does not fall back to textual MLIR assembly.") from cause
+
+
+def _wave_amd_native():
+    try:
+        from triton._C.libtriton import wave_amd
+    except (AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            "wave_amd M1 lowering requires the Triton wave_amd native extension. "
+            "Rebuild Triton with the wave_amd backend so TTIR operation attributes can be read structurally.") from exc
+
+    missing = [name for name in ("get_program_id_axis", "get_cmpi_predicate") if not hasattr(wave_amd, name)]
+    if missing:
+        raise RuntimeError("wave_amd M1 lowering requires the Triton wave_amd native extension to expose "
+                           f"{', '.join(missing)}. Rebuild Triton with the updated wave_amd backend.")
+    return wave_amd
