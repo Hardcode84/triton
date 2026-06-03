@@ -54,12 +54,12 @@ class _TTIRToWaveLowerer:
 
         with self.dsl.module() as module_builder:
             arg_types = [self._signature_type(ty) for ty in self.module.get_function_signature(func_op)]
+            del module_builder.module.operation.attributes["gpu.container_module"]
             module_builder.module.operation.attributes["waveamdmachine.target"] = self.dsl.StringAttr.get(target)
-            with module_builder.gpu_module("kernels") as gpu_module:
-                with gpu_module.kernel(name, arg_types) as func:
-                    self.func = func
-                    self._bind_arguments(func_op, func.args)
-                    self._lower_ops(ops)
+            with module_builder.function(name, arg_types, kernel=True) as func:
+                self.func = func
+                self._bind_arguments(func_op, func.args)
+                self._lower_ops(ops)
             return str(module_builder), name
 
     def _collect_entry_ops(self, entry_name: str) -> Sequence[object]:

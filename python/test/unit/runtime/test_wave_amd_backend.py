@@ -56,7 +56,7 @@ module {
     %lane = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
     %offs = arith.addi %block_vec, %lane : tensor<32xi32>
     %n_vec = tt.splat %arg3 : i32 -> tensor<32xi32>
-    %mask = arith.cmpi slt, %offs, %n_vec : tensor<32xi32>
+    %mask = arith.cmpi ult, %offs, %n_vec : tensor<32xi32>
     %a_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
     %b_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
     %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
@@ -118,8 +118,7 @@ def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
     assert metadata["name"] == "add_kernel"
     assert metadata["shared"] == 0
     assert 'waveamdmachine.target = "amdgcn-amd-amdhsa--gfx1100"' in wave
-    assert "gpu.container_module" in wave
-    assert "gpu.kernel" in wave
+    assert "func.func @add_kernel" in wave
     assert "wave.kernel" in wave
     assert "wave.index_expr" in wave
     assert "lid" in wave
@@ -144,7 +143,7 @@ def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypat
 
         def get_cmpi_predicate(self, op):
             assert op.get_name() == "arith.cmpi"
-            return "slt"
+            return "ult"
 
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
 
@@ -166,6 +165,32 @@ def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypat
     assert "wave.store" in wave
     assert "pid_0" in wave
     assert "lid" in wave
+
+
+def test_wave_amd_make_amdgcn_emits_masked_kernel_with_packaged_wave_translate(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_ADD_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+
+    assert metadata["name"] == "masked_add_kernel"
+    assert '.amdgcn_target "amdgcn-amd-amdhsa--gfx1100"' in amdgcn
+    assert "masked_add_kernel:" in amdgcn
+    assert "global_load_b32" in amdgcn
+    assert "global_store_b32" in amdgcn
 
 
 def test_wave_amd_make_wave_rejects_textual_ttir():

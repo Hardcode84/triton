@@ -4,6 +4,7 @@ set(WAVE_AMD_WAVE_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/wave)
 set(WAVE_AMD_WAVE_LLVM_INSTALL_DIR ${WAVE_AMD_WAVE_SOURCE_DIR}/build/llvm-install)
 set(WAVE_AMD_WAVE_LLVM_STAMP ${WAVE_AMD_WAVE_LLVM_INSTALL_DIR}/.wave-mlir-commit)
 set(WAVE_AMD_WAVE_TRANSLATE ${WAVE_AMD_WAVE_BINARY_DIR}/bin/wave-translate)
+set(WAVE_AMD_WAVE_PIPELINES ${WAVE_AMD_WAVE_BINARY_DIR}/share/wave-mlir/pipelines/pipelines.mlir)
 
 include(ProcessorCount)
 ProcessorCount(WAVE_AMD_HOST_PROCESSOR_COUNT)
@@ -82,17 +83,26 @@ if(TRITON_BUILD_PYTHON_MODULE)
     message(FATAL_ERROR "TRITON_WHEEL_DIR must be set to package wave-translate.")
   endif()
   set(WAVE_AMD_BACKEND_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backend/bin")
+  set(WAVE_AMD_BACKEND_PIPELINES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backend/share/wave-mlir/pipelines")
   set(WAVE_AMD_PACKAGED_WAVE_TRANSLATE "${WAVE_AMD_BACKEND_BIN_DIR}/wave-translate")
+  set(WAVE_AMD_PACKAGED_PIPELINES "${WAVE_AMD_BACKEND_PIPELINES_DIR}/pipelines.mlir")
   add_custom_command(
     OUTPUT "${WAVE_AMD_PACKAGED_WAVE_TRANSLATE}"
+           "${WAVE_AMD_PACKAGED_PIPELINES}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${WAVE_AMD_BACKEND_BIN_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${WAVE_AMD_BACKEND_PIPELINES_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${WAVE_AMD_WAVE_TRANSLATE}"
             "${WAVE_AMD_PACKAGED_WAVE_TRANSLATE}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WAVE_AMD_WAVE_PIPELINES}"
+            "${WAVE_AMD_PACKAGED_PIPELINES}"
     DEPENDS WaveAMDWaveTranslate
+            "${WAVE_AMD_WAVE_PIPELINES}"
     COMMENT "Packaging wave-translate for the wave_amd backend"
     VERBATIM)
   add_custom_target(WaveAMDPackagedWaveTranslate ALL
-    DEPENDS "${WAVE_AMD_PACKAGED_WAVE_TRANSLATE}")
+    DEPENDS "${WAVE_AMD_PACKAGED_WAVE_TRANSLATE}"
+            "${WAVE_AMD_PACKAGED_PIPELINES}")
   add_dependencies(TritonWaveAMD WaveAMDPackagedWaveTranslate)
 endif()
