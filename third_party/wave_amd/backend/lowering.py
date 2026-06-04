@@ -126,6 +126,8 @@ class _TTIRToWaveLowerer:
             self._lower_binary(op, None, self.func.fmul)
         elif name == "arith.cmpi":
             self._lower_cmpi(op)
+        elif name == "arith.select":
+            self._lower_select(op)
         elif name == "tt.get_program_id":
             self._lower_program_id(op)
         elif name == "tt.make_range":
@@ -264,6 +266,20 @@ class _TTIRToWaveLowerer:
                 "wave_amd cannot lower arith.cmpi until the predicate attribute is exposed structurally")
         self._set_result(op, _Value(wave=self.func.cmpi(predicate, lhs.wave, rhs.wave), elem_type="i1"))
 
+    def _lower_select(self, op) -> None:
+        condition = self._value(op.get_operand(0))
+        true_value = self._value(op.get_operand(1))
+        false_value = self._value(op.get_operand(2))
+        true_wave, false_wave = self._select_operands(true_value, false_value)
+        self._set_result(
+            op,
+            _Value(
+                wave=self.func.select(condition.wave, true_wave, false_wave),
+                elem_type=true_value.elem_type or false_value.elem_type,
+                mask_id=_merge_mask_ids(true_value, false_value),
+            ),
+        )
+
     def _lower_addptr(self, op) -> None:
         ptr = self._value(op.get_operand(0))
         offset = self._value(op.get_operand(1))
@@ -394,6 +410,18 @@ class _TTIRToWaveLowerer:
         if str(value.wave.type).startswith("!wave.simd<"):
             return self.func.splat(scalar, self._scalar_type(elem_type), self.width)
         return scalar
+
+    def _select_operands(self, true_value: _Value, false_value: _Value):
+        true_wave = true_value.wave
+        false_wave = false_value.wave
+        true_is_simd = str(true_wave.type).startswith("!wave.simd<")
+        false_is_simd = str(false_wave.type).startswith("!wave.simd<")
+        elem_type = true_value.elem_type or false_value.elem_type
+        if true_is_simd and not false_is_simd:
+            false_wave = self.func.splat(false_wave, self._scalar_type(false_value.elem_type or elem_type), self.width)
+        elif false_is_simd and not true_is_simd:
+            true_wave = self.func.splat(true_wave, self._scalar_type(true_value.elem_type or elem_type), self.width)
+        return true_wave, false_wave
 
     def _memory_mask(self, op):
         name = op.get_name()
