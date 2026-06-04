@@ -97,6 +97,39 @@ module {
 }
 """
 
+MASKED_SUB_MUL_TTIR = """
+module {
+  tt.func public @masked_sub_mul_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg3: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    %pid = tt.get_program_id x : i32
+    %block = arith.muli %pid, %c32 : i32
+    %block_vec = tt.splat %block : i32 -> tensor<32xi32>
+    %lane = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %raw_offs = arith.addi %block_vec, %lane : tensor<32xi32>
+    %zero_vec = tt.splat %c0 : i32 -> tensor<32xi32>
+    %offs = arith.subi %raw_offs, %zero_vec : tensor<32xi32>
+    %n_vec = tt.splat %arg3 : i32 -> tensor<32xi32>
+    %mask = arith.cmpi ult, %offs, %n_vec : tensor<32xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %a_ptr = tt.addptr %a_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %b_ptr = tt.addptr %b_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %c_ptr = tt.addptr %c_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %a = tt.load %a_ptr, %mask : tensor<32x!tt.ptr<f32>>
+    %b = tt.load %b_ptr, %mask : tensor<32x!tt.ptr<f32>>
+    %diff = arith.subf %a, %b : tensor<32xf32>
+    %prod = arith.mulf %diff, %b : tensor<32xf32>
+    tt.store %c_ptr, %prod, %mask : tensor<32x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 
 def _parse_ttir(tmp_path, backend, ttir):
     context = ir.context()
@@ -252,6 +285,47 @@ def test_wave_amd_make_wave_lowers_masked_load_other(tmp_path, monkeypatch):
     assert "wave.store" in wave
 
 
+def test_wave_amd_make_wave_lowers_masked_sub_mul(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    class FakeNative:
+
+        def get_program_id_axis(self, op):
+            assert op.get_name() == "tt.get_program_id"
+            return 0
+
+        def get_cmpi_predicate(self, op):
+            assert op.get_name() == "arith.cmpi"
+            return "ult"
+
+        def get_arith_constant_splat(self, op):
+            value = op.get_constant_value()
+            if value is None:
+                return None
+            return value, "i32", None
+
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_SUB_MUL_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "masked_sub_mul_kernel"
+    assert "wave.fsub" in wave
+    assert "wave.fmul" in wave
+    assert "arith.constant -1" in wave
+    assert wave.count("wave.where") == 3
+    assert wave.count("wave.load") == 2
+    assert "wave.store" in wave
+
+
 def test_wave_amd_make_amdgcn_emits_masked_kernel_with_packaged_wave_translate(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -303,6 +377,33 @@ def test_wave_amd_make_amdgcn_emits_masked_load_other_with_packaged_wave_transla
     assert "global_load_b32" in amdgcn
     assert "global_store_b32" in amdgcn
     assert amdgcn.count("global_store_b32") >= 2
+
+
+def test_wave_amd_make_amdgcn_emits_masked_sub_mul_with_packaged_wave_translate(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_SUB_MUL_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+
+    assert metadata["name"] == "masked_sub_mul_kernel"
+    assert '.amdgcn_target "amdgcn-amd-amdhsa--gfx1100"' in amdgcn
+    assert "masked_sub_mul_kernel:" in amdgcn
+    assert "v_sub_f32" in amdgcn
+    assert "v_mul_f32" in amdgcn
+    assert "global_store_b32" in amdgcn
 
 
 def test_wave_amd_make_hsaco_emits_masked_kernel_elf(tmp_path):
@@ -359,6 +460,33 @@ def test_wave_amd_make_hsaco_emits_masked_load_other_kernel_elf(tmp_path):
     assert len(hsaco) > 0
 
 
+def test_wave_amd_make_hsaco_emits_masked_sub_mul_kernel_elf(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_SUB_MUL_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+    hsaco = backend.make_hsaco(amdgcn, metadata, options)
+
+    assert metadata["name"] == "masked_sub_mul_kernel"
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert len(hsaco) > 0
+
+
 def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, device):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -397,6 +525,47 @@ def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, dev
 
     expected = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
     expected[:n] = a[:n] + b[:n]
+    torch.testing.assert_close(c, expected)
+
+
+def test_wave_amd_runtime_launches_masked_sub_mul_tail(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+
+    n = 45
+    total = 64
+    a = torch.arange(total, device=device, dtype=torch.float32)
+    b = torch.arange(total, device=device, dtype=torch.float32) * 0.5
+    c = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
+    module_path = tmp_path / "masked_sub_mul.ttir"
+    module_path.write_text(MASKED_SUB_MUL_TTIR)
+    kernel = triton_compiler.compile(
+        str(module_path),
+        target=GPUTarget("wave_amd", target.arch, target.warp_size),
+        options={"num_warps": 1},
+    )
+    kernel[(2, 1, 1)](a, b, c, n)
+    getattr(torch, device).synchronize()
+
+    expected = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
+    expected[:n] = (a[:n] - b[:n]) * b[:n]
     torch.testing.assert_close(c, expected)
 
 

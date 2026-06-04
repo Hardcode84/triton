@@ -114,10 +114,16 @@ class _TTIRToWaveLowerer:
             self._lower_constant(op)
         elif name == "arith.addi":
             self._lower_binary(op, lambda lhs, rhs: lhs + rhs, self.func.addi)
+        elif name == "arith.subi":
+            self._lower_subi(op)
         elif name == "arith.muli":
             self._lower_binary(op, lambda lhs, rhs: lhs * rhs, self.func.muli)
         elif name == "arith.addf":
             self._lower_binary(op, None, self.func.fadd)
+        elif name == "arith.subf":
+            self._lower_binary(op, None, self.func.fsub)
+        elif name == "arith.mulf":
+            self._lower_binary(op, None, self.func.fmul)
         elif name == "arith.cmpi":
             self._lower_cmpi(op)
         elif name == "tt.get_program_id":
@@ -186,14 +192,16 @@ class _TTIRToWaveLowerer:
         if src.ptr_base is not None:
             state = _Value(wave=src.ptr_base, elem_type=src.elem_type, ptr_base=src.ptr_base, mask_id=src.mask_id)
         else:
+            expr, bindings = self._expr_and_bindings(src)
             splat_const = None
             if src.splat_const is not None and src.splat_const[2] is None:
                 splat_const = (src.splat_const[0], src.splat_const[1], self.width)
             state = _Value(
                 wave=self.func.splat(src.wave, self._scalar_type(src.elem_type), self.width),
                 elem_type=src.elem_type,
-                expr=src.expr,
-                bindings=dict(src.bindings),
+                const=src.const,
+                expr=expr,
+                bindings=bindings,
                 mask_id=src.mask_id,
                 splat_const=splat_const,
             )
@@ -212,6 +220,30 @@ class _TTIRToWaveLowerer:
             if lhs_expr is not None and rhs_expr is not None:
                 expr = expr_builder(lhs_expr, rhs_expr)
                 bindings = {**lhs_bindings, **rhs_bindings}
+        self._set_result(
+            op,
+            _Value(
+                wave=wave,
+                elem_type=lhs.elem_type or rhs.elem_type,
+                expr=expr,
+                bindings=bindings,
+                mask_id=mask_id,
+            ),
+        )
+
+    def _lower_subi(self, op) -> None:
+        lhs = self._value(op.get_operand(0))
+        rhs = self._value(op.get_operand(1))
+        mask_id = _merge_mask_ids(lhs, rhs)
+        neg_rhs = self.func.muli(rhs.wave, self._negative_one_like(rhs))
+        wave = self.func.addi(lhs.wave, neg_rhs)
+        expr = None
+        bindings = {}
+        lhs_expr, lhs_bindings = self._expr_and_bindings(lhs)
+        rhs_expr, rhs_bindings = self._expr_and_bindings(rhs)
+        if lhs_expr is not None and rhs_expr is not None:
+            expr = lhs_expr - rhs_expr
+            bindings = {**lhs_bindings, **rhs_bindings}
         self._set_result(
             op,
             _Value(
@@ -355,6 +387,13 @@ class _TTIRToWaveLowerer:
         if width is None:
             return scalar
         return self.func.splat(scalar, self._scalar_type(elem_type), width)
+
+    def _negative_one_like(self, value: _Value):
+        elem_type = value.elem_type or "i32"
+        scalar = self.func.constant(self._scalar_type(elem_type), -1)
+        if str(value.wave.type).startswith("!wave.simd<"):
+            return self.func.splat(scalar, self._scalar_type(elem_type), self.width)
+        return scalar
 
     def _memory_mask(self, op):
         name = op.get_name()
