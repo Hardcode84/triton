@@ -43,6 +43,27 @@ module {
 }
 """
 
+MULTI_REGISTER_ADD_TTIR = """
+module {
+  tt.func public @wide_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                  %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                  %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %lane = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %a_ptr = tt.addptr %a_base, %lane : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %b_ptr = tt.addptr %b_base, %lane : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %c_ptr = tt.addptr %c_base, %lane : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %a = tt.load %a_ptr : tensor<64x!tt.ptr<f32>>
+    %b = tt.load %b_ptr : tensor<64x!tt.ptr<f32>>
+    %sum = arith.addf %a, %b : tensor<64xf32>
+    tt.store %c_ptr, %sum : tensor<64x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 MASKED_ADD_TTIR = """
 module {
   tt.func public @masked_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
@@ -174,6 +195,20 @@ def _parse_ttir(tmp_path, backend, ttir):
     return module
 
 
+def _fake_result_tensor_info(op, result_index):
+    if result_index >= op.get_num_results():
+        return None
+    type_text = str(op.get_result(result_index).get_type())
+    if not type_text.startswith("tensor<") or not type_text.endswith(">"):
+        return None
+    body = type_text[len("tensor<"):-1]
+    shape_text, elem_type = body.rsplit("x", 1)
+    shape = tuple(int(dim) for dim in shape_text.split("x"))
+    if elem_type.startswith("!tt.ptr<") and elem_type.endswith(">"):
+        return shape, elem_type[len("!tt.ptr<"):-1], True
+    return shape, elem_type, False
+
+
 def test_wave_amd_backend_skeleton():
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
@@ -205,6 +240,15 @@ def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monke
     assert WaveAMDBackend(target).hash() != first_hash
 
 
+def test_wave_amd_blocked_layout_chunks_wide_1d_tensor():
+    info = wave_lowering._TensorInfo((64, ), "i32")
+
+    layout = wave_lowering._BlockedLayout.for_tensor(info, width=32, num_warps=1, num_ctas=1)
+
+    assert layout.shape == (64, )
+    assert layout.registers == 2
+
+
 def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -233,6 +277,35 @@ def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
     assert "!wave.mem.token" in wave
 
 
+def test_wave_amd_make_wave_lowers_wide_add_with_layout_chunks(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    class FakeNative:
+
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
+
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MULTI_REGISTER_ADD_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "wide_add_kernel"
+    assert wave.count("wave.index_expr") == 6
+    assert "lid + 32" in wave or "32 + lid" in wave
+    assert wave.count("wave.load") == 4
+    assert wave.count("wave.fadd") == 2
+    assert wave.count("wave.store") == 2
+
+
 def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypatch):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -254,6 +327,9 @@ def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypat
             if value is None:
                 return None
             return value, "i32", None
+
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
 
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
 
@@ -299,6 +375,9 @@ def test_wave_amd_make_wave_lowers_masked_load_other(tmp_path, monkeypatch):
                 return value, "i32", None
             return 5.0, "f32", 32
 
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
+
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
 
     target = GPUTarget("wave_amd", "gfx1100", 32)
@@ -338,6 +417,9 @@ def test_wave_amd_make_wave_lowers_masked_sub_mul(tmp_path, monkeypatch):
             if value is None:
                 return None
             return value, "i32", None
+
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
 
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
 
@@ -379,6 +461,9 @@ def test_wave_amd_make_wave_lowers_masked_select(tmp_path, monkeypatch):
             if value is None:
                 return None
             return value, "i32", None
+
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
 
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
 
@@ -804,6 +889,10 @@ def test_wave_amd_lowering_reads_structural_attrs_through_native_helpers(monkeyp
         def get_arith_constant_splat(self, op):
             self.calls.append(("constant", op))
             return 7, "i32", None
+
+        def get_result_tensor_info(self, op, result_index):
+            self.calls.append(("tensor_info", op, result_index))
+            return None
 
     fake_native = FakeNative()
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: fake_native)

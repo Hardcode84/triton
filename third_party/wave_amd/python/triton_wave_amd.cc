@@ -3,6 +3,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 #include <optional>
 #include <pybind11/pybind11.h>
@@ -72,6 +73,34 @@ py::object packSplatConstant(py::object value, mlir::Type elementType,
   return result;
 }
 
+py::object packTensorInfo(mlir::Type type) {
+  auto tensor = llvm::dyn_cast<mlir::RankedTensorType>(type);
+  if (!tensor)
+    return py::none();
+
+  mlir::Type elementType = tensor.getElementType();
+  bool isPointer = false;
+  if (auto pointerType =
+          llvm::dyn_cast<mlir::triton::PointerType>(elementType)) {
+    elementType = pointerType.getPointeeType();
+    isPointer = true;
+  }
+
+  py::object elementTypeName = getScalarTypeName(elementType);
+  if (elementTypeName.is_none())
+    return py::none();
+
+  py::tuple shape(tensor.getRank());
+  for (auto [index, dim] : llvm::enumerate(tensor.getShape()))
+    shape[index] = py::int_(dim);
+
+  py::tuple result(3);
+  result[0] = shape;
+  result[1] = elementTypeName;
+  result[2] = py::bool_(isPointer);
+  return result;
+}
+
 } // namespace
 
 void init_triton_wave_amd(py::module &&m) {
@@ -127,4 +156,12 @@ void init_triton_wave_amd(py::module &&m) {
     }
     return py::none();
   });
+
+  m.def("get_result_tensor_info",
+        [](mlir::Operation *op, int64_t resultIndex) -> py::object {
+          if (!op || resultIndex < 0 ||
+              resultIndex >= static_cast<int64_t>(op->getNumResults()))
+            return py::none();
+          return packTensorInfo(op->getResult(resultIndex).getType());
+        });
 }
