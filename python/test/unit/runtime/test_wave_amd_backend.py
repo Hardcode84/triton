@@ -220,6 +220,47 @@ def test_wave_amd_make_hsaco_emits_masked_kernel_elf(tmp_path):
     assert len(hsaco) > 0
 
 
+def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+
+    n = 45
+    total = 64
+    a = torch.arange(total, device=device, dtype=torch.float32)
+    b = torch.arange(total, device=device, dtype=torch.float32) * 2.0
+    c = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
+    module_path = tmp_path / "masked_add.ttir"
+    module_path.write_text(MASKED_ADD_TTIR)
+    kernel = triton_compiler.compile(
+        str(module_path),
+        target=GPUTarget("wave_amd", target.arch, target.warp_size),
+        options={"num_warps": 1},
+    )
+    kernel[(2, 1, 1)](a, b, c, n)
+    getattr(torch, device).synchronize()
+
+    expected = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
+    expected[:n] = a[:n] + b[:n]
+    torch.testing.assert_close(c, expected)
+
+
 def test_wave_amd_make_wave_rejects_textual_ttir():
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
