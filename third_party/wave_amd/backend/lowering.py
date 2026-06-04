@@ -26,36 +26,57 @@ class _BlockedLayout:
     shape: Tuple[int, ...]
     width: int
     num_warps: int
+    num_ctas: int
     registers: int
 
     @classmethod
     def for_tensor(cls, info: _TensorInfo, width: int, num_warps: int, num_ctas: int) -> "_BlockedLayout":
         if num_warps < 1 or not _is_power_of_two(num_warps):
             raise NotImplementedError("wave_amd layout lowering requires power-of-two num_warps")
-        if num_ctas != 1:
-            raise NotImplementedError("wave_amd general layout lowering currently supports one CTA per CGA")
+        if num_ctas < 1 or not _is_power_of_two(num_ctas):
+            raise NotImplementedError("wave_amd layout lowering requires power-of-two num_ctas")
         elements = _product(info.shape)
         if any(not _is_power_of_two(dim) for dim in info.shape):
             raise NotImplementedError("wave_amd layout lowering requires power-of-two tensor dimensions")
         if not _is_power_of_two(elements):
             raise NotImplementedError("wave_amd layout lowering requires power-of-two tensor shapes")
         threads = width * num_warps
-        if elements < threads or elements % threads != 0:
+        cga_threads = threads * num_ctas
+        if elements < cga_threads or elements % cga_threads != 0:
             raise NotImplementedError("wave_amd layout lowering requires tensor elements to be a multiple of "
-                                      f"num_warps * warp_size, got {elements}")
-        return cls(shape=info.shape, width=width, num_warps=num_warps, registers=elements // threads)
+                                      f"num_ctas * num_warps * warp_size, got {elements}")
+        return cls(
+            shape=info.shape,
+            width=width,
+            num_warps=num_warps,
+            num_ctas=num_ctas,
+            registers=elements // cga_threads,
+        )
 
-    def index_expr(self, dsl, lane_sym, register: int):
+    @property
+    def elements_per_cta(self) -> int:
+        return _product(self.shape) // self.num_ctas
+
+    @property
+    def threads_per_cta(self) -> int:
+        return self.width * self.num_warps
+
+    def index_expr(self, dsl, lane_sym, cta_sym, register: int):
         if register < 0 or register >= self.registers:
             raise IndexError(register)
-        if register == 0:
-            return lane_sym
-        return lane_sym + register * self.width * self.num_warps
+        flat = lane_sym
+        if register != 0:
+            flat = flat + register * self.threads_per_cta
+        if self.num_ctas != 1:
+            if cta_sym is None:
+                raise ValueError("wave_amd multi-CTA layout requires a CTA symbol")
+            flat = cta_sym * self.elements_per_cta + flat
+        return flat
 
-    def coord_expr(self, dsl, lane_sym, register: int, axis: int):
+    def coord_expr(self, dsl, lane_sym, cta_sym, register: int, axis: int):
         if axis < 0 or axis >= len(self.shape):
             raise IndexError(axis)
-        flat = self.index_expr(dsl, lane_sym, register)
+        flat = self.index_expr(dsl, lane_sym, cta_sym, register)
         stride = _product(self.shape[axis + 1:])
         if stride != 1:
             flat = dsl.floor(flat / stride)
@@ -122,6 +143,7 @@ class _TTIRToWaveLowerer:
         self.symbols: Dict[str, object] = {}
         self._lane_value = None
         self._workitem_value = None
+        self._workgroup_values: Dict[int, object] = {}
 
     def lower(self) -> Tuple[str, str]:
         name = self.module.get_entry_func_name()
@@ -252,8 +274,18 @@ class _TTIRToWaveLowerer:
         if axis is None:
             raise NotImplementedError(
                 "wave_amd cannot lower tt.get_program_id until ProgramDimAttr is exposed structurally")
-        pid = self.func.workgroup_id(axis)
+        pid = self._workgroup_id(axis)
         sym = self._sym(f"pid_{axis}")
+        if axis == 0 and self.num_ctas > 1:
+            wg_sym = self._workgroup_sym(axis)
+            expr = self.dsl.floor(wg_sym / self.num_ctas)
+            pid_index = self.func.index_expr(expr, {wg_sym: pid}, self.dsl.index_type())
+            pid = self.func.index_cast(pid_index, self.dsl.i32())
+            self._set_result(
+                op,
+                _Value(wave=pid, elem_type="i32", expr=expr, bindings={wg_sym: self._workgroup_id(axis)}),
+            )
+            return
         self._set_result(op, _Value(wave=pid, elem_type="i32", expr=sym, bindings={sym: pid}))
 
     def _lower_make_range(self, op) -> None:
@@ -403,7 +435,7 @@ class _TTIRToWaveLowerer:
             lhs = self._coerce_tensor(lhs, layout, info)
             rhs = self._coerce_tensor(rhs, layout, info)
             waves = ()
-            if lhs.waves and rhs.waves:
+            if self._can_emit_binary_waves(lhs, rhs):
                 waves = tuple(wave_builder(lhs_wave, rhs_wave) for lhs_wave, rhs_wave in zip(lhs.waves, rhs.waves))
             exprs = []
             bindings_by_wave = []
@@ -470,7 +502,7 @@ class _TTIRToWaveLowerer:
             exprs = []
             bindings_by_wave = []
             for index in range(layout.registers):
-                if lhs.waves and rhs.waves:
+                if self._can_emit_binary_waves(lhs, rhs):
                     lhs_wave = lhs.waves[index]
                     rhs_wave = rhs.waves[index]
                     neg_rhs = self.func.muli(rhs_wave, self._negative_one_like(rhs, index))
@@ -846,6 +878,20 @@ class _TTIRToWaveLowerer:
             self._workitem_value = self.func.workitem_id(axis=0, element_type=self.dsl.i32(), width=self.width)
         return self._workitem_value, self._sym("wi")
 
+    def _workgroup_id(self, axis: int):
+        if axis not in self._workgroup_values:
+            self._workgroup_values[axis] = self.func.workgroup_id(axis)
+        return self._workgroup_values[axis]
+
+    def _workgroup_sym(self, axis: int):
+        return self._sym(f"wg_{axis}")
+
+    def _cta_expr_and_bindings(self):
+        if self.num_ctas == 1:
+            return None, {}
+        wg_sym = self._workgroup_sym(0)
+        return self.dsl.mod(wg_sym, self.num_ctas), {wg_sym: self._workgroup_id(0)}
+
     def _splat_i32(self, value: int):
         scalar = self.func.constant(self.dsl.i32(), value)
         return self.func.splat(scalar, self.dsl.i32(), self.width)
@@ -856,6 +902,10 @@ class _TTIRToWaveLowerer:
         if state.wave is None:
             return ()
         return (state.wave, )
+
+    def _can_emit_binary_waves(self, lhs: _Value, rhs: _Value) -> bool:
+        return bool(lhs.waves and rhs.waves and len(lhs.waves) == len(rhs.waves)
+                    and all(lhs_wave.type == rhs_wave.type for lhs_wave, rhs_wave in zip(lhs.waves, rhs.waves)))
 
     def _coerce_tensor(self, state: _Value, layout: _BlockedLayout, info: _TensorInfo) -> _Value:
         if state.layout is not None:
@@ -892,17 +942,25 @@ class _TTIRToWaveLowerer:
 
     def _coordinate_value(self, layout: _BlockedLayout, info: _TensorInfo, axis: int, start: int = 0) -> _Value:
         thread, sym = self._thread_id_and_sym()
+        cta_expr, cta_bindings = self._cta_expr_and_bindings()
         waves = []
         exprs = []
         bindings_by_wave = []
         for register in range(layout.registers):
-            expr = layout.coord_expr(self.dsl, sym, register, axis)
+            expr = layout.coord_expr(self.dsl, sym, cta_expr, register, axis)
             if start:
                 expr = expr + start
-            bindings = {sym: thread}
+            bindings = {sym: thread, **cta_bindings}
             if len(layout.shape) == 1:
-                offset = register * self.width * self.num_warps + start
-                wave = thread if offset == 0 else self.func.addi(thread, self._splat_i32(offset))
+                offset = register * layout.threads_per_cta + start
+                if cta_expr is None:
+                    wave = thread if offset == 0 else self.func.addi(thread, self._splat_i32(offset))
+                else:
+                    flat_expr = layout.index_expr(self.dsl, sym, cta_expr, register)
+                    if start:
+                        flat_expr = flat_expr + start
+                    wave = self.func.index_expr(flat_expr, bindings,
+                                                self.dsl.simd_type(self.dsl.index_type(), self.width))
                 waves.append(wave)
             exprs.append(expr)
             bindings_by_wave.append(bindings)
@@ -931,7 +989,7 @@ class _TTIRToWaveLowerer:
 
     def _can_defer_coordinate_layout(self, info: _TensorInfo) -> bool:
         elements = _product(info.shape)
-        return (self.num_ctas == 1 and elements < self.width * self.num_warps
+        return (elements < self.width * self.num_warps * self.num_ctas
                 and all(_is_power_of_two(dim) for dim in info.shape) and _is_power_of_two(elements))
 
     def _program_id_axis(self, op) -> Optional[int]:
