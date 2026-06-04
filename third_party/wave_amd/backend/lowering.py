@@ -265,7 +265,21 @@ class _TTIRToWaveLowerer:
         if len(info.shape) != 1 or info.shape[0] != end - start:
             raise NotImplementedError("wave_amd tt.make_range shape must match end - start")
 
-        layout = self._layout_for_info(info)
+        try:
+            layout = self._layout_for_info(info)
+        except NotImplementedError:
+            if len(info.shape) == 1 and self._can_defer_coordinate_layout(info):
+                self._set_result(
+                    op,
+                    _Value(
+                        elem_type="i32",
+                        shape=info.shape,
+                        coord_axis=0,
+                        coord_start=start,
+                    ),
+                )
+                return
+            raise
         state = self._coordinate_value(layout, info, axis=0, start=start)
         self._set_result(
             op,
@@ -293,7 +307,21 @@ class _TTIRToWaveLowerer:
         if src.coord_axis is None:
             raise NotImplementedError("wave_amd tt.expand_dims currently supports coordinate tensors")
         coord_axis = src.coord_axis + 1 if axis <= src.coord_axis else src.coord_axis
-        layout = self._layout_for_info(info)
+        try:
+            layout = self._layout_for_info(info)
+        except NotImplementedError:
+            if self._can_defer_coordinate_layout(info):
+                self._set_result(
+                    op,
+                    _Value(
+                        elem_type=src.elem_type or info.elem_type,
+                        shape=info.shape,
+                        coord_axis=coord_axis,
+                        coord_start=src.coord_start,
+                    ),
+                )
+                return
+            raise
         state = self._coordinate_value(layout, _TensorInfo(info.shape, src.elem_type or info.elem_type), coord_axis,
                                        src.coord_start)
         self._set_result(op, state)
@@ -900,6 +928,11 @@ class _TTIRToWaveLowerer:
         if info is None:
             return None
         return _BlockedLayout.for_tensor(info, self.width, self.num_warps, self.num_ctas)
+
+    def _can_defer_coordinate_layout(self, info: _TensorInfo) -> bool:
+        elements = _product(info.shape)
+        return (self.num_ctas == 1 and elements < self.width * self.num_warps
+                and all(_is_power_of_two(dim) for dim in info.shape) and _is_power_of_two(elements))
 
     def _program_id_axis(self, op) -> Optional[int]:
         axis = _wave_amd_native().get_program_id_axis(op)
