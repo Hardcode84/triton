@@ -1313,6 +1313,52 @@ def test_wave_amd_make_hsaco_emits_dot_kernel_elf(tmp_path):
     assert len(hsaco) > 0
 
 
+def test_wave_amd_runtime_launches_dot_matmul_tile(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+
+    from triton.backends import Backend, backends
+
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
+
+    a_matrix = torch.arange(16 * 16, device=device, dtype=torch.float32).reshape(16, 16) / 32.0
+    b_matrix = (torch.arange(16 * 16, device=device, dtype=torch.float32).reshape(16, 16) / 64.0) - 1.0
+    a = a_matrix.to(torch.float16).contiguous()
+    b = b_matrix.to(torch.float16).t().contiguous()
+    c = torch.full((16, 16), -999.0, device=device, dtype=torch.float32)
+
+    module_path = tmp_path / "dot_matmul.ttir"
+    module_path.write_text(DOT_MATMUL_TTIR.replace("@dot_kernel", "@dot_e2e_kernel"))
+    kernel = triton_compiler.compile(
+        str(module_path),
+        target=GPUTarget("wave_amd", target.arch, target.warp_size),
+        options={"num_warps": 1},
+    )
+    kernel[(1, 1, 1)](a, b, c)
+    getattr(torch, device).synchronize()
+
+    expected = a.to(torch.float32) @ b_matrix.to(torch.float16).to(torch.float32)
+    torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
+
+
 def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, device):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",

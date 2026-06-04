@@ -896,8 +896,22 @@ class _TTIRToWaveLowerer:
         if ptr.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot result stores require a splatted pointer base")
         self._expect_dot_pointer_layout(ptr, value.shape, _AffineIndex(0, (16, 1)), "C result row-major 16x16 offsets")
-        self.func.fragment_store(value.fragment, ptr.ptr_base, after=self._load_after_token())
+        self._emit_dot_row_major_fragment_store(ptr.ptr_base, value.fragment)
         self.load_tokens.clear()
+
+    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment) -> None:
+        regs = self.func.fragment_unpack(fragment)
+        thread, sym = self._thread_id_and_sym()
+        lane = self.dsl.mod(sym, 16)
+        row_parity = self.dsl.floor(sym / 16)
+        after = self._load_after_token()
+        value_type = self.dsl.simd_type(self.dsl.i32(), self.width)
+        index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
+        for register in range(8):
+            row_major = (register * 2 + row_parity) * 16 + lane
+            index = self.func.index_expr(row_major, {sym: thread}, index_type)
+            value = self.dsl.wave.ExtractOp(value_type, regs, register).result
+            self.func.store(value, self.func.ptr_add(ptr_base, index), after=after)
 
     def _expect_dot_pointer_layout(self, ptr: _Value, shape: Optional[Tuple[int, ...]], expected: _AffineIndex,
                                    description: str) -> None:
