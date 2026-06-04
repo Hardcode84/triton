@@ -28,6 +28,12 @@ class _AffineIndex:
 
 
 @dataclass(frozen=True)
+class _DotConfig:
+    k: int
+    k_steps: int
+
+
+@dataclass(frozen=True)
 class _BlockedLayout:
     shape: Tuple[int, ...]
     width: int
@@ -97,6 +103,7 @@ class _Value:
     wave: object = None
     waves: Tuple[object, ...] = field(default_factory=tuple)
     fragment: object = None
+    fragments: Tuple[object, ...] = field(default_factory=tuple)
     elem_type: Optional[str] = None
     const: Optional[int] = None
     affine: Optional[_AffineIndex] = None
@@ -689,15 +696,16 @@ class _TTIRToWaveLowerer:
                 raise NotImplementedError("wave_amd tt.dot operand loads do not yet support masks")
             ptr = self._value(op.get_operand(0))
             info = self._result_tensor_info(op)
-            fragment, token = self._emit_dot_fragment_load(ptr, info, role)
-            self.load_tokens.append(token)
+            fragments, tokens = self._emit_dot_fragment_load(ptr, info, role)
+            self.load_tokens.extend(tokens)
             self._set_result(
                 op,
                 _Value(
-                    fragment=fragment,
+                    fragment=fragments[0],
+                    fragments=fragments,
                     elem_type=info.elem_type,
-                    token=token,
-                    tokens=(token, ),
+                    token=tokens[0],
+                    tokens=tokens,
                     shape=info.shape,
                 ),
             )
@@ -823,17 +831,22 @@ class _TTIRToWaveLowerer:
         rhs_info = self._value_tensor_info(op.get_operand(1))
         acc_info = self._value_tensor_info(op.get_operand(2))
         result_info = self._result_tensor_info(op)
-        self._validate_dot_tile(lhs_info, rhs_info, result_info)
+        config = self._dot_config(lhs_info, rhs_info, result_info)
         if acc_info != result_info:
             raise NotImplementedError("wave_amd tt.dot accumulator must match the dot result type")
 
         lhs = self._value(op.get_operand(0))
         rhs = self._value(op.get_operand(1))
         acc = self._value(op.get_operand(2))
-        if lhs.fragment is None or rhs.fragment is None:
+        lhs_fragments = self._dot_fragments(lhs)
+        rhs_fragments = self._dot_fragments(rhs)
+        if not lhs_fragments or not rhs_fragments:
             raise NotImplementedError("wave_amd tt.dot currently requires operands produced by supported tt.load ops")
-        acc_fragment = self._dot_accumulator_fragment(acc, result_info)
-        result = self.func.mma("wmma.f32.16x16x16.f16", lhs.fragment, rhs.fragment, acc_fragment)
+        if len(lhs_fragments) != config.k_steps or len(rhs_fragments) != config.k_steps:
+            raise NotImplementedError("wave_amd tt.dot operand fragment counts must match the K decomposition")
+        result = self._dot_accumulator_fragment(acc, result_info)
+        for lhs_fragment, rhs_fragment in zip(lhs_fragments, rhs_fragments):
+            result = self.func.mma("wmma.f32.16x16x16.f16", lhs_fragment, rhs_fragment, result)
         self._set_result(
             op,
             _Value(
@@ -843,8 +856,8 @@ class _TTIRToWaveLowerer:
             ),
         )
 
-    def _validate_dot_tile(self, lhs: Optional[_TensorInfo], rhs: Optional[_TensorInfo],
-                           result: Optional[_TensorInfo]) -> None:
+    def _dot_config(self, lhs: Optional[_TensorInfo], rhs: Optional[_TensorInfo],
+                    result: Optional[_TensorInfo]) -> _DotConfig:
         if self.num_warps != 1 or self.num_ctas != 1:
             raise NotImplementedError("wave_amd tt.dot currently supports num_warps=1 and num_ctas=1")
         if lhs is None or rhs is None or result is None:
@@ -857,8 +870,18 @@ class _TTIRToWaveLowerer:
         rhs_k, n = rhs.shape
         if rhs_k != k or result.shape != (m, n):
             raise NotImplementedError("wave_amd tt.dot found incompatible matrix shapes")
-        if (m, n, k) != (16, 16, 16):
-            raise NotImplementedError("wave_amd tt.dot currently supports one 16x16x16 WMMA tile")
+        if m != 16 or n != 16:
+            raise NotImplementedError("wave_amd tt.dot currently supports one 16x16 output tile")
+        if k < 16 or k % 16 != 0:
+            raise NotImplementedError("wave_amd tt.dot K dimension must be a positive multiple of 16")
+        return _DotConfig(k=k, k_steps=k // 16)
+
+    def _dot_fragments(self, value: _Value) -> Tuple[object, ...]:
+        if value.fragments:
+            return value.fragments
+        if value.fragment is not None:
+            return (value.fragment, )
+        return ()
 
     def _dot_accumulator_fragment(self, acc: _Value, result_info: _TensorInfo):
         frag_type = self._dot_fragment_type(role=2, elem_type=result_info.elem_type)
@@ -873,24 +896,41 @@ class _TTIRToWaveLowerer:
     def _emit_dot_fragment_load(self, ptr: _Value, info: Optional[_TensorInfo], role: int):
         if info is None:
             raise NotImplementedError("wave_amd tt.dot operand load requires ranked tensor result metadata")
-        if info.elem_type != "f16" or info.shape != (16, 16):
-            raise NotImplementedError("wave_amd tt.dot operand loads currently support tensor<16x16xf16>")
+        if info.elem_type != "f16" or len(info.shape) != 2:
+            raise NotImplementedError("wave_amd tt.dot operand loads currently support rank-2 f16 tensors")
         if ptr.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot operand loads require a splatted pointer base")
         if role == 0:
-            self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (16, 1)),
-                                            "A operand row-major 16x16 offsets")
+            if info.shape[0] != 16:
+                raise NotImplementedError("wave_amd tt.dot A operand loads currently support 16 rows")
+            k = info.shape[1]
+            self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (k, 1)),
+                                            f"A operand row-major 16x{k} offsets")
         elif role == 1:
-            self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (1, 16)),
-                                            "B operand K-contiguous column-major 16x16 offsets")
+            if info.shape[1] != 16:
+                raise NotImplementedError("wave_amd tt.dot B operand loads currently support 16 columns")
+            k = info.shape[0]
+            self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (1, k)),
+                                            f"B operand K-contiguous column-major {k}x16 offsets")
         else:
             raise AssertionError(f"unexpected dot operand role {role}")
+        if k < 16 or k % 16 != 0:
+            raise NotImplementedError("wave_amd tt.dot operand K dimension must be a positive multiple of 16")
 
         thread, sym = self._thread_id_and_sym()
-        lane_row = self.dsl.mod(sym, 16) * 16
-        index = self.func.index_expr(lane_row, {sym: thread}, self.dsl.simd_type(self.dsl.index_type(), self.width))
-        frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
-        return self.func.fragment_load(frag_ptr, self._dot_fragment_type(role=role, elem_type=info.elem_type))
+        lane_base = self.dsl.mod(sym, 16) * k
+        index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
+        fragments = []
+        tokens = []
+        for step in range(k // 16):
+            index_expr = lane_base + step * 16 if step else lane_base
+            index = self.func.index_expr(index_expr, {sym: thread}, index_type)
+            frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
+            fragment, token = self.func.fragment_load(frag_ptr,
+                                                      self._dot_fragment_type(role=role, elem_type=info.elem_type))
+            fragments.append(fragment)
+            tokens.append(token)
+        return tuple(fragments), tuple(tokens)
 
     def _emit_fragment_store(self, ptr: _Value, value: _Value) -> None:
         if ptr.ptr_base is None:
@@ -915,7 +955,7 @@ class _TTIRToWaveLowerer:
 
     def _expect_dot_pointer_layout(self, ptr: _Value, shape: Optional[Tuple[int, ...]], expected: _AffineIndex,
                                    description: str) -> None:
-        if shape != (16, 16):
+        if shape is None:
             raise NotImplementedError(f"wave_amd tt.dot currently supports {description}")
         if ptr.ptr_offset_affine != expected:
             raise NotImplementedError(f"wave_amd tt.dot currently supports only {description}")
