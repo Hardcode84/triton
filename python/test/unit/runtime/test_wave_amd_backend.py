@@ -268,7 +268,18 @@ def test_wave_amd_blocked_layout_chunks_wide_1d_tensor():
     layout = wave_lowering._BlockedLayout.for_tensor(info, width=32, num_warps=1, num_ctas=1)
 
     assert layout.shape == (64, )
+    assert layout.num_warps == 1
     assert layout.registers == 2
+
+
+def test_wave_amd_blocked_layout_uses_warps_before_register_chunks():
+    info = wave_lowering._TensorInfo((64, ), "i32")
+
+    layout = wave_lowering._BlockedLayout.for_tensor(info, width=32, num_warps=2, num_ctas=1)
+
+    assert layout.shape == (64, )
+    assert layout.num_warps == 2
+    assert layout.registers == 1
 
 
 def test_wave_amd_blocked_layout_chunks_2d_tensor():
@@ -335,6 +346,36 @@ def test_wave_amd_make_wave_lowers_wide_add_with_layout_chunks(tmp_path, monkeyp
     assert wave.count("wave.load") == 4
     assert wave.count("wave.fadd") == 2
     assert wave.count("wave.store") == 2
+
+
+def test_wave_amd_make_wave_lowers_wide_add_across_two_warps(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    class FakeNative:
+
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
+
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 2})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MULTI_REGISTER_ADD_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "wide_add_kernel"
+    assert "wave.workitem_id 0" in wave
+    assert "wi" in wave
+    assert wave.count("wave.index_expr") == 1
+    assert wave.count("wave.load") == 2
+    assert wave.count("wave.fadd") == 1
+    assert wave.count("wave.store") == 1
 
 
 def test_wave_amd_make_wave_lowers_2d_offsets_with_broadcasts(tmp_path, monkeypatch):

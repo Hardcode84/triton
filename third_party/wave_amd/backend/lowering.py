@@ -25,28 +25,32 @@ class _TensorInfo:
 class _BlockedLayout:
     shape: Tuple[int, ...]
     width: int
+    num_warps: int
     registers: int
 
     @classmethod
     def for_tensor(cls, info: _TensorInfo, width: int, num_warps: int, num_ctas: int) -> "_BlockedLayout":
-        if num_warps != 1 or num_ctas != 1:
-            raise NotImplementedError("wave_amd general layout lowering currently supports one Wave per CTA")
+        if num_warps < 1 or not _is_power_of_two(num_warps):
+            raise NotImplementedError("wave_amd layout lowering requires power-of-two num_warps")
+        if num_ctas != 1:
+            raise NotImplementedError("wave_amd general layout lowering currently supports one CTA per CGA")
         elements = _product(info.shape)
         if any(not _is_power_of_two(dim) for dim in info.shape):
             raise NotImplementedError("wave_amd layout lowering requires power-of-two tensor dimensions")
         if not _is_power_of_two(elements):
             raise NotImplementedError("wave_amd layout lowering requires power-of-two tensor shapes")
-        if elements < width or elements % width != 0:
-            raise NotImplementedError(
-                f"wave_amd layout lowering requires tensor elements to be a multiple of warp_size, got {elements}")
-        return cls(shape=info.shape, width=width, registers=elements // width)
+        threads = width * num_warps
+        if elements < threads or elements % threads != 0:
+            raise NotImplementedError("wave_amd layout lowering requires tensor elements to be a multiple of "
+                                      f"num_warps * warp_size, got {elements}")
+        return cls(shape=info.shape, width=width, num_warps=num_warps, registers=elements // threads)
 
     def index_expr(self, dsl, lane_sym, register: int):
         if register < 0 or register >= self.registers:
             raise IndexError(register)
         if register == 0:
             return lane_sym
-        return lane_sym + register * self.width
+        return lane_sym + register * self.width * self.num_warps
 
     def coord_expr(self, dsl, lane_sym, register: int, axis: int):
         if axis < 0 or axis >= len(self.shape):
@@ -117,6 +121,7 @@ class _TTIRToWaveLowerer:
         self.load_tokens = []
         self.symbols: Dict[str, object] = {}
         self._lane_value = None
+        self._workitem_value = None
 
     def lower(self) -> Tuple[str, str]:
         name = self.module.get_entry_func_name()
@@ -806,6 +811,13 @@ class _TTIRToWaveLowerer:
             self._lane_value = self.func.lane_id(self.dsl.i32(), self.width)
         return self._lane_value
 
+    def _thread_id_and_sym(self):
+        if self.num_warps == 1:
+            return self._lane_id(), self._sym("lid")
+        if self._workitem_value is None:
+            self._workitem_value = self.func.workitem_id(axis=0, element_type=self.dsl.i32(), width=self.width)
+        return self._workitem_value, self._sym("wi")
+
     def _splat_i32(self, value: int):
         scalar = self.func.constant(self.dsl.i32(), value)
         return self.func.splat(scalar, self.dsl.i32(), self.width)
@@ -851,8 +863,7 @@ class _TTIRToWaveLowerer:
         )
 
     def _coordinate_value(self, layout: _BlockedLayout, info: _TensorInfo, axis: int, start: int = 0) -> _Value:
-        lane = self._lane_id()
-        sym = self._sym("lid")
+        thread, sym = self._thread_id_and_sym()
         waves = []
         exprs = []
         bindings_by_wave = []
@@ -860,10 +871,10 @@ class _TTIRToWaveLowerer:
             expr = layout.coord_expr(self.dsl, sym, register, axis)
             if start:
                 expr = expr + start
-            bindings = {sym: lane}
+            bindings = {sym: thread}
             if len(layout.shape) == 1:
-                offset = register * self.width + start
-                wave = lane if offset == 0 else self.func.addi(lane, self._splat_i32(offset))
+                offset = register * self.width * self.num_warps + start
+                wave = thread if offset == 0 else self.func.addi(thread, self._splat_i32(offset))
                 waves.append(wave)
             exprs.append(expr)
             bindings_by_wave.append(bindings)
