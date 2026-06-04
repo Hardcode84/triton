@@ -31,9 +31,9 @@ class _BlockedLayout:
     def for_tensor(cls, info: _TensorInfo, width: int, num_warps: int, num_ctas: int) -> "_BlockedLayout":
         if num_warps != 1 or num_ctas != 1:
             raise NotImplementedError("wave_amd general layout lowering currently supports one Wave per CTA")
-        if len(info.shape) != 1:
-            raise NotImplementedError("wave_amd layout lowering currently supports 1D TTIR tensors")
         elements = _product(info.shape)
+        if any(not _is_power_of_two(dim) for dim in info.shape):
+            raise NotImplementedError("wave_amd layout lowering requires power-of-two tensor dimensions")
         if not _is_power_of_two(elements):
             raise NotImplementedError("wave_amd layout lowering requires power-of-two tensor shapes")
         if elements < width or elements % width != 0:
@@ -47,6 +47,18 @@ class _BlockedLayout:
         if register == 0:
             return lane_sym
         return lane_sym + register * self.width
+
+    def coord_expr(self, dsl, lane_sym, register: int, axis: int):
+        if axis < 0 or axis >= len(self.shape):
+            raise IndexError(axis)
+        flat = self.index_expr(dsl, lane_sym, register)
+        stride = _product(self.shape[axis + 1:])
+        if stride != 1:
+            flat = dsl.floor(flat / stride)
+        dim = self.shape[axis]
+        if dim == 1:
+            return dsl.sym_ctx.int_(0)
+        return dsl.mod(flat, dim)
 
 
 @dataclass
@@ -73,6 +85,8 @@ class _Value:
     splat_const: Optional[Tuple[object, str, Optional[int]]] = None
     layout: Optional[_BlockedLayout] = None
     shape: Optional[Tuple[int, ...]] = None
+    coord_axis: Optional[int] = None
+    coord_start: int = 0
 
 
 def lower_ttir_to_wave_mlir(src, options) -> Tuple[str, str]:
@@ -189,6 +203,10 @@ class _TTIRToWaveLowerer:
             self._lower_program_id(op)
         elif name == "tt.make_range":
             self._lower_make_range(op)
+        elif name == "tt.expand_dims":
+            self._lower_expand_dims(op)
+        elif name == "tt.broadcast":
+            self._lower_broadcast(op)
         elif name == "tt.splat":
             self._lower_splat(op)
         elif name == "tt.addptr":
@@ -243,34 +261,50 @@ class _TTIRToWaveLowerer:
             raise NotImplementedError("wave_amd tt.make_range shape must match end - start")
 
         layout = self._layout_for_info(info)
-        lane = self._lane_id()
-        sym = self._sym("lid")
-        waves = []
-        exprs = []
-        bindings = []
-        for register in range(layout.registers):
-            offset = register * self.width + start
-            wave = lane if offset == 0 else self.func.addi(lane, self._splat_i32(offset))
-            expr = layout.index_expr(self.dsl, sym, register)
-            if start:
-                expr = expr + start
-            waves.append(wave)
-            exprs.append(expr)
-            bindings.append({sym: lane})
+        state = self._coordinate_value(layout, info, axis=0, start=start)
         self._set_result(
             op,
             _Value(
-                wave=waves[0],
-                waves=tuple(waves),
+                wave=state.wave,
+                waves=state.waves,
                 elem_type="i32",
-                expr=exprs[0],
-                exprs=tuple(exprs),
-                bindings=bindings[0],
-                bindings_by_wave=tuple(bindings),
+                expr=state.expr,
+                exprs=state.exprs,
+                bindings=state.bindings,
+                bindings_by_wave=state.bindings_by_wave,
                 layout=layout,
                 shape=info.shape,
+                coord_axis=0,
+                coord_start=start,
             ),
         )
+
+    def _lower_expand_dims(self, op) -> None:
+        src = self._value(op.get_operand(0))
+        axis = op.get_int_attr("axis")
+        info = self._result_tensor_info(op)
+        if info is None:
+            raise NotImplementedError("wave_amd tt.expand_dims requires tensor result type metadata")
+        if src.coord_axis is None:
+            raise NotImplementedError("wave_amd tt.expand_dims currently supports coordinate tensors")
+        coord_axis = src.coord_axis + 1 if axis <= src.coord_axis else src.coord_axis
+        layout = self._layout_for_info(info)
+        state = self._coordinate_value(layout, _TensorInfo(info.shape, src.elem_type or info.elem_type), coord_axis,
+                                       src.coord_start)
+        self._set_result(op, state)
+
+    def _lower_broadcast(self, op) -> None:
+        src = self._value(op.get_operand(0))
+        info = self._result_tensor_info(op)
+        if info is None:
+            raise NotImplementedError("wave_amd tt.broadcast requires tensor result type metadata")
+        layout = self._layout_for_info(info)
+        if src.coord_axis is not None:
+            state = self._coordinate_value(layout, _TensorInfo(info.shape, src.elem_type or info.elem_type),
+                                           src.coord_axis, src.coord_start)
+        else:
+            state = self._coerce_tensor(src, layout, info)
+        self._set_result(op, state)
 
     def _lower_splat(self, op) -> None:
         src = self._value(op.get_operand(0))
@@ -335,7 +369,9 @@ class _TTIRToWaveLowerer:
             layout = self._layout_for_info(info)
             lhs = self._coerce_tensor(lhs, layout, info)
             rhs = self._coerce_tensor(rhs, layout, info)
-            waves = tuple(wave_builder(lhs_wave, rhs_wave) for lhs_wave, rhs_wave in zip(lhs.waves, rhs.waves))
+            waves = ()
+            if lhs.waves and rhs.waves:
+                waves = tuple(wave_builder(lhs_wave, rhs_wave) for lhs_wave, rhs_wave in zip(lhs.waves, rhs.waves))
             exprs = []
             bindings_by_wave = []
             if expr_builder is not None:
@@ -354,7 +390,7 @@ class _TTIRToWaveLowerer:
             self._set_result(
                 op,
                 _Value(
-                    wave=waves[0],
+                    wave=waves[0] if waves else None,
                     waves=waves,
                     elem_type=lhs.elem_type or rhs.elem_type,
                     expr=exprs[0],
@@ -400,9 +436,12 @@ class _TTIRToWaveLowerer:
             waves = []
             exprs = []
             bindings_by_wave = []
-            for index, (lhs_wave, rhs_wave) in enumerate(zip(lhs.waves, rhs.waves)):
-                neg_rhs = self.func.muli(rhs_wave, self._negative_one_like(rhs, index))
-                waves.append(self.func.addi(lhs_wave, neg_rhs))
+            for index in range(layout.registers):
+                if lhs.waves and rhs.waves:
+                    lhs_wave = lhs.waves[index]
+                    rhs_wave = rhs.waves[index]
+                    neg_rhs = self.func.muli(rhs_wave, self._negative_one_like(rhs, index))
+                    waves.append(self.func.addi(lhs_wave, neg_rhs))
                 lhs_expr, lhs_bindings = self._expr_and_bindings(lhs, index)
                 rhs_expr, rhs_bindings = self._expr_and_bindings(rhs, index)
                 if lhs_expr is not None and rhs_expr is not None:
@@ -414,7 +453,7 @@ class _TTIRToWaveLowerer:
             self._set_result(
                 op,
                 _Value(
-                    wave=waves[0],
+                    wave=waves[0] if waves else None,
                     waves=tuple(waves),
                     elem_type=lhs.elem_type or rhs.elem_type,
                     expr=exprs[0],
@@ -809,6 +848,37 @@ class _TTIRToWaveLowerer:
             splat_const=state.splat_const,
             layout=layout,
             shape=info.shape,
+        )
+
+    def _coordinate_value(self, layout: _BlockedLayout, info: _TensorInfo, axis: int, start: int = 0) -> _Value:
+        lane = self._lane_id()
+        sym = self._sym("lid")
+        waves = []
+        exprs = []
+        bindings_by_wave = []
+        for register in range(layout.registers):
+            expr = layout.coord_expr(self.dsl, sym, register, axis)
+            if start:
+                expr = expr + start
+            bindings = {sym: lane}
+            if len(layout.shape) == 1:
+                offset = register * self.width + start
+                wave = lane if offset == 0 else self.func.addi(lane, self._splat_i32(offset))
+                waves.append(wave)
+            exprs.append(expr)
+            bindings_by_wave.append(bindings)
+        return _Value(
+            wave=waves[0] if waves else None,
+            waves=tuple(waves),
+            elem_type=info.elem_type,
+            expr=exprs[0],
+            exprs=tuple(exprs),
+            bindings=bindings_by_wave[0],
+            bindings_by_wave=tuple(bindings_by_wave),
+            layout=layout,
+            shape=info.shape,
+            coord_axis=axis,
+            coord_start=start,
         )
 
     def _result_tensor_info(self, op) -> Optional[_TensorInfo]:

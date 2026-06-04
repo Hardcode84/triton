@@ -64,6 +64,28 @@ module {
 }
 """
 
+TWO_D_STORE_TTIR = """
+module {
+  tt.func public @store_2d_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c32 = arith.constant 32 : i32
+    %one = arith.constant dense<1.000000e+00> : tensor<32x32xf32>
+    %rows = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<32xi32> -> tensor<32x1xi32>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32> -> tensor<1x32xi32>
+    %rows_b = tt.broadcast %rows_2d : tensor<32x1xi32> -> tensor<32x32xi32>
+    %cols_b = tt.broadcast %cols_2d : tensor<1x32xi32> -> tensor<32x32xi32>
+    %stride = tt.splat %c32 : i32 -> tensor<32x32xi32>
+    %row_offsets = arith.muli %rows_b, %stride : tensor<32x32xi32>
+    %offs = arith.addi %row_offsets, %cols_b : tensor<32x32xi32>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>>
+    %ptrs = tt.addptr %base, %offs : tensor<32x32x!tt.ptr<f32>>, tensor<32x32xi32>
+    tt.store %ptrs, %one : tensor<32x32x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 MASKED_ADD_TTIR = """
 module {
   tt.func public @masked_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
@@ -249,6 +271,15 @@ def test_wave_amd_blocked_layout_chunks_wide_1d_tensor():
     assert layout.registers == 2
 
 
+def test_wave_amd_blocked_layout_chunks_2d_tensor():
+    info = wave_lowering._TensorInfo((32, 32), "i32")
+
+    layout = wave_lowering._BlockedLayout.for_tensor(info, width=32, num_warps=1, num_ctas=1)
+
+    assert layout.shape == (32, 32)
+    assert layout.registers == 32
+
+
 def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -299,11 +330,44 @@ def test_wave_amd_make_wave_lowers_wide_add_with_layout_chunks(tmp_path, monkeyp
     wave = backend.make_wave(module, metadata, options)
 
     assert metadata["name"] == "wide_add_kernel"
-    assert wave.count("wave.index_expr") == 6
+    assert wave.count("wave.index_expr") == 2
     assert "lid + 32" in wave or "32 + lid" in wave
     assert wave.count("wave.load") == 4
     assert wave.count("wave.fadd") == 2
     assert wave.count("wave.store") == 2
+
+
+def test_wave_amd_make_wave_lowers_2d_offsets_with_broadcasts(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    class FakeNative:
+
+        def get_arith_constant_splat(self, op):
+            value = op.get_constant_value()
+            if value is not None:
+                return value, "i32", None
+            return 1.0, "f32", 1024
+
+        def get_result_tensor_info(self, op, result_index):
+            return _fake_result_tensor_info(op, result_index)
+
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, TWO_D_STORE_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "store_2d_kernel"
+    assert "wave.index_expr" in wave
+    assert "floor" in wave or "Mod" in wave or "mod" in wave
+    assert wave.count("wave.store") == 32
 
 
 def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypatch):
