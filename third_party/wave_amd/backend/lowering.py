@@ -15,6 +15,10 @@ class _Value:
     token: object = None
     ptr_base: object = None
     mask_id: Optional[int] = None
+    mask_wave: object = None
+    other_wave: object = None
+    other_splat_const: Optional[Tuple[object, str, Optional[int]]] = None
+    splat_const: Optional[Tuple[object, str, Optional[int]]] = None
 
 
 def lower_ttir_to_wave_mlir(src, options) -> Tuple[str, str]:
@@ -132,11 +136,21 @@ class _TTIRToWaveLowerer:
             raise NotImplementedError(f"wave_amd M1 TTIR lowering does not support op: {name}")
 
     def _lower_constant(self, op) -> None:
-        value = op.get_constant_value()
-        state = _Value(const=value if isinstance(value, int) else None)
-        if state.const is not None:
-            state.wave = self.func.constant(self.dsl.i32(), state.const)
-            state.elem_type = "i32"
+        constant = self._arith_constant_splat(op)
+        state = _Value()
+        if constant is not None:
+            value, elem_type, width = constant
+            scalar = self.func.constant(self._scalar_type(elem_type), value)
+            state.elem_type = elem_type
+            state.const = value if isinstance(value, int) and width is None else None
+            state.splat_const = (value, elem_type, width)
+            if width is None:
+                state.wave = scalar
+            else:
+                if width != self.width:
+                    raise NotImplementedError(
+                        f"wave_amd M1 only supports splat constants with width {self.width}, got {width}")
+                state.wave = self.func.splat(scalar, self._scalar_type(elem_type), width)
         self._set_result(op, state)
 
     def _lower_program_id(self, op) -> None:
@@ -172,12 +186,16 @@ class _TTIRToWaveLowerer:
         if src.ptr_base is not None:
             state = _Value(wave=src.ptr_base, elem_type=src.elem_type, ptr_base=src.ptr_base, mask_id=src.mask_id)
         else:
+            splat_const = None
+            if src.splat_const is not None and src.splat_const[2] is None:
+                splat_const = (src.splat_const[0], src.splat_const[1], self.width)
             state = _Value(
                 wave=self.func.splat(src.wave, self._scalar_type(src.elem_type), self.width),
                 elem_type=src.elem_type,
                 expr=src.expr,
                 bindings=dict(src.bindings),
                 mask_id=src.mask_id,
+                splat_const=splat_const,
             )
         self._set_result(op, state)
 
@@ -229,19 +247,36 @@ class _TTIRToWaveLowerer:
     def _lower_load(self, op) -> None:
         mask = self._memory_mask(op)
         if mask is not None:
-            if op.get_num_operands() != 2:
-                raise NotImplementedError("wave_amd masked tt.load does not support `other` values yet")
+            if op.get_num_operands() not in {2, 3}:
+                raise NotImplementedError("wave_amd masked tt.load supports pointer, mask, and optional other only")
             ptr = self._value(op.get_operand(0))
             mask_value = self._value(mask)
             if mask_value.wave is None:
                 raise NotImplementedError("wave_amd masked load requires a Wave mask value")
             result_type = self._load_result_type(ptr)
+            other = None
+            if op.get_num_operands() == 3:
+                other = self._load_other_value(self._value(op.get_operand(2)), ptr.elem_type)
             with self.func.where(mask_value.wave, [result_type, self.dsl.mem_token_type()]) as where_op:
                 value, token = self._emit_load(ptr, result_type)
                 self.func.yield_([value, token])
             value, token = where_op.results
-            self.load_tokens.append(token)
-            self._set_result(op, _Value(wave=value, elem_type=ptr.elem_type, token=token, mask_id=mask.id()))
+            if other is not None:
+                self._set_result(
+                    op,
+                    _Value(
+                        wave=value,
+                        elem_type=ptr.elem_type,
+                        token=token,
+                        mask_id=mask.id(),
+                        mask_wave=mask_value.wave,
+                        other_wave=other.wave,
+                        other_splat_const=other.splat_const,
+                    ),
+                )
+            else:
+                self.load_tokens.append(token)
+                self._set_result(op, _Value(wave=value, elem_type=ptr.elem_type, token=token, mask_id=mask.id()))
             return
 
         ptr = self._value(op.get_operand(0))
@@ -253,6 +288,9 @@ class _TTIRToWaveLowerer:
         ptr = self._value(op.get_operand(0))
         value = self._value(op.get_operand(1))
         mask = self._memory_mask(op)
+        if mask is None and value.other_wave is not None and value.mask_wave is not None:
+            self._emit_unmasked_store_of_masked_load_other(ptr, value)
+            return
         if mask is not None:
             if op.get_num_operands() != 3:
                 raise NotImplementedError("wave_amd masked tt.store supports pointer, value, and mask operands only")
@@ -287,6 +325,37 @@ class _TTIRToWaveLowerer:
         self.func.store(value.wave, ptr.wave, after=after)
         self.load_tokens.clear()
 
+    def _emit_unmasked_store_of_masked_load_other(self, ptr: _Value, value: _Value) -> None:
+        with self.func.where(value.mask_wave, [self.dsl.mem_token_type()]) as where_op:
+            token = self.func.store(value.wave, ptr.wave, after=value.token)
+            self.func.yield_([token])
+        block = where_op.elseRegion.blocks.append()
+        with self.dsl.InsertionPoint(block):
+            other = value.other_wave
+            if value.other_splat_const is not None:
+                other = self._materialize_splat_constant(value.other_splat_const)
+            token = self.func.store(other, ptr.wave)
+            self.dsl.wave.YieldOp([token])
+        self.load_tokens.clear()
+
+    def _load_other_value(self, other: _Value, elem_type: str) -> _Value:
+        if other.wave is None:
+            raise NotImplementedError("wave_amd masked tt.load `other` requires a Wave value")
+        if str(other.wave.type).startswith("!wave.simd<"):
+            return other
+        splat = self.func.splat(other.wave, self._scalar_type(other.elem_type or elem_type), self.width)
+        splat_const = None
+        if other.splat_const is not None and other.splat_const[2] is None:
+            splat_const = (other.splat_const[0], other.splat_const[1], self.width)
+        return _Value(wave=splat, elem_type=other.elem_type or elem_type, splat_const=splat_const)
+
+    def _materialize_splat_constant(self, constant: Tuple[object, str, Optional[int]]):
+        value, elem_type, width = constant
+        scalar = self.func.constant(self._scalar_type(elem_type), value)
+        if width is None:
+            return scalar
+        return self.func.splat(scalar, self._scalar_type(elem_type), width)
+
     def _memory_mask(self, op):
         name = op.get_name()
         if name == "tt.load" and op.get_num_operands() >= 2:
@@ -301,8 +370,7 @@ class _TTIRToWaveLowerer:
         expr, bindings = self._expr_and_bindings(state)
         if expr is None:
             raise NotImplementedError("wave_amd M1 requires symbolic tt.addptr offsets")
-        state.index = self.func.index_expr(expr, bindings, self.dsl.simd_type(self.dsl.index_type(), self.width))
-        return state.index
+        return self.func.index_expr(expr, bindings, self.dsl.simd_type(self.dsl.index_type(), self.width))
 
     def _expr_and_bindings(self, state: _Value):
         if state.expr is not None:
@@ -321,6 +389,13 @@ class _TTIRToWaveLowerer:
     def _cmpi_predicate(self, op) -> Optional[str]:
         predicate = _wave_amd_native().get_cmpi_predicate(op)
         return None if predicate is None else str(predicate)
+
+    def _arith_constant_splat(self, op):
+        constant = _wave_amd_native().get_arith_constant_splat(op)
+        if constant is None:
+            return None
+        value, elem_type, width = constant
+        return value, str(elem_type), None if width is None else int(width)
 
     def _sym(self, name: str):
         if name not in self.symbols:
@@ -405,7 +480,8 @@ def _wave_amd_native():
             "wave_amd M1 lowering requires the Triton wave_amd native extension. "
             "Rebuild Triton with the wave_amd backend so TTIR operation attributes can be read structurally.") from exc
 
-    missing = [name for name in ("get_program_id_axis", "get_cmpi_predicate") if not hasattr(wave_amd, name)]
+    required = ("get_program_id_axis", "get_cmpi_predicate", "get_arith_constant_splat")
+    missing = [name for name in required if not hasattr(wave_amd, name)]
     if missing:
         raise RuntimeError("wave_amd M1 lowering requires the Triton wave_amd native extension to expose "
                            f"{', '.join(missing)}. Rebuild Triton with the updated wave_amd backend.")

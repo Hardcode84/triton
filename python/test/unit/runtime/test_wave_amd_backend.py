@@ -72,6 +72,31 @@ module {
 }
 """
 
+MASKED_LOAD_OTHER_TTIR = """
+module {
+  tt.func public @masked_load_other_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                          %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                          %arg2: i32) attributes {noinline = false} {
+    %c32 = arith.constant 32 : i32
+    %other = arith.constant dense<5.000000e+00> : tensor<32xf32>
+    %pid = tt.get_program_id x : i32
+    %block = arith.muli %pid, %c32 : i32
+    %block_vec = tt.splat %block : i32 -> tensor<32xi32>
+    %lane = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %offs = arith.addi %block_vec, %lane : tensor<32xi32>
+    %n_vec = tt.splat %arg2 : i32 -> tensor<32xi32>
+    %mask = arith.cmpi ult, %offs, %n_vec : tensor<32xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %c_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %a_ptr = tt.addptr %a_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %c_ptr = tt.addptr %c_base, %offs : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %a = tt.load %a_ptr, %mask, %other : tensor<32x!tt.ptr<f32>>
+    tt.store %c_ptr, %a : tensor<32x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 
 def _parse_ttir(tmp_path, backend, ttir):
     context = ir.context()
@@ -145,6 +170,12 @@ def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypat
             assert op.get_name() == "arith.cmpi"
             return "ult"
 
+        def get_arith_constant_splat(self, op):
+            value = op.get_constant_value()
+            if value is None:
+                return None
+            return value, "i32", None
+
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
 
     target = GPUTarget("wave_amd", "gfx1100", 32)
@@ -165,6 +196,46 @@ def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypat
     assert "wave.store" in wave
     assert "pid_0" in wave
     assert "lid" in wave
+
+
+def test_wave_amd_make_wave_lowers_masked_load_other(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    class FakeNative:
+
+        def get_program_id_axis(self, op):
+            assert op.get_name() == "tt.get_program_id"
+            return 0
+
+        def get_cmpi_predicate(self, op):
+            assert op.get_name() == "arith.cmpi"
+            return "ult"
+
+        def get_arith_constant_splat(self, op):
+            value = op.get_constant_value()
+            if value is not None:
+                return value, "i32", None
+            return 5.0, "f32", 32
+
+    monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: FakeNative())
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_LOAD_OTHER_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "masked_load_other_kernel"
+    assert wave.count("wave.where") == 2
+    assert "otherwise" in wave
+    assert "5.000000e+00" in wave
+    assert wave.count("wave.load") == 1
+    assert "wave.store" in wave
 
 
 def test_wave_amd_make_amdgcn_emits_masked_kernel_with_packaged_wave_translate(tmp_path):
@@ -193,6 +264,33 @@ def test_wave_amd_make_amdgcn_emits_masked_kernel_with_packaged_wave_translate(t
     assert "global_store_b32" in amdgcn
 
 
+def test_wave_amd_make_amdgcn_emits_masked_load_other_with_packaged_wave_translate(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_LOAD_OTHER_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+
+    assert metadata["name"] == "masked_load_other_kernel"
+    assert '.amdgcn_target "amdgcn-amd-amdhsa--gfx1100"' in amdgcn
+    assert "masked_load_other_kernel:" in amdgcn
+    assert "global_load_b32" in amdgcn
+    assert "global_store_b32" in amdgcn
+    assert amdgcn.count("global_store_b32") >= 2
+
+
 def test_wave_amd_make_hsaco_emits_masked_kernel_elf(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -215,6 +313,33 @@ def test_wave_amd_make_hsaco_emits_masked_kernel_elf(tmp_path):
     hsaco = backend.make_hsaco(amdgcn, metadata, options)
 
     assert metadata["name"] == "masked_add_kernel"
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert len(hsaco) > 0
+
+
+def test_wave_amd_make_hsaco_emits_masked_load_other_kernel_elf(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, MASKED_LOAD_OTHER_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+    hsaco = backend.make_hsaco(amdgcn, metadata, options)
+
+    assert metadata["name"] == "masked_load_other_kernel"
     assert isinstance(hsaco, bytes)
     assert hsaco.startswith(b"\x7fELF")
     assert len(hsaco) > 0
@@ -285,6 +410,10 @@ def test_wave_amd_lowering_reads_structural_attrs_through_native_helpers(monkeyp
             self.calls.append(("cmpi", op))
             return "ult"
 
+        def get_arith_constant_splat(self, op):
+            self.calls.append(("constant", op))
+            return 7, "i32", None
+
     fake_native = FakeNative()
     monkeypatch.setattr(wave_lowering, "_wave_amd_native", lambda: fake_native)
     lowerer = wave_lowering._TTIRToWaveLowerer.__new__(wave_lowering._TTIRToWaveLowerer)
@@ -293,7 +422,8 @@ def test_wave_amd_lowering_reads_structural_attrs_through_native_helpers(monkeyp
 
     assert lowerer._program_id_axis(program_id_op) == 1
     assert lowerer._cmpi_predicate(cmpi_op) == "ult"
-    assert fake_native.calls == [("program_id", program_id_op), ("cmpi", cmpi_op)]
+    assert lowerer._arith_constant_splat(cmpi_op) == (7, "i32", None)
+    assert fake_native.calls == [("program_id", program_id_op), ("cmpi", cmpi_op), ("constant", cmpi_op)]
 
 
 def test_wave_amd_make_amdgcn_uses_packaged_wave_translate(tmp_path, monkeypatch):
