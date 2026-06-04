@@ -148,6 +148,39 @@ module {
 }
 """
 
+DOT_MATMUL_TTIR = """
+module {
+  tt.func public @dot_kernel(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+                            %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+                            %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c16 = arith.constant 16 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %cols = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %rows_b = tt.broadcast %rows_2d : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cols_b = tt.broadcast %cols_2d : tensor<1x16xi32> -> tensor<16x16xi32>
+    %stride = tt.splat %c16 : i32 -> tensor<16x16xi32>
+    %row_offsets = arith.muli %rows_b, %stride : tensor<16x16xi32>
+    %a_offsets = arith.addi %row_offsets, %cols_b : tensor<16x16xi32>
+    %b_col_offsets = arith.muli %cols_b, %stride : tensor<16x16xi32>
+    %b_offsets = arith.addi %b_col_offsets, %rows_b : tensor<16x16xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
+    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %c_ptrs = tt.addptr %c_base, %a_offsets : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
+    %a = tt.load %a_ptrs : tensor<16x16x!tt.ptr<f16>>
+    %b = tt.load %b_ptrs : tensor<16x16x!tt.ptr<f16>>
+    %acc = tt.dot %a, %b, %zero : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+    tt.store %c_ptrs, %acc : tensor<16x16x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 MASKED_ADD_TTIR = """
 module {
   tt.func public @masked_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
@@ -384,6 +417,18 @@ def test_wave_amd_blocked_layout_chunks_2d_two_ctas():
     assert layout.num_ctas == 2
     assert layout.elements_per_cta == 1024
     assert layout.registers == 32
+
+
+def test_wave_amd_affine_index_tracks_dot_pointer_layouts():
+    rows = wave_lowering._affine_coord(rank=2, axis=0)
+    cols = wave_lowering._affine_coord(rank=2, axis=1)
+    stride = wave_lowering._AffineIndex(16, (0, 0))
+
+    row_major = wave_lowering._affine_add(wave_lowering._affine_mul(rows, stride), cols)
+    col_major = wave_lowering._affine_add(wave_lowering._affine_mul(cols, stride), rows)
+
+    assert row_major == wave_lowering._AffineIndex(0, (16, 1))
+    assert col_major == wave_lowering._AffineIndex(0, (1, 16))
 
 
 def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
@@ -642,6 +687,30 @@ def test_wave_amd_make_wave_lowers_2d_offsets_across_two_ctas(tmp_path, monkeypa
     assert "Mod" in wave or "mod" in wave
     assert "floor" in wave or "Floor" in wave
     assert wave.count("wave.store") == 32
+
+
+def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "dot_kernel"
+    assert "func.func @dot_kernel" in wave
+    assert "wave.lds_size" not in wave
+    assert "wave.index_expr" in wave
+    assert "waveamd.fragment_pack" in wave
+    assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
 
 
 def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypatch):
@@ -1002,6 +1071,32 @@ def test_wave_amd_make_amdgcn_emits_multi_cta_program_id_with_packaged_wave_tran
     assert "global_store_b32" in amdgcn
 
 
+def test_wave_amd_make_amdgcn_emits_dot_with_packaged_wave_translate(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+
+    assert metadata["name"] == "dot_kernel"
+    assert '.amdgcn_target "amdgcn-amd-amdhsa--gfx1100"' in amdgcn
+    assert "dot_kernel:" in amdgcn
+    assert "global_load" in amdgcn
+    assert "global_store" in amdgcn
+
+
 def test_wave_amd_make_hsaco_emits_masked_kernel_elf(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -1186,6 +1281,33 @@ def test_wave_amd_make_hsaco_emits_multi_cta_program_id_kernel_elf(tmp_path):
     hsaco = backend.make_hsaco(amdgcn, metadata, options)
 
     assert metadata["name"] == "store_multi_cta_pid_kernel"
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert len(hsaco) > 0
+
+
+def test_wave_amd_make_hsaco_emits_dot_kernel_elf(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+    hsaco = backend.make_hsaco(amdgcn, metadata, options)
+
+    assert metadata["name"] == "dot_kernel"
     assert isinstance(hsaco, bytes)
     assert hsaco.startswith(b"\x7fELF")
     assert len(hsaco) > 0
