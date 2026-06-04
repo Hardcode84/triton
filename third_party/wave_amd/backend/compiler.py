@@ -2,13 +2,14 @@ import functools
 import hashlib
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Tuple
 
 from triton import knobs
 from triton._C.libtriton import ir, passes
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn
+from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn, _packaged_wave_translate
 from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
 
 
@@ -24,6 +25,25 @@ def _warp_size_for_arch(arch: str) -> int:
 
 def _min_dot_size(target: GPUTarget):
     return lambda lhs_type, rhs_type: (1, 1, 1)
+
+
+def _wave_backend_artifact_paths() -> Tuple[Path, ...]:
+    backend_dir = Path(__file__).resolve().parent
+    return (
+        _packaged_wave_translate(),
+        backend_dir / "share" / "wave-mlir" / "pipelines" / "pipelines.mlir",
+    )
+
+
+def _wave_backend_artifact_hash() -> str:
+    digest = hashlib.sha256()
+    for path in _wave_backend_artifact_paths():
+        digest.update(str(path.name).encode("utf-8"))
+        if path.is_file():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(f"missing:{path}".encode("utf-8"))
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -97,7 +117,7 @@ class WaveAMDBackend(BaseBackend):
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
-        # M1 builds Wave MLIR through the Wave Python bindings.
+        # Wave MLIR is built through the Wave Python bindings.
         return
 
     @staticmethod
@@ -137,7 +157,7 @@ class WaveAMDBackend(BaseBackend):
 
     def add_stages(self, stages, options, language):
         if language != Language.TRITON:
-            raise NotImplementedError("wave_amd M3 only supports Triton TTIR input")
+            raise NotImplementedError("wave_amd only supports Triton TTIR input")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
@@ -147,4 +167,4 @@ class WaveAMDBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}-wave_amd-m3"
+        return f"{self.target}-wave_amd-{_wave_backend_artifact_hash()}"

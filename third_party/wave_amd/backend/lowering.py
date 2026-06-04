@@ -50,7 +50,7 @@ class _TTIRToWaveLowerer:
     def lower(self) -> Tuple[str, str]:
         name = self.module.get_entry_func_name()
         if not name:
-            raise NotImplementedError("wave_amd M1 expects a kernel tt.func entry point")
+            raise NotImplementedError("wave_amd expects a kernel tt.func entry point")
 
         ops = self._collect_entry_ops(name)
         func_op = self.module.get_function(name)
@@ -133,7 +133,7 @@ class _TTIRToWaveLowerer:
         elif name == "tt.store":
             self._lower_store(op)
         else:
-            raise NotImplementedError(f"wave_amd M1 TTIR lowering does not support op: {name}")
+            raise NotImplementedError(f"wave_amd TTIR lowering does not support op: {name}")
 
     def _lower_constant(self, op) -> None:
         constant = self._arith_constant_splat(op)
@@ -149,7 +149,7 @@ class _TTIRToWaveLowerer:
             else:
                 if width != self.width:
                     raise NotImplementedError(
-                        f"wave_amd M1 only supports splat constants with width {self.width}, got {width}")
+                        f"wave_amd only supports splat constants with width {self.width}, got {width}")
                 state.wave = self.func.splat(scalar, self._scalar_type(elem_type), width)
         self._set_result(op, state)
 
@@ -157,7 +157,7 @@ class _TTIRToWaveLowerer:
         axis = self._program_id_axis(op)
         if axis is None:
             raise NotImplementedError(
-                "wave_amd M1 cannot lower tt.get_program_id until ProgramDimAttr is exposed structurally")
+                "wave_amd cannot lower tt.get_program_id until ProgramDimAttr is exposed structurally")
         pid = self.func.workgroup_id(axis)
         sym = self._sym(f"pid_{axis}")
         self._set_result(op, _Value(wave=pid, elem_type="i32", expr=sym, bindings={sym: pid}))
@@ -167,7 +167,7 @@ class _TTIRToWaveLowerer:
         end = op.get_int_attr("end")
         if start != 0 or end != self.width:
             raise NotImplementedError(
-                f"wave_amd M1 only supports tt.make_range {{start = 0, end = warp_size}}, got {start}:{end}")
+                f"wave_amd only supports tt.make_range {{start = 0, end = warp_size}}, got {start}:{end}")
 
         lane = self.func.lane_id(self.dsl.i32(), self.width)
         sym = self._sym("lid")
@@ -229,7 +229,7 @@ class _TTIRToWaveLowerer:
         predicate = self._cmpi_predicate(op)
         if predicate is None:
             raise NotImplementedError(
-                "wave_amd M1 cannot lower arith.cmpi until the predicate attribute is exposed structurally")
+                "wave_amd cannot lower arith.cmpi until the predicate attribute is exposed structurally")
         self._set_result(op, _Value(wave=self.func.cmpi(predicate, lhs.wave, rhs.wave), elem_type="i1"))
 
     def _lower_addptr(self, op) -> None:
@@ -369,7 +369,7 @@ class _TTIRToWaveLowerer:
             return state.index
         expr, bindings = self._expr_and_bindings(state)
         if expr is None:
-            raise NotImplementedError("wave_amd M1 requires symbolic tt.addptr offsets")
+            raise NotImplementedError("wave_amd requires symbolic tt.addptr offsets")
         return self.func.index_expr(expr, bindings, self.dsl.simd_type(self.dsl.index_type(), self.width))
 
     def _expr_and_bindings(self, state: _Value):
@@ -406,11 +406,11 @@ class _TTIRToWaveLowerer:
         try:
             return self.values[value.id()]
         except KeyError as exc:
-            raise NotImplementedError("wave_amd M1 encountered a value produced by an unsupported TTIR op") from exc
+            raise NotImplementedError("wave_amd encountered a value produced by an unsupported TTIR op") from exc
 
     def _set_result(self, op, state: _Value) -> None:
         if op.get_num_results() != 1:
-            raise NotImplementedError(f"wave_amd M1 expected one result from {op.get_name()}")
+            raise NotImplementedError(f"wave_amd expected one result from {op.get_name()}")
         self.values[op.get_result(0).id()] = state
 
     def _signature_type(self, signature: str):
@@ -435,7 +435,7 @@ class _TTIRToWaveLowerer:
             return self.dsl.f32()
         if name == "index":
             return self.dsl.index_type()
-        raise NotImplementedError(f"wave_amd M1 does not support type {name!r}")
+        raise NotImplementedError(f"wave_amd does not support type {name!r}")
 
 
 def _signature_element_type(signature: str) -> Optional[str]:
@@ -467,7 +467,7 @@ def _load_wave_dsl():
         except ImportError as exc:
             cause = first_error if exc is not first_error else exc
             raise RuntimeError(
-                "wave_amd M1 lowering requires the Wave Python MLIR builder bindings. "
+                "wave_amd lowering requires the Wave Python MLIR builder bindings. "
                 "Build/install the Wave submodule Python bindings so `mlir.dialects.wave_dsl` "
                 "can be imported; this backend intentionally does not fall back to textual MLIR assembly.") from cause
 
@@ -477,12 +477,12 @@ def _wave_amd_native():
         from triton._C.libtriton import wave_amd
     except (AttributeError, ImportError) as exc:
         raise RuntimeError(
-            "wave_amd M1 lowering requires the Triton wave_amd native extension. "
+            "wave_amd lowering requires the Triton wave_amd native extension. "
             "Rebuild Triton with the wave_amd backend so TTIR operation attributes can be read structurally.") from exc
 
     required = ("get_program_id_axis", "get_cmpi_predicate", "get_arith_constant_splat")
     missing = [name for name in required if not hasattr(wave_amd, name)]
     if missing:
-        raise RuntimeError("wave_amd M1 lowering requires the Triton wave_amd native extension to expose "
+        raise RuntimeError("wave_amd lowering requires the Triton wave_amd native extension to expose "
                            f"{', '.join(missing)}. Rebuild Triton with the updated wave_amd backend.")
     return wave_amd

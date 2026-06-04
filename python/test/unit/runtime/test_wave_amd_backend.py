@@ -126,6 +126,20 @@ def test_wave_amd_backend_skeleton():
     assert list(stages) == ["ttir", "wave", "amdgcn", "hsaco"]
 
 
+def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):
+    wave_translate = tmp_path / "wave-translate"
+    pipelines = tmp_path / "pipelines.mlir"
+    wave_translate.write_bytes(b"tool-v1")
+    pipelines.write_text("pipeline-v1")
+    monkeypatch.setattr(wave_compiler, "_wave_backend_artifact_paths", lambda: (wave_translate, pipelines))
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    first_hash = WaveAMDBackend(target).hash()
+    wave_translate.write_bytes(b"tool-v2")
+
+    assert WaveAMDBackend(target).hash() != first_hash
+
+
 def test_wave_amd_make_wave_lowers_tiny_add(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -383,6 +397,46 @@ def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, dev
 
     expected = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
     expected[:n] = a[:n] + b[:n]
+    torch.testing.assert_close(c, expected)
+
+
+def test_wave_amd_runtime_launches_masked_load_other_tail(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+
+    n = 45
+    total = 64
+    a = torch.arange(total, device=device, dtype=torch.float32)
+    c = torch.full((total, ), -7.0, device=device, dtype=torch.float32)
+    module_path = tmp_path / "masked_load_other.ttir"
+    module_path.write_text(MASKED_LOAD_OTHER_TTIR)
+    kernel = triton_compiler.compile(
+        str(module_path),
+        target=GPUTarget("wave_amd", target.arch, target.warp_size),
+        options={"num_warps": 1},
+    )
+    kernel[(2, 1, 1)](a, c, n)
+    getattr(torch, device).synchronize()
+
+    expected = torch.full((total, ), 5.0, device=device, dtype=torch.float32)
+    expected[:n] = a[:n]
     torch.testing.assert_close(c, expected)
 
 
