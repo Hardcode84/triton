@@ -29,8 +29,31 @@ class _AffineIndex:
 
 @dataclass(frozen=True)
 class _DotConfig:
+    m: int
+    n: int
     k: int
+    m_tiles: int
+    n_tiles: int
     k_steps: int
+
+
+@dataclass(frozen=True)
+class _DotFragmentGrid:
+    role: int
+    m_tiles: int
+    n_tiles: int
+    k_steps: int
+    fragments: Tuple[object, ...]
+    tokens: Tuple[object, ...] = ()
+
+    def a(self, m_tile: int, k_step: int):
+        return self.fragments[m_tile * self.k_steps + k_step]
+
+    def b(self, n_tile: int, k_step: int):
+        return self.fragments[n_tile * self.k_steps + k_step]
+
+    def c(self, m_tile: int, n_tile: int):
+        return self.fragments[m_tile * self.n_tiles + n_tile]
 
 
 @dataclass(frozen=True)
@@ -104,6 +127,7 @@ class _Value:
     waves: Tuple[object, ...] = field(default_factory=tuple)
     fragment: object = None
     fragments: Tuple[object, ...] = field(default_factory=tuple)
+    dot_grid: Optional[_DotFragmentGrid] = None
     elem_type: Optional[str] = None
     const: Optional[int] = None
     affine: Optional[_AffineIndex] = None
@@ -696,16 +720,17 @@ class _TTIRToWaveLowerer:
                 raise NotImplementedError("wave_amd tt.dot operand loads do not yet support masks")
             ptr = self._value(op.get_operand(0))
             info = self._result_tensor_info(op)
-            fragments, tokens = self._emit_dot_fragment_load(ptr, info, role)
-            self.load_tokens.extend(tokens)
+            grid = self._emit_dot_fragment_load(ptr, info, role)
+            self.load_tokens.extend(grid.tokens)
             self._set_result(
                 op,
                 _Value(
-                    fragment=fragments[0],
-                    fragments=fragments,
+                    fragment=grid.fragments[0],
+                    fragments=grid.fragments,
+                    dot_grid=grid,
                     elem_type=info.elem_type,
-                    token=tokens[0],
-                    tokens=tokens,
+                    token=grid.tokens[0],
+                    tokens=grid.tokens,
                     shape=info.shape,
                 ),
             )
@@ -838,19 +863,31 @@ class _TTIRToWaveLowerer:
         lhs = self._value(op.get_operand(0))
         rhs = self._value(op.get_operand(1))
         acc = self._value(op.get_operand(2))
-        lhs_fragments = self._dot_fragments(lhs)
-        rhs_fragments = self._dot_fragments(rhs)
-        if not lhs_fragments or not rhs_fragments:
+        lhs_grid = self._dot_operand_grid(lhs, role=0, config=config)
+        rhs_grid = self._dot_operand_grid(rhs, role=1, config=config)
+        if lhs_grid is None or rhs_grid is None:
             raise NotImplementedError("wave_amd tt.dot currently requires operands produced by supported tt.load ops")
-        if len(lhs_fragments) != config.k_steps or len(rhs_fragments) != config.k_steps:
-            raise NotImplementedError("wave_amd tt.dot operand fragment counts must match the K decomposition")
-        result = self._dot_accumulator_fragment(acc, result_info)
-        for lhs_fragment, rhs_fragment in zip(lhs_fragments, rhs_fragments):
-            result = self.func.mma("wmma.f32.16x16x16.f16", lhs_fragment, rhs_fragment, result)
+        result_fragments = []
+        for m_tile in range(config.m_tiles):
+            for n_tile in range(config.n_tiles):
+                result = self._dot_accumulator_fragment(acc, result_info, m_tile, n_tile)
+                for k_step in range(config.k_steps):
+                    result = self.func.mma("wmma.f32.16x16x16.f16", lhs_grid.a(m_tile, k_step),
+                                           rhs_grid.b(n_tile, k_step), result)
+                result_fragments.append(result)
+        result_grid = _DotFragmentGrid(
+            role=2,
+            m_tiles=config.m_tiles,
+            n_tiles=config.n_tiles,
+            k_steps=0,
+            fragments=tuple(result_fragments),
+        )
         self._set_result(
             op,
             _Value(
-                fragment=result,
+                fragment=result_fragments[0],
+                fragments=tuple(result_fragments),
+                dot_grid=result_grid,
                 elem_type=result_info.elem_type,
                 shape=result_info.shape,
             ),
@@ -870,22 +907,40 @@ class _TTIRToWaveLowerer:
         rhs_k, n = rhs.shape
         if rhs_k != k or result.shape != (m, n):
             raise NotImplementedError("wave_amd tt.dot found incompatible matrix shapes")
-        if m != 16 or n != 16:
-            raise NotImplementedError("wave_amd tt.dot currently supports one 16x16 output tile")
+        if m < 16 or m % 16 != 0:
+            raise NotImplementedError("wave_amd tt.dot M dimension must be a positive multiple of 16")
+        if n < 16 or n % 16 != 0:
+            raise NotImplementedError("wave_amd tt.dot N dimension must be a positive multiple of 16")
         if k < 16 or k % 16 != 0:
             raise NotImplementedError("wave_amd tt.dot K dimension must be a positive multiple of 16")
-        return _DotConfig(k=k, k_steps=k // 16)
+        return _DotConfig(m=m, n=n, k=k, m_tiles=m // 16, n_tiles=n // 16, k_steps=k // 16)
 
-    def _dot_fragments(self, value: _Value) -> Tuple[object, ...]:
-        if value.fragments:
-            return value.fragments
-        if value.fragment is not None:
-            return (value.fragment, )
-        return ()
+    def _dot_operand_grid(self, value: _Value, role: int, config: _DotConfig) -> Optional[_DotFragmentGrid]:
+        if value.dot_grid is None:
+            if value.fragments:
+                k_steps = config.k_steps
+                if role == 0 and config.m_tiles == 1 and len(value.fragments) == k_steps:
+                    return _DotFragmentGrid(role=role, m_tiles=1, n_tiles=0, k_steps=k_steps, fragments=value.fragments)
+                if role == 1 and config.n_tiles == 1 and len(value.fragments) == k_steps:
+                    return _DotFragmentGrid(role=role, m_tiles=0, n_tiles=1, k_steps=k_steps, fragments=value.fragments)
+            if value.fragment is not None and config.k_steps == 1:
+                return _DotFragmentGrid(role=role, m_tiles=1 if role == 0 else 0, n_tiles=1 if role == 1 else 0,
+                                        k_steps=1, fragments=(value.fragment, ))
+            return None
+        grid = value.dot_grid
+        if grid.role != role:
+            raise NotImplementedError("wave_amd tt.dot operand fragment role does not match the dot operand")
+        expected_outer_tiles = config.m_tiles if role == 0 else config.n_tiles
+        actual_outer_tiles = grid.m_tiles if role == 0 else grid.n_tiles
+        if actual_outer_tiles != expected_outer_tiles or grid.k_steps != config.k_steps:
+            raise NotImplementedError("wave_amd tt.dot operand fragment grid must match the dot tile decomposition")
+        return grid
 
-    def _dot_accumulator_fragment(self, acc: _Value, result_info: _TensorInfo):
+    def _dot_accumulator_fragment(self, acc: _Value, result_info: _TensorInfo, m_tile: int, n_tile: int):
         frag_type = self._dot_fragment_type(role=2, elem_type=result_info.elem_type)
-        if acc.fragment is not None:
+        if acc.dot_grid is not None:
+            return acc.dot_grid.c(m_tile, n_tile)
+        if acc.fragment is not None and result_info.shape == (16, 16):
             return acc.fragment
         if acc.splat_const is not None:
             value, elem_type, width = acc.splat_const
@@ -901,17 +956,21 @@ class _TTIRToWaveLowerer:
         if ptr.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot operand loads require a splatted pointer base")
         if role == 0:
-            if info.shape[0] != 16:
-                raise NotImplementedError("wave_amd tt.dot A operand loads currently support 16 rows")
-            k = info.shape[1]
+            m, k = info.shape
+            if m < 16 or m % 16 != 0:
+                raise NotImplementedError("wave_amd tt.dot A operand M dimension must be a positive multiple of 16")
             self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (k, 1)),
-                                            f"A operand row-major 16x{k} offsets")
+                                            f"A operand row-major {m}x{k} offsets")
+            m_tiles = m // 16
+            n_tiles = 0
         elif role == 1:
-            if info.shape[1] != 16:
-                raise NotImplementedError("wave_amd tt.dot B operand loads currently support 16 columns")
-            k = info.shape[0]
+            k, n = info.shape
+            if n < 16 or n % 16 != 0:
+                raise NotImplementedError("wave_amd tt.dot B operand N dimension must be a positive multiple of 16")
             self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (1, k)),
-                                            f"B operand K-contiguous column-major {k}x16 offsets")
+                                            f"B operand K-contiguous column-major {k}x{n} offsets")
+            m_tiles = 0
+            n_tiles = n // 16
         else:
             raise AssertionError(f"unexpected dot operand role {role}")
         if k < 16 or k % 16 != 0:
@@ -922,24 +981,49 @@ class _TTIRToWaveLowerer:
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
         fragments = []
         tokens = []
-        for step in range(k // 16):
-            index_expr = lane_base + step * 16 if step else lane_base
-            index = self.func.index_expr(index_expr, {sym: thread}, index_type)
-            frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
-            fragment, token = self.func.fragment_load(frag_ptr,
-                                                      self._dot_fragment_type(role=role, elem_type=info.elem_type))
-            fragments.append(fragment)
-            tokens.append(token)
-        return tuple(fragments), tuple(tokens)
+        k_steps = k // 16
+        outer_tiles = m_tiles if role == 0 else n_tiles
+        for tile in range(outer_tiles):
+            tile_base = tile * 16 * k
+            for step in range(k_steps):
+                offset = tile_base + step * 16
+                index_expr = lane_base + offset if offset else lane_base
+                index = self.func.index_expr(index_expr, {sym: thread}, index_type)
+                frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
+                fragment, token = self.func.fragment_load(frag_ptr,
+                                                          self._dot_fragment_type(role=role, elem_type=info.elem_type))
+                fragments.append(fragment)
+                tokens.append(token)
+        return _DotFragmentGrid(
+            role=role,
+            m_tiles=m_tiles,
+            n_tiles=n_tiles,
+            k_steps=k_steps,
+            fragments=tuple(fragments),
+            tokens=tuple(tokens),
+        )
 
     def _emit_fragment_store(self, ptr: _Value, value: _Value) -> None:
         if ptr.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot result stores require a splatted pointer base")
-        self._expect_dot_pointer_layout(ptr, value.shape, _AffineIndex(0, (16, 1)), "C result row-major 16x16 offsets")
-        self._emit_dot_row_major_fragment_store(ptr.ptr_base, value.fragment)
+        if value.shape is None or len(value.shape) != 2:
+            raise NotImplementedError("wave_amd tt.dot result stores require a rank-2 matrix result")
+        m, n = value.shape
+        self._expect_dot_pointer_layout(ptr, value.shape, _AffineIndex(0, (n, 1)),
+                                        f"C result row-major {m}x{n} offsets")
+        if value.dot_grid is not None:
+            grid = value.dot_grid
+            if grid.role != 2:
+                raise NotImplementedError("wave_amd tt.dot result stores require C/result fragments")
+            for m_tile in range(grid.m_tiles):
+                for n_tile in range(grid.n_tiles):
+                    tile_base = m_tile * 16 * n + n_tile * 16
+                    self._emit_dot_row_major_fragment_store(ptr.ptr_base, grid.c(m_tile, n_tile), n, tile_base)
+        else:
+            self._emit_dot_row_major_fragment_store(ptr.ptr_base, value.fragment, n, 0)
         self.load_tokens.clear()
 
-    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment) -> None:
+    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment, leading_dim: int, tile_base: int) -> None:
         regs = self.func.fragment_unpack(fragment)
         thread, sym = self._thread_id_and_sym()
         lane = self.dsl.mod(sym, 16)
@@ -948,7 +1032,7 @@ class _TTIRToWaveLowerer:
         value_type = self.dsl.simd_type(self.dsl.i32(), self.width)
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
         for register in range(8):
-            row_major = (register * 2 + row_parity) * 16 + lane
+            row_major = tile_base + (register * 2 + row_parity) * leading_dim + lane
             index = self.func.index_expr(row_major, {sym: thread}, index_type)
             value = self.dsl.wave.ExtractOp(value_type, regs, register).result
             self.func.store(value, self.func.ptr_add(ptr_base, index), after=after)

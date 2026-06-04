@@ -149,58 +149,62 @@ module {
 """
 
 
-def _dot_matmul_ttir(k: int, name: str) -> str:
+def _dot_matmul_ttir(m: int, n: int, k: int, name: str) -> str:
     return f"""
 module {{
   tt.func public @{name}(%arg0: !tt.ptr<f16> {{tt.divisibility = 16 : i32}},
                         %arg1: !tt.ptr<f16> {{tt.divisibility = 16 : i32}},
                         %arg2: !tt.ptr<f32> {{tt.divisibility = 16 : i32}}) attributes {{noinline = false}} {{
-    %c16 = arith.constant 16 : i32
+    %cn = arith.constant {n} : i32
     %ck = arith.constant {k} : i32
-    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
-    %rows = tt.make_range {{end = 16 : i32, start = 0 : i32}} : tensor<16xi32>
-    %cols = tt.make_range {{end = 16 : i32, start = 0 : i32}} : tensor<16xi32>
+    %zero = arith.constant dense<0.000000e+00> : tensor<{m}x{n}xf32>
+    %rows = tt.make_range {{end = {m} : i32, start = 0 : i32}} : tensor<{m}xi32>
+    %cols = tt.make_range {{end = {n} : i32, start = 0 : i32}} : tensor<{n}xi32>
     %ks = tt.make_range {{end = {k} : i32, start = 0 : i32}} : tensor<{k}xi32>
-    %rows_a = tt.expand_dims %rows {{axis = 1 : i32}} : tensor<16xi32> -> tensor<16x1xi32>
+    %rows_a = tt.expand_dims %rows {{axis = 1 : i32}} : tensor<{m}xi32> -> tensor<{m}x1xi32>
     %ks_a = tt.expand_dims %ks {{axis = 0 : i32}} : tensor<{k}xi32> -> tensor<1x{k}xi32>
-    %rows_a_b = tt.broadcast %rows_a : tensor<16x1xi32> -> tensor<16x{k}xi32>
-    %ks_a_b = tt.broadcast %ks_a : tensor<1x{k}xi32> -> tensor<16x{k}xi32>
-    %a_stride = tt.splat %ck : i32 -> tensor<16x{k}xi32>
-    %a_row_offsets = arith.muli %rows_a_b, %a_stride : tensor<16x{k}xi32>
-    %a_offsets = arith.addi %a_row_offsets, %ks_a_b : tensor<16x{k}xi32>
+    %rows_a_b = tt.broadcast %rows_a : tensor<{m}x1xi32> -> tensor<{m}x{k}xi32>
+    %ks_a_b = tt.broadcast %ks_a : tensor<1x{k}xi32> -> tensor<{m}x{k}xi32>
+    %a_stride = tt.splat %ck : i32 -> tensor<{m}x{k}xi32>
+    %a_row_offsets = arith.muli %rows_a_b, %a_stride : tensor<{m}x{k}xi32>
+    %a_offsets = arith.addi %a_row_offsets, %ks_a_b : tensor<{m}x{k}xi32>
     %ks_b = tt.expand_dims %ks {{axis = 1 : i32}} : tensor<{k}xi32> -> tensor<{k}x1xi32>
-    %cols_b = tt.expand_dims %cols {{axis = 0 : i32}} : tensor<16xi32> -> tensor<1x16xi32>
-    %ks_b_b = tt.broadcast %ks_b : tensor<{k}x1xi32> -> tensor<{k}x16xi32>
-    %cols_b_b = tt.broadcast %cols_b : tensor<1x16xi32> -> tensor<{k}x16xi32>
-    %b_stride = tt.splat %ck : i32 -> tensor<{k}x16xi32>
-    %b_col_offsets = arith.muli %cols_b_b, %b_stride : tensor<{k}x16xi32>
-    %b_offsets = arith.addi %b_col_offsets, %ks_b_b : tensor<{k}x16xi32>
-    %rows_c = tt.expand_dims %rows {{axis = 1 : i32}} : tensor<16xi32> -> tensor<16x1xi32>
-    %cols_c = tt.expand_dims %cols {{axis = 0 : i32}} : tensor<16xi32> -> tensor<1x16xi32>
-    %rows_c_b = tt.broadcast %rows_c : tensor<16x1xi32> -> tensor<16x16xi32>
-    %cols_c_b = tt.broadcast %cols_c : tensor<1x16xi32> -> tensor<16x16xi32>
-    %c_stride = tt.splat %c16 : i32 -> tensor<16x16xi32>
-    %c_row_offsets = arith.muli %rows_c_b, %c_stride : tensor<16x16xi32>
-    %c_offsets = arith.addi %c_row_offsets, %cols_c_b : tensor<16x16xi32>
-    %a_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<16x{k}x!tt.ptr<f16>>
-    %b_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<{k}x16x!tt.ptr<f16>>
-    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
-    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<16x{k}x!tt.ptr<f16>>, tensor<16x{k}xi32>
-    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<{k}x16x!tt.ptr<f16>>, tensor<{k}x16xi32>
-    %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
-    %a = tt.load %a_ptrs : tensor<16x{k}x!tt.ptr<f16>>
-    %b = tt.load %b_ptrs : tensor<{k}x16x!tt.ptr<f16>>
-    %acc = tt.dot %a, %b, %zero : tensor<16x{k}xf16> * tensor<{k}x16xf16> -> tensor<16x16xf32>
-    tt.store %c_ptrs, %acc : tensor<16x16x!tt.ptr<f32>>
+    %cols_b = tt.expand_dims %cols {{axis = 0 : i32}} : tensor<{n}xi32> -> tensor<1x{n}xi32>
+    %ks_b_b = tt.broadcast %ks_b : tensor<{k}x1xi32> -> tensor<{k}x{n}xi32>
+    %cols_b_b = tt.broadcast %cols_b : tensor<1x{n}xi32> -> tensor<{k}x{n}xi32>
+    %b_stride = tt.splat %ck : i32 -> tensor<{k}x{n}xi32>
+    %b_col_offsets = arith.muli %cols_b_b, %b_stride : tensor<{k}x{n}xi32>
+    %b_offsets = arith.addi %b_col_offsets, %ks_b_b : tensor<{k}x{n}xi32>
+    %rows_c = tt.expand_dims %rows {{axis = 1 : i32}} : tensor<{m}xi32> -> tensor<{m}x1xi32>
+    %cols_c = tt.expand_dims %cols {{axis = 0 : i32}} : tensor<{n}xi32> -> tensor<1x{n}xi32>
+    %rows_c_b = tt.broadcast %rows_c : tensor<{m}x1xi32> -> tensor<{m}x{n}xi32>
+    %cols_c_b = tt.broadcast %cols_c : tensor<1x{n}xi32> -> tensor<{m}x{n}xi32>
+    %c_stride = tt.splat %cn : i32 -> tensor<{m}x{n}xi32>
+    %c_row_offsets = arith.muli %rows_c_b, %c_stride : tensor<{m}x{n}xi32>
+    %c_offsets = arith.addi %c_row_offsets, %cols_c_b : tensor<{m}x{n}xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<{m}x{k}x!tt.ptr<f16>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<{k}x{n}x!tt.ptr<f16>>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<{m}x{n}x!tt.ptr<f32>>
+    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<{m}x{k}x!tt.ptr<f16>>, tensor<{m}x{k}xi32>
+    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<{k}x{n}x!tt.ptr<f16>>, tensor<{k}x{n}xi32>
+    %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<{m}x{n}x!tt.ptr<f32>>, tensor<{m}x{n}xi32>
+    %a = tt.load %a_ptrs : tensor<{m}x{k}x!tt.ptr<f16>>
+    %b = tt.load %b_ptrs : tensor<{k}x{n}x!tt.ptr<f16>>
+    %acc = tt.dot %a, %b, %zero : tensor<{m}x{k}xf16> * tensor<{k}x{n}xf16> -> tensor<{m}x{n}xf32>
+    tt.store %c_ptrs, %acc : tensor<{m}x{n}x!tt.ptr<f32>>
     tt.return
   }}
 }}
 """
 
 
-DOT_MATMUL_TTIR = _dot_matmul_ttir(16, "dot_kernel")
-DOT_MATMUL_K32_TTIR = _dot_matmul_ttir(32, "dot_k32_kernel")
-DOT_MATMUL_K8_TTIR = _dot_matmul_ttir(8, "dot_k8_kernel")
+DOT_MATMUL_TTIR = _dot_matmul_ttir(16, 16, 16, "dot_kernel")
+DOT_MATMUL_K32_TTIR = _dot_matmul_ttir(16, 16, 32, "dot_k32_kernel")
+DOT_MATMUL_K8_TTIR = _dot_matmul_ttir(16, 16, 8, "dot_k8_kernel")
+DOT_MATMUL_32X32_TTIR = _dot_matmul_ttir(32, 32, 16, "dot_32x32_kernel")
+DOT_MATMUL_32X32_K32_TTIR = _dot_matmul_ttir(32, 32, 32, "dot_32x32_k32_kernel")
+DOT_MATMUL_M8_TTIR = _dot_matmul_ttir(8, 32, 16, "dot_m8_kernel")
+DOT_MATMUL_N8_TTIR = _dot_matmul_ttir(32, 8, 16, "dot_n8_kernel")
 
 MASKED_ADD_TTIR = """
 module {
@@ -756,6 +760,36 @@ def test_wave_amd_make_wave_lowers_dot_k32_to_two_native_wmma_ops(tmp_path):
     assert "wave.store" in wave
 
 
+@pytest.mark.parametrize(
+    ("ttir", "kernel_name", "expected_mmas", "expected_packs"),
+    [
+        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4),
+        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8),
+    ],
+)
+def test_wave_amd_make_wave_lowers_32x32_dot_to_native_wmma_grid(tmp_path, ttir, kernel_name, expected_mmas,
+                                                                 expected_packs):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, ttir)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == kernel_name
+    assert f"func.func @{kernel_name}" in wave
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == expected_mmas
+    assert wave.count("waveamd.fragment_pack") == expected_packs
+    assert wave.count("waveamd.fragment_unpack") == 4
+    assert wave.count("wave.store") == 32
+
+
 def test_wave_amd_make_wave_rejects_dot_k_not_multiple_of_16(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -768,6 +802,28 @@ def test_wave_amd_make_wave_rejects_dot_k_not_multiple_of_16(tmp_path):
     module = _parse_ttir(tmp_path, backend, DOT_MATMUL_K8_TTIR)
 
     with pytest.raises(NotImplementedError, match="K dimension.*multiple of 16"):
+        backend.make_wave(module, {}, options)
+
+
+@pytest.mark.parametrize(
+    ("ttir", "match"),
+    [
+        (DOT_MATMUL_M8_TTIR, "M dimension.*multiple of 16"),
+        (DOT_MATMUL_N8_TTIR, "N dimension.*multiple of 16"),
+    ],
+)
+def test_wave_amd_make_wave_rejects_dot_mn_not_multiple_of_16(tmp_path, ttir, match):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    module = _parse_ttir(tmp_path, backend, ttir)
+
+    with pytest.raises(NotImplementedError, match=match):
         backend.make_wave(module, {}, options)
 
 
@@ -1372,13 +1428,14 @@ def test_wave_amd_make_hsaco_emits_dot_kernel_elf(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("k", "ttir", "kernel_name"),
+    ("m", "n", "k", "kernel_name"),
     [
-        (16, DOT_MATMUL_TTIR, "dot_e2e_kernel"),
-        (32, DOT_MATMUL_K32_TTIR, "dot_k32_e2e_kernel"),
+        (16, 16, 16, "dot_e2e_kernel"),
+        (16, 16, 32, "dot_k32_e2e_kernel"),
+        (32, 32, 16, "dot_32x32_e2e_kernel"),
     ],
 )
-def test_wave_amd_runtime_launches_dot_matmul_tile(tmp_path, monkeypatch, device, k, ttir, kernel_name):
+def test_wave_amd_runtime_launches_dot_matmul_tile(tmp_path, monkeypatch, device, m, n, k, kernel_name):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
         reason="Wave Python MLIR builder bindings are required",
@@ -1404,14 +1461,14 @@ def test_wave_amd_runtime_launches_dot_matmul_tile(tmp_path, monkeypatch, device
     monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
 
-    a_matrix = torch.arange(16 * k, device=device, dtype=torch.float32).reshape(16, k) / 32.0
-    b_matrix = (torch.arange(k * 16, device=device, dtype=torch.float32).reshape(k, 16) / 64.0) - 1.0
+    a_matrix = torch.arange(m * k, device=device, dtype=torch.float32).reshape(m, k) / 32.0
+    b_matrix = (torch.arange(k * n, device=device, dtype=torch.float32).reshape(k, n) / 64.0) - 1.0
     a = a_matrix.to(torch.float16).contiguous()
     b = b_matrix.to(torch.float16).t().contiguous()
-    c = torch.full((16, 16), -999.0, device=device, dtype=torch.float32)
+    c = torch.full((m, n), -999.0, device=device, dtype=torch.float32)
 
-    module_path = tmp_path / f"dot_matmul_k{k}.ttir"
-    module_path.write_text(ttir.replace("@dot_kernel", f"@{kernel_name}").replace("@dot_k32_kernel", f"@{kernel_name}"))
+    module_path = tmp_path / f"dot_matmul_{m}x{n}x{k}.ttir"
+    module_path.write_text(_dot_matmul_ttir(m, n, k, kernel_name))
     kernel = triton_compiler.compile(
         str(module_path),
         target=GPUTarget("wave_amd", target.arch, target.warp_size),
