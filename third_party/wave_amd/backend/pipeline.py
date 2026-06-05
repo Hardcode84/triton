@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+import tempfile
 from typing import Callable, Optional, Sequence
 
 from triton._C.libtriton import ir, passes
@@ -106,6 +107,34 @@ def run_wave_ttir_pipeline(mod, label: str = "wave_amd_make_ttir"):
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     add_wave_ttir_cleanup_passes(pm)
+    pm.run(mod, label)
+    return mod
+
+
+def clone_module_for_preview(mod, suffix: str = ".ttir"):
+    """Clone an MLIR module through text for non-mutating preview pipelines."""
+
+    with tempfile.NamedTemporaryFile("w", suffix=suffix) as tmp:
+        tmp.write(str(mod))
+        tmp.flush()
+        cloned = ir.parse_mlir_module(tmp.name, mod.context)
+        cloned.context = mod.context
+        return cloned
+
+
+def add_wave_ttgir_preview_passes(pm, options) -> None:
+    passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
+                                       options.num_ctas)
+    passes.common.add_canonicalizer(pm)
+    passes.common.add_cse(pm)
+
+
+def run_wave_ttgir_preview_pipeline(mod, options, label: str = "wave_amd_ttgir_preview"):
+    """Convert a preview module to TTGIR without making it the lowering input."""
+
+    pm = ir.pass_manager(mod.context)
+    pm.enable_debug()
+    add_wave_ttgir_preview_passes(pm, options)
     pm.run(mod, label)
     return mod
 

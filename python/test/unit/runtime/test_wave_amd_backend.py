@@ -530,6 +530,11 @@ def test_wave_amd_backend_skeleton():
     backend.add_stages(stages, options, Language.TRITON)
     assert list(stages) == ["ttir", "wave", "amdgcn", "hsaco"]
 
+    preview_options = backend.parse_options({"enable_ttgir_preview": True})
+    preview_stages = {}
+    backend.add_stages(preview_stages, preview_options, Language.TRITON)
+    assert list(preview_stages) == ["ttir", "ttgir_preview", "wave", "amdgcn", "hsaco"]
+
 
 def test_wave_amd_pipeline_records_safe_ttir_cleanup_and_ttgir_reuse_plan():
     assert [stage.name for stage in wave_pipeline.wave_ttir_cleanup_plan()] == [
@@ -553,6 +558,21 @@ def test_wave_amd_pipeline_records_safe_ttir_cleanup_and_ttgir_reuse_plan():
         stage.name
         for stage in wave_pipeline.ttgir_passes_by_reuse(wave_pipeline.PassReuse.REUSE_WITH_CONSTRAINTS)
     }
+
+
+def test_wave_amd_ttgir_preview_keeps_ttir_as_lowering_input(tmp_path):
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1, "enable_ttgir_preview": True})
+    module = _parse_ttir(tmp_path, backend, ELEMENTWISE_ADD_TTIR)
+    metadata = {}
+
+    returned = backend.make_ttgir_preview(module, metadata, options)
+
+    assert returned is module
+    assert "wave_ttgir_preview" in metadata
+    assert "#ttg." in metadata["wave_ttgir_preview"]
+    assert "tt.func" in str(module)
 
 
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):

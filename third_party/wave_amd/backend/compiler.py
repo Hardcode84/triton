@@ -10,7 +10,8 @@ from triton import knobs
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn, _packaged_wave_translate
 from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
-from triton.backends.wave_amd.pipeline import run_wave_ttir_pipeline
+from triton.backends.wave_amd.pipeline import clone_module_for_preview, run_wave_ttgir_preview_pipeline, \
+    run_wave_ttir_pipeline
 
 
 def _warp_size_for_arch(arch: str) -> int:
@@ -63,6 +64,7 @@ class WaveAMDOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "bf16x3", "bf16x6")
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
+    enable_ttgir_preview: bool = False
     backend_name: str = "wave_amd"
 
     def __post_init__(self):
@@ -138,6 +140,13 @@ class WaveAMDBackend(BaseBackend):
         return wave_mlir
 
     @staticmethod
+    def make_ttgir_preview(src, metadata, options):
+        preview = clone_module_for_preview(src)
+        run_wave_ttgir_preview_pipeline(preview, options)
+        metadata["wave_ttgir_preview"] = str(preview)
+        return src
+
+    @staticmethod
     def make_amdgcn(src, metadata, options):
         return emit_amdgcn_from_wave_mlir(src, options)
 
@@ -149,6 +158,8 @@ class WaveAMDBackend(BaseBackend):
         if language != Language.TRITON:
             raise NotImplementedError("wave_amd only supports Triton TTIR input")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
+        if options.enable_ttgir_preview:
+            stages["ttgir_preview"] = lambda src, metadata: self.make_ttgir_preview(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
