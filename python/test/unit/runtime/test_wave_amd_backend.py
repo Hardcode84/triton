@@ -575,6 +575,57 @@ def test_wave_amd_ttgir_preview_keeps_ttir_as_lowering_input(tmp_path):
     assert "tt.func" in str(module)
 
 
+def _ttgir_preview_text(tmp_path, ttir, options_dict=None):
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    opts = {"num_warps": 1, "enable_ttgir_preview": True}
+    if options_dict is not None:
+        opts.update(options_dict)
+    options = backend.parse_options(opts)
+    module = _parse_ttir(tmp_path, backend, ttir)
+    metadata = {}
+
+    backend.make_ttgir_preview(module, metadata, options)
+
+    return metadata["wave_ttgir_preview"]
+
+
+@pytest.mark.parametrize(
+    ("ttir", "kernel_name", "expected_min_blocked", "expected_min_converts"),
+    [
+        (DOT_MATMUL_TTIR, "dot_kernel", 5, 6),
+        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 6, 10),
+        (REALISTIC_MATMUL_TILE_TTIR, "realistic_matmul_tile_kernel", 6, 11),
+    ],
+)
+def test_wave_amd_ttgir_preview_exposes_matmul_layout_facts(tmp_path, ttir, kernel_name, expected_min_blocked,
+                                                            expected_min_converts):
+    ttgir = _ttgir_preview_text(tmp_path, ttir)
+
+    assert f"@{kernel_name}" in ttgir
+    assert "ttg.target = \"hip:gfx1100\"" in ttgir
+    assert "\"ttg.num-warps\" = 1" in ttgir
+    assert "\"ttg.threads-per-warp\" = 32" in ttgir
+    assert ttgir.count("#ttg.blocked") >= expected_min_blocked
+    assert ttgir.count("#ttg.dot_op") >= 4
+    assert ttgir.count("ttg.convert_layout") >= expected_min_converts
+    assert ttgir.count("tt.load") == 2
+    assert ttgir.count("tt.dot") == 1
+    assert ttgir.count("tt.store") == 1
+
+
+def test_wave_amd_ttgir_preview_preserves_matmul_k_loop_structure(tmp_path):
+    ttgir = _ttgir_preview_text(tmp_path, REALISTIC_MATMUL_LOOP_TTIR)
+
+    assert "@realistic_matmul_loop_kernel" in ttgir
+    assert "scf.for" in ttgir
+    assert ttgir.count("tt.load") == 2
+    assert ttgir.count("tt.dot") == 1
+    assert ttgir.count("tt.store") == 1
+    assert "#ttg.dot_op" in ttgir
+    assert "ttg.convert_layout" in ttgir
+
+
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):
     wave_translate = tmp_path / "wave-translate"
     pipelines = tmp_path / "pipelines.mlir"
