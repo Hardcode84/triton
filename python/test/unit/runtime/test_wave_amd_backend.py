@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+triton = pytest.importorskip("triton")
+tl = pytest.importorskip("triton.language")
 libtriton = pytest.importorskip("triton._C.libtriton")
 compiler_api = pytest.importorskip("triton.backends.compiler")
 triton_compiler = pytest.importorskip("triton.compiler.compiler")
@@ -246,7 +248,10 @@ module {
     %a_k_offsets = arith.muli %ks_a_b, %stride_ak : tensor<16x16xi32>
     %a_offsets = arith.addi %a_row_offsets, %a_k_offsets : tensor<16x16xi32>
     %m_vec = tt.splat %arg3 : i32 -> tensor<16x16xi32>
-    %a_mask = arith.cmpi ult, %rows_a_b, %m_vec : tensor<16x16xi32>
+    %k_vec = tt.splat %arg5 : i32 -> tensor<16x16xi32>
+    %a_m_mask = arith.cmpi ult, %rows_a_b, %m_vec : tensor<16x16xi32>
+    %a_k_mask = arith.cmpi ult, %ks_a_b, %k_vec : tensor<16x16xi32>
+    %a_mask = arith.andi %a_m_mask, %a_k_mask : tensor<16x16xi1>
     %ks_b = tt.expand_dims %ks {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
     %cols_b = tt.expand_dims %offs_n {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
     %ks_b_b = tt.broadcast %ks_b : tensor<16x1xi32> -> tensor<16x16xi32>
@@ -257,7 +262,9 @@ module {
     %b_col_offsets = arith.muli %cols_b_b, %stride_bn : tensor<16x16xi32>
     %b_offsets = arith.addi %b_k_offsets, %b_col_offsets : tensor<16x16xi32>
     %n_vec = tt.splat %arg4 : i32 -> tensor<16x16xi32>
-    %b_mask = arith.cmpi ult, %cols_b_b, %n_vec : tensor<16x16xi32>
+    %b_k_mask = arith.cmpi ult, %ks_b_b, %k_vec : tensor<16x16xi32>
+    %b_n_mask = arith.cmpi ult, %cols_b_b, %n_vec : tensor<16x16xi32>
+    %b_mask = arith.andi %b_k_mask, %b_n_mask : tensor<16x16xi1>
     %rows_c = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
     %cols_c = tt.expand_dims %offs_n {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
     %rows_c_b = tt.broadcast %rows_c : tensor<16x1xi32> -> tensor<16x16xi32>
@@ -267,7 +274,9 @@ module {
     %c_row_offsets = arith.muli %rows_c_b, %stride_cm : tensor<16x16xi32>
     %c_col_offsets = arith.muli %cols_c_b, %stride_cn : tensor<16x16xi32>
     %c_offsets = arith.addi %c_row_offsets, %c_col_offsets : tensor<16x16xi32>
-    %c_mask = arith.cmpi ult, %rows_c_b, %m_vec : tensor<16x16xi32>
+    %c_m_mask = arith.cmpi ult, %rows_c_b, %m_vec : tensor<16x16xi32>
+    %c_n_mask = arith.cmpi ult, %cols_c_b, %n_vec : tensor<16x16xi32>
+    %c_mask = arith.andi %c_m_mask, %c_n_mask : tensor<16x16xi1>
     %a_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
     %b_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
     %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
@@ -285,18 +294,79 @@ module {
 
 REALISTIC_MATMUL_LOOP_TTIR = """
 module {
-  tt.func public @realistic_matmul_loop_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+  tt.func public @realistic_matmul_loop_kernel(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+                                               %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+                                               %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c2 = arith.constant 2 : index
+    %c16idx = arith.constant 16 : index
+    %c32idx = arith.constant 32 : index
+    %c16 = arith.constant 16 : i32
+    %c32 = arith.constant 32 : i32
     %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
-    %acc = scf.for %i = %c0 to %c2 step %c1 iter_args(%iter = %zero) -> (tensor<16x16xf32>) {
-      scf.yield %iter : tensor<16x16xf32>
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %cols = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %ks = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %rows_a = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %ks_a = tt.expand_dims %ks {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %rows_a_b = tt.broadcast %rows_a : tensor<16x1xi32> -> tensor<16x16xi32>
+    %ks_a_b = tt.broadcast %ks_a : tensor<1x16xi32> -> tensor<16x16xi32>
+    %a_stride = tt.splat %c32 : i32 -> tensor<16x16xi32>
+    %a_row_offsets = arith.muli %rows_a_b, %a_stride : tensor<16x16xi32>
+    %ks_b = tt.expand_dims %ks {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cols_b = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %ks_b_b = tt.broadcast %ks_b : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cols_b_b = tt.broadcast %cols_b : tensor<1x16xi32> -> tensor<16x16xi32>
+    %b_stride = tt.splat %c32 : i32 -> tensor<16x16xi32>
+    %b_col_offsets = arith.muli %cols_b_b, %b_stride : tensor<16x16xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %acc = scf.for %i = %c0 to %c32idx step %c16idx iter_args(%iter = %zero) -> (tensor<16x16xf32>) {
+      %i_i32 = arith.index_cast %i : index to i32
+      %i_a = tt.splat %i_i32 : i32 -> tensor<16x16xi32>
+      %a_k_offsets = arith.addi %i_a, %ks_a_b : tensor<16x16xi32>
+      %a_offsets = arith.addi %a_row_offsets, %a_k_offsets : tensor<16x16xi32>
+      %b_k_offsets = arith.addi %i_a, %ks_b_b : tensor<16x16xi32>
+      %b_offsets = arith.addi %b_col_offsets, %b_k_offsets : tensor<16x16xi32>
+      %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+      %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+      %a = tt.load %a_ptrs : tensor<16x16x!tt.ptr<f16>>
+      %b = tt.load %b_ptrs : tensor<16x16x!tt.ptr<f16>>
+      %next = tt.dot %a, %b, %iter : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+      scf.yield %next : tensor<16x16xf32>
     }
+    %rows_c = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cols_c = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %rows_c_b = tt.broadcast %rows_c : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cols_c_b = tt.broadcast %cols_c : tensor<1x16xi32> -> tensor<16x16xi32>
+    %c_stride = tt.splat %c16 : i32 -> tensor<16x16xi32>
+    %c_row_offsets = arith.muli %rows_c_b, %c_stride : tensor<16x16xi32>
+    %c_offsets = arith.addi %c_row_offsets, %cols_c_b : tensor<16x16xi32>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
+    %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
+    tt.store %c_ptrs, %acc : tensor<16x16x!tt.ptr<f32>>
     tt.return
   }
 }
 """
+
+BOUNDARY_MATMUL_TILE_TTIR = REALISTIC_MATMUL_TILE_TTIR.replace(
+    "realistic_matmul_tile_kernel", "boundary_matmul_tile_kernel").replace(
+        """    %c2 = arith.constant 2 : i32
+    %c16 = arith.constant 16 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    %other = arith.constant dense<0.000000e+00> : tensor<16x16xf16>
+    %pid = tt.get_program_id x : i32
+    %pid_m = arith.remsi %pid, %c2 : i32
+    %pid_n = arith.divsi %pid, %c2 : i32
+    %pid_m_block = arith.muli %pid_m, %c16 : i32
+    %pid_n_block = arith.muli %pid_n, %c16 : i32
+    %pid_m_vec = tt.splat %pid_m_block : i32 -> tensor<16xi32>
+    %pid_n_vec = tt.splat %pid_n_block : i32 -> tensor<16xi32>""",
+        """    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    %other = arith.constant dense<0.000000e+00> : tensor<16x16xf16>
+    %c0_i32 = arith.constant 0 : i32
+    %pid_m_vec = tt.splat %c0_i32 : i32 -> tensor<16xi32>
+    %pid_n_vec = tt.splat %c0_i32 : i32 -> tensor<16xi32>""")
 
 MASKED_ADD_TTIR = """
 module {
@@ -882,6 +952,28 @@ def test_wave_amd_make_wave_lowers_32x32_dot_to_native_wmma_grid(tmp_path, ttir,
     assert wave.count("wave.store") == 32
 
 
+@pytest.mark.parametrize(
+    ("options_dict", "match"),
+    [
+        ({"num_warps": 2}, "multi-warp tile ownership"),
+        ({"num_warps": 1, "num_ctas": 2}, "multi-CTA launch semantics"),
+    ],
+)
+def test_wave_amd_make_wave_rejects_dot_unsupported_scheduling(tmp_path, options_dict, match):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options(options_dict)
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_32X32_TTIR)
+
+    with pytest.raises(NotImplementedError, match=match):
+        backend.make_wave(module, {}, options)
+
+
 def test_wave_amd_make_wave_rejects_dot_k_not_multiple_of_16(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -944,7 +1036,7 @@ def test_wave_amd_make_wave_lowers_realistic_matmul_tile_pattern(tmp_path):
     assert "wave.store" in wave
 
 
-def test_wave_amd_make_wave_rejects_realistic_matmul_k_loop(tmp_path):
+def test_wave_amd_make_wave_lowers_realistic_matmul_k_loop(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
         reason="Wave Python MLIR builder bindings are required",
@@ -953,10 +1045,17 @@ def test_wave_amd_make_wave_rejects_realistic_matmul_k_loop(tmp_path):
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
     options = backend.parse_options({"num_warps": 1})
+    metadata = {}
     module = _parse_ttir(tmp_path, backend, REALISTIC_MATMUL_LOOP_TTIR)
 
-    with pytest.raises(NotImplementedError, match="scf.for K loops"):
-        backend.make_wave(module, {}, options)
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "realistic_matmul_loop_kernel"
+    assert "scf.for" in wave
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
+    assert wave.count("waveamd.fragment_pack") == 2
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
 
 
 def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypatch):
@@ -1559,6 +1658,34 @@ def test_wave_amd_make_hsaco_emits_dot_kernel_elf(tmp_path):
     assert len(hsaco) > 0
 
 
+def _require_wave_amd_runtime(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+
+    from triton.backends import Backend, backends
+
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
+    return torch, target
+
+
 @pytest.mark.parametrize(
     ("m", "n", "k", "kernel_name"),
     [
@@ -1611,6 +1738,175 @@ def test_wave_amd_runtime_launches_dot_matmul_tile(tmp_path, monkeypatch, device
 
     expected = a.to(torch.float32) @ b_matrix.to(torch.float16).to(torch.float32)
     torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_wave_amd_runtime_launches_looped_dot_matmul_tile(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+
+    from triton.backends import Backend, backends
+
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
+
+    m = n = 16
+    k = 32
+    a_matrix = torch.arange(m * k, device=device, dtype=torch.float32).reshape(m, k) / 32.0
+    b_matrix = (torch.arange(k * n, device=device, dtype=torch.float32).reshape(k, n) / 64.0) - 1.0
+    a = a_matrix.to(torch.float16).contiguous()
+    b = b_matrix.to(torch.float16).t().contiguous()
+    c = torch.full((m, n), -999.0, device=device, dtype=torch.float32)
+
+    module_path = tmp_path / "looped_dot_matmul.ttir"
+    module_path.write_text(REALISTIC_MATMUL_LOOP_TTIR)
+    kernel = triton_compiler.compile(
+        str(module_path),
+        target=GPUTarget("wave_amd", target.arch, target.warp_size),
+        options={"num_warps": 1},
+    )
+    kernel[(1, 1, 1)](a, b, c)
+    getattr(torch, device).synchronize()
+
+    expected = a.to(torch.float32) @ b_matrix.to(torch.float16).to(torch.float32)
+    torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(16, 16, 16), (16, 16, 32)])
+def test_wave_amd_e2e_triton_jit_matmul_tile(tmp_path, monkeypatch, device, m, n, k):
+    torch, _ = _require_wave_amd_runtime(tmp_path, monkeypatch, device)
+
+    @triton.jit
+    def matmul_tile_kernel(a, b, c, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        a_ptrs = a + offs_m[:, None] * BLOCK_K + offs_k[None, :]
+        b_ptrs = b + offs_k[:, None] + offs_n[None, :] * BLOCK_K
+        a_tile = tl.load(a_ptrs)
+        b_tile = tl.load(b_ptrs)
+        acc = tl.dot(a_tile, b_tile)
+        c_ptrs = c + offs_m[:, None] * BLOCK_N + offs_n[None, :]
+        tl.store(c_ptrs, acc)
+
+    a_matrix = torch.arange(m * k, device=device, dtype=torch.float32).reshape(m, k) / 32.0
+    b_matrix = (torch.arange(k * n, device=device, dtype=torch.float32).reshape(k, n) / 64.0) - 1.0
+    a = a_matrix.to(torch.float16).contiguous()
+    b = b_matrix.to(torch.float16).t().contiguous()
+    c = torch.full((m, n), -999.0, device=device, dtype=torch.float32)
+
+    matmul_tile_kernel[(1, 1, 1)](a, b, c, BLOCK_M=m, BLOCK_N=n, BLOCK_K=k, num_warps=1)
+    getattr(torch, device).synchronize()
+
+    expected = a.to(torch.float32) @ b_matrix.to(torch.float16).to(torch.float32)
+    torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.xfail(reason="real JIT scf.for matmul still needs AMDGCN full-address support for loop-IV expressions",
+                   strict=False)
+def test_wave_amd_e2e_triton_jit_looped_matmul(tmp_path, monkeypatch, device):
+    torch, _ = _require_wave_amd_runtime(tmp_path, monkeypatch, device)
+
+    @triton.jit
+    def looped_matmul_kernel(a, b, c, k_tiles):
+        offs_m = tl.arange(0, 16)
+        offs_n = tl.arange(0, 16)
+        offs_k = tl.arange(0, 16)
+        acc = tl.zeros((16, 16), dtype=tl.float32)
+        for k_tile in range(0, k_tiles):
+            k_base = k_tile * 16
+            a_ptrs = a + offs_m[:, None] * 32 + (k_base + offs_k)[None, :]
+            b_ptrs = b + (k_base + offs_k)[:, None] + offs_n[None, :] * 32
+            a_tile = tl.load(a_ptrs)
+            b_tile = tl.load(b_ptrs)
+            acc += tl.dot(a_tile, b_tile)
+        c_ptrs = c + offs_m[:, None] * 16 + offs_n[None, :]
+        tl.store(c_ptrs, acc)
+
+    m = n = 16
+    k = 32
+    a_matrix = torch.arange(m * k, device=device, dtype=torch.float32).reshape(m, k) / 32.0
+    b_matrix = (torch.arange(k * n, device=device, dtype=torch.float32).reshape(k, n) / 64.0) - 1.0
+    a = a_matrix.to(torch.float16).contiguous()
+    b = b_matrix.to(torch.float16).t().contiguous()
+    c = torch.full((m, n), -999.0, device=device, dtype=torch.float32)
+
+    looped_matmul_kernel[(1, 1, 1)](a, b, c, 2, num_warps=1)
+    getattr(torch, device).synchronize()
+
+    expected = a.to(torch.float32) @ b_matrix.to(torch.float16).to(torch.float32)
+    torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_wave_amd_runtime_launches_realistic_matmul_tile_with_boundary_masks(tmp_path, monkeypatch, device):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    if device != "cuda":
+        pytest.skip("Wave AMD runtime smoke requires a CUDA/HIP torch device")
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("Wave AMD runtime smoke requires ROCm PyTorch and an active HIP device")
+
+    try:
+        active_driver = wave_driver.WaveAMDDriver()
+        target = active_driver.get_current_target()
+    except Exception as exc:
+        pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+
+    from triton.backends import Backend, backends
+
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
+    monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
+    monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
+
+    m, n, k = 13, 11, 9
+    a_ld = b_ld = c_ld = 16
+    a_full = torch.zeros((16, a_ld), device=device, dtype=torch.float16)
+    b_matrix_full = torch.zeros((b_ld, 16), device=device, dtype=torch.float16)
+    a_values = (torch.arange(m * k, device=device, dtype=torch.float32).reshape(m, k) / 32.0).to(torch.float16)
+    b_values = ((torch.arange(k * n, device=device, dtype=torch.float32).reshape(k, n) / 64.0) - 1.0).to(torch.float16)
+    a_full[:m, :k] = a_values
+    b_matrix_full[:k, :n] = b_values
+    b_physical = b_matrix_full.t().contiguous()
+    c = torch.full((16, c_ld), -999.0, device=device, dtype=torch.float32)
+
+    pytest.xfail("masked dot fragment loads still require full-address support for lane mod/floor expressions")
+
+    module_path = tmp_path / "realistic_matmul_tile.ttir"
+    module_path.write_text(BOUNDARY_MATMUL_TILE_TTIR)
+    kernel = triton_compiler.compile(
+        str(module_path),
+        target=GPUTarget("wave_amd", target.arch, target.warp_size),
+        options={"num_warps": 1},
+    )
+    kernel[(1, 1, 1)](a_full, b_physical, c, m, n, k, a_ld, 1, 1, b_ld, c_ld, 1)
+    getattr(torch, device).synchronize()
+
+    expected = a_values.to(torch.float32) @ b_values.to(torch.float32)
+    torch.testing.assert_close(c[:m, :n], expected, rtol=1e-2, atol=1e-2)
+    assert torch.all(c[m:, :] == -999.0)
+    assert torch.all(c[:, n:] == -999.0)
 
 
 def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, device):

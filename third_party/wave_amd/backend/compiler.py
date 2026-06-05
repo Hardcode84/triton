@@ -54,6 +54,7 @@ class WaveAMDOptions:
     num_ctas: int = 1
     extern_libs: dict = None
     debug: bool = False
+    instrumentation_mode: str = ""
     sanitize_overflow: bool = True
     arch: str = None
     supported_fp8_dtypes: Tuple[str] = ("fp8e4nv", "fp8e5", "fp8e5b16", "fp8e4b8")
