@@ -13,7 +13,6 @@ triton_compiler = pytest.importorskip("triton.compiler.compiler")
 driver_api = pytest.importorskip("triton.backends.driver")
 wave_compiler = pytest.importorskip("triton.backends.wave_amd.compiler")
 wave_emission = pytest.importorskip("triton.backends.wave_amd.emission")
-wave_gemm_analysis = pytest.importorskip("triton.backends.wave_amd.gemm_analysis")
 wave_lowering = pytest.importorskip("triton.backends.wave_amd.lowering")
 wave_pipeline = pytest.importorskip("triton.backends.wave_amd.pipeline")
 wave_driver = pytest.importorskip("triton.backends.wave_amd.driver")
@@ -591,107 +590,31 @@ def _ttgir_preview_text(tmp_path, ttir, options_dict=None):
     return metadata["wave_ttgir_preview"]
 
 
-def _wave_gemm_analysis(tmp_path, ttir):
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    module = _parse_ttir(tmp_path, backend, ttir)
-
-    return wave_gemm_analysis.analyze_wave_gemm(module)
-
-
-def test_wave_amd_gemm_analysis_classifies_static_dot_roles_and_pointers(tmp_path):
-    analysis = _wave_gemm_analysis(tmp_path, DOT_MATMUL_TTIR)
-
-    assert analysis["entry"] == "dot_kernel"
-    assert len(analysis["dots"]) == 1
-    dot = analysis["dots"][0]
-    assert [operand["role"] for operand in dot["operands"]] == ["A", "B"]
-    assert [operand["producer"] for operand in dot["operands"]] == ["tt.load", "tt.load"]
-    assert dot["operands"][0]["tensor"] == {"shape": [16, 16], "elem_type": "f16", "is_pointer": False}
-    assert dot["operands"][1]["tensor"] == {"shape": [16, 16], "elem_type": "f16", "is_pointer": False}
-    assert dot["result"] == {"shape": [16, 16], "elem_type": "f32", "is_pointer": False}
-
-    a_pointer = dot["operands"][0]["pointer"]
-    b_pointer = dot["operands"][1]["pointer"]
-    c_pointer = dot["store"]
-    assert a_pointer["classification"] == "dense_static"
-    assert a_pointer["expected_affine"] == {"const": 0, "coeffs": [16, 1]}
-    assert a_pointer["actual_affine"] == {"const": 0, "coeffs": [16, 1]}
-    assert b_pointer["classification"] == "dense_static"
-    assert b_pointer["expected_affine"] == {"const": 0, "coeffs": [1, 16]}
-    assert b_pointer["actual_affine"] == {"const": 0, "coeffs": [1, 16]}
-    assert c_pointer["classification"] == "dense_static"
-    assert c_pointer["expected_affine"] == {"const": 0, "coeffs": [16, 1]}
-    assert c_pointer["actual_affine"] == {"const": 0, "coeffs": [16, 1]}
-
-
-def test_wave_amd_gemm_analysis_marks_runtime_stride_pointers_dynamic(tmp_path):
-    analysis = _wave_gemm_analysis(tmp_path, REALISTIC_MATMUL_TILE_TTIR)
-
-    dot = analysis["dots"][0]
-    assert [operand["role"] for operand in dot["operands"]] == ["A", "B"]
-    assert dot["operands"][0]["pointer"]["classification"] == "symbolic_or_dynamic"
-    assert dot["operands"][1]["pointer"]["classification"] == "symbolic_or_dynamic"
-    assert dot["store"]["classification"] == "symbolic_or_dynamic"
-    assert dot["operands"][0]["pointer"]["expected_affine"] == {"const": 0, "coeffs": [16, 1]}
-    assert dot["operands"][1]["pointer"]["expected_affine"] == {"const": 0, "coeffs": [1, 16]}
-    assert dot["store"]["expected_affine"] == {"const": 0, "coeffs": [16, 1]}
-
-
-def test_wave_amd_make_wave_emits_gemm_analysis_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr(wave_compiler, "lower_ttir_to_wave_mlir", lambda src, options: ("module {}", "dot_kernel"))
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
-    metadata = {}
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert wave == "module {}"
-    assert metadata["name"] == "dot_kernel"
-    dot = metadata["wave_gemm_analysis"]["dots"][0]
-    assert [operand["role"] for operand in dot["operands"]] == ["A", "B"]
-    assert dot["store"]["role"] == "C"
-
-
-def test_wave_amd_ttgir_preview_emits_gemm_analysis_metadata(tmp_path):
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1, "enable_ttgir_preview": True})
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
-    metadata = {}
-
-    backend.make_ttgir_preview(module, metadata, options)
-
-    analysis = metadata["wave_ttgir_gemm_analysis"]
-    dot = analysis["dots"][0]
-    assert analysis["entry"] == "dot_kernel"
-    assert [operand["role"] for operand in dot["operands"]] == ["A", "B"]
-    assert [operand["producer"] for operand in dot["operands"]] == ["tt.load", "tt.load"]
-    assert dot["store"]["role"] == "C"
-    assert "wave_ttgir_preview" in metadata
-
-
 @pytest.mark.parametrize(
-    ("ttir", "kernel_name", "expected_min_blocked", "expected_min_converts"),
+    ("ttir", "kernel_name", "expected_min_blocked"),
     [
-        (DOT_MATMUL_TTIR, "dot_kernel", 5, 6),
-        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 6, 10),
-        (REALISTIC_MATMUL_TILE_TTIR, "realistic_matmul_tile_kernel", 6, 11),
+        (DOT_MATMUL_TTIR, "dot_kernel", 3),
+        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 3),
+        (REALISTIC_MATMUL_TILE_TTIR, "realistic_matmul_tile_kernel", 1),
     ],
 )
-def test_wave_amd_ttgir_preview_exposes_matmul_layout_facts(tmp_path, ttir, kernel_name, expected_min_blocked,
-                                                            expected_min_converts):
+def test_wave_amd_ttgir_preview_accelerates_matmul_to_amd_wmma_encoding(tmp_path, ttir, kernel_name,
+                                                                        expected_min_blocked):
     ttgir = _ttgir_preview_text(tmp_path, ttir)
 
     assert f"@{kernel_name}" in ttgir
     assert "ttg.target = \"hip:gfx1100\"" in ttgir
     assert "\"ttg.num-warps\" = 1" in ttgir
     assert "\"ttg.threads-per-warp\" = 32" in ttgir
+    assert ttgir.count("#ttg.amd_wmma") == 1
+    assert "#mma = #ttg.amd_wmma" in ttgir
+    assert "version = 1" in ttgir
+    assert "isTranspose = true" in ttgir
+    assert "#ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>" in ttgir
+    assert "#ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>" in ttgir
     assert ttgir.count("#ttg.blocked") >= expected_min_blocked
     assert ttgir.count("#ttg.dot_op") >= 4
-    assert ttgir.count("ttg.convert_layout") >= expected_min_converts
+    assert ttgir.count("ttg.convert_layout") >= 3
     assert ttgir.count("tt.load") == 2
     assert ttgir.count("tt.dot") == 1
     assert ttgir.count("tt.store") == 1
@@ -705,6 +628,7 @@ def test_wave_amd_ttgir_preview_preserves_matmul_k_loop_structure(tmp_path):
     assert ttgir.count("tt.load") == 2
     assert ttgir.count("tt.dot") == 1
     assert ttgir.count("tt.store") == 1
+    assert "#ttg.amd_wmma" in ttgir
     assert "#ttg.dot_op" in ttgir
     assert "ttg.convert_layout" in ttgir
 
@@ -1070,9 +994,6 @@ def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
     wave = backend.make_wave(module, metadata, options)
 
     assert metadata["name"] == "dot_kernel"
-    assert metadata["wave_gemm_analysis"]["dots"][0]["operands"][0]["role"] == "A"
-    assert metadata["wave_gemm_analysis"]["dots"][0]["operands"][1]["role"] == "B"
-    assert metadata["wave_gemm_analysis"]["dots"][0]["store"]["role"] == "C"
     assert "func.func @dot_kernel" in wave
     assert "wave.lds_size" not in wave
     assert "wave.index_expr" in wave

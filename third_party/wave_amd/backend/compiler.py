@@ -9,7 +9,6 @@ from typing import Any, Dict, Tuple
 from triton import knobs
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn, _packaged_wave_translate
-from triton.backends.wave_amd.gemm_analysis import analyze_wave_gemm
 from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
 from triton.backends.wave_amd.pipeline import clone_module_for_preview, run_wave_ttgir_preview_pipeline, \
     run_wave_ttir_pipeline
@@ -66,6 +65,8 @@ class WaveAMDOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     enable_ttgir_preview: bool = False
+    matrix_instr_nonkdim: int = 0
+    kpack: int = 1
     backend_name: str = "wave_amd"
 
     def __post_init__(self):
@@ -130,7 +131,6 @@ class WaveAMDBackend(BaseBackend):
 
     @staticmethod
     def make_wave(src, metadata, options):
-        metadata["wave_gemm_analysis"] = analyze_wave_gemm(src)
         wave_mlir, name = lower_ttir_to_wave_mlir(src, options)
         metadata["name"] = name
         metadata["shared"] = 0
@@ -146,7 +146,6 @@ class WaveAMDBackend(BaseBackend):
         preview = clone_module_for_preview(src)
         run_wave_ttgir_preview_pipeline(preview, options)
         metadata["wave_ttgir_preview"] = str(preview)
-        metadata["wave_ttgir_gemm_analysis"] = analyze_wave_gemm(preview)
         return src
 
     @staticmethod
