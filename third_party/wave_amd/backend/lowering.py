@@ -273,6 +273,7 @@ class _TTIRToWaveLowerer:
         self._workitem_value = None
         self._workgroup_values: Dict[int, object] = {}
         self.dot_operand_roles: Dict[int, int] = {}
+        self.producers_by_result: Dict[int, object] = {}
         self.all_entry_ops: Tuple[object, ...] = ()
         self.ops_by_region: Dict[int, Tuple[object, ...]] = {}
         self.loop_yields: Dict[int, _Value] = {}
@@ -309,6 +310,7 @@ class _TTIRToWaveLowerer:
                 nonlocal entry_ops
                 if op.get_str_attr("sym_name") == entry_name:
                     self.all_entry_ops = tuple(pending_body_ops)
+                    self.producers_by_result = self._collect_result_producers(pending_body_ops)
                     self.ops_by_region = self._group_ops_by_parent_region(pending_body_ops)
                     entry_ops = list(self.ops_by_region.get(op.get_region(0).id(), ()))
                 pending_body_ops.clear()
@@ -317,6 +319,13 @@ class _TTIRToWaveLowerer:
 
         self.module.walk(visit)
         return entry_ops
+
+    def _collect_result_producers(self, ops: Sequence[object]) -> Dict[int, object]:
+        producers = {}
+        for op in ops:
+            for result_index in range(op.get_num_results()):
+                producers[op.get_result(result_index).id()] = op
+        return producers
 
     def _group_ops_by_parent_region(self, ops: Sequence[object]) -> Dict[int, Tuple[object, ...]]:
         grouped = {}
@@ -339,10 +348,18 @@ class _TTIRToWaveLowerer:
                 continue
             for role in (0, 1):
                 value_id = op.get_operand(role).id()
-                existing = self.dot_operand_roles.get(value_id)
-                if existing is not None and existing != role:
-                    raise NotImplementedError("wave_amd tt.dot lowering cannot reuse one value as both dot operands")
-                self.dot_operand_roles[value_id] = role
+                self._record_dot_operand_role(value_id, role)
+                producer = self.producers_by_result.get(value_id)
+                while producer is not None and producer.get_name() == "ttg.convert_layout":
+                    value_id = producer.get_operand(0).id()
+                    self._record_dot_operand_role(value_id, role)
+                    producer = self.producers_by_result.get(value_id)
+
+    def _record_dot_operand_role(self, value_id: int, role: int) -> None:
+        existing = self.dot_operand_roles.get(value_id)
+        if existing is not None and existing != role:
+            raise NotImplementedError("wave_amd tt.dot lowering cannot reuse one value as both dot operands")
+        self.dot_operand_roles[value_id] = role
 
     def _bind_arguments(self, func_op, wave_args) -> None:
         signatures = self.module.get_function_signature(func_op)
@@ -420,6 +437,8 @@ class _TTIRToWaveLowerer:
             self._lower_load(op)
         elif name == "tt.store":
             self._lower_store(op)
+        elif name == "ttg.convert_layout":
+            self._lower_convert_layout(op)
         elif name == "scf.for":
             self._lower_for(op)
         elif name == "scf.yield":
@@ -705,6 +724,40 @@ class _TTIRToWaveLowerer:
                     mask=_MaskPayload(mask_id=src.mask.mask_id),
                 )
         self._set_result(op, state)
+
+    def _lower_convert_layout(self, op) -> None:
+        src = self._value(op.get_operand(0))
+        info = self._result_tensor_info(op)
+
+        # TTGIR layout conversions encode Triton's SIMT distribution contract.
+        # Wave lowering owns its own subgroup representation, so conversions are
+        # mechanical value forwards except when the forwarded value carries a
+        # matrix fragment payload for tt.dot.
+        self._set_result(
+            op,
+            _Value(
+                elem_type=src.elem_type if src.elem_type is not None else (None if info is None else info.elem_type),
+                layout=src.layout,
+                shape=src.shape if src.shape is not None else (None if info is None else info.shape),
+                lanes=_LanePayload(wave=src.lanes.wave, waves=src.lanes.waves),
+                dot=_DotPayload(fragment=src.dot.fragment, fragments=src.dot.fragments, dot_grid=src.dot.dot_grid),
+                constant=_ConstantPayload(const=src.constant.const, splat_const=src.constant.splat_const),
+                symbolic=_SymbolicPayload(affine=src.symbolic.affine, expr=src.symbolic.expr, exprs=src.symbolic.exprs,
+                                          bindings=src.symbolic.bindings,
+                                          bindings_by_wave=src.symbolic.bindings_by_wave,
+                                          sym_index=src.symbolic.sym_index, coord_axis=src.symbolic.coord_axis,
+                                          coord_start=src.symbolic.coord_start),
+                indexing=_IndexPayload(index=src.indexing.index, indexes=src.indexing.indexes),
+                memory=_MemoryPayload(token=src.memory.token, tokens=src.memory.tokens),
+                pointer=_PointerPayload(ptr_base=src.pointer.ptr_base, ptr_offset_affine=src.pointer.ptr_offset_affine,
+                                        ptr_dot_layout=src.pointer.ptr_dot_layout),
+                mask=_MaskPayload(mask_id=src.mask.mask_id, mask_wave=src.mask.mask_wave,
+                                  mask_waves=src.mask.mask_waves, mask_components=src.mask.mask_components,
+                                  other_wave=src.mask.other_wave, other_waves=src.mask.other_waves,
+                                  other_splat_const=src.mask.other_splat_const, cmpi_predicate=src.mask.cmpi_predicate,
+                                  cmpi_lhs=src.mask.cmpi_lhs, cmpi_rhs=src.mask.cmpi_rhs),
+            ),
+        )
 
     def _lower_binary(self, op, expr_builder, wave_builder, affine_builder=None, symbolic_builder=None) -> None:
         lhs = self._value(op.get_operand(0))

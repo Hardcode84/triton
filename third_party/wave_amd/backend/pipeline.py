@@ -122,7 +122,7 @@ def clone_module_for_preview(mod, suffix: str = ".ttir"):
         return cloned
 
 
-def add_wave_ttgir_preview_passes(pm, options) -> None:
+def add_wave_ttgir_passes(pm, options) -> None:
     passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
                                        options.num_ctas)
     passes.ttgpuir.add_coalesce(pm)
@@ -134,6 +134,18 @@ def add_wave_ttgir_preview_passes(pm, options) -> None:
     passes.ttgpuir.add_remove_layout_conversions(pm)
     passes.common.add_canonicalizer(pm)
     passes.common.add_cse(pm)
+
+
+def run_wave_ttgir_pipeline(mod, options, label: str = "wave_amd_make_ttgir"):
+    pm = ir.pass_manager(mod.context)
+    pm.enable_debug()
+    add_wave_ttgir_passes(pm, options)
+    pm.run(mod, label)
+    return mod
+
+
+def add_wave_ttgir_preview_passes(pm, options) -> None:
+    add_wave_ttgir_passes(pm, options)
 
 
 def run_wave_ttgir_preview_pipeline(mod, options, label: str = "wave_amd_ttgir_preview"):

@@ -524,6 +524,7 @@ def test_wave_amd_backend_skeleton():
     assert backend.get_target_name(options) == "wave_amd:gfx1100"
     assert options.backend_name == "wave_amd"
     assert options.warp_size == 32
+    assert not options.enable_ttgir_wave_lowering
     assert backend.pack_metadata(SimpleNamespace(num_warps=4, num_ctas=1)) == (4, 1, 0)
 
     stages = {}
@@ -534,6 +535,11 @@ def test_wave_amd_backend_skeleton():
     preview_stages = {}
     backend.add_stages(preview_stages, preview_options, Language.TRITON)
     assert list(preview_stages) == ["ttir", "ttgir_preview", "wave", "amdgcn", "hsaco"]
+
+    ttgir_options = backend.parse_options({"enable_ttgir_wave_lowering": True})
+    ttgir_stages = {}
+    backend.add_stages(ttgir_stages, ttgir_options, Language.TRITON)
+    assert list(ttgir_stages) == ["ttir", "ttgir", "wave", "amdgcn", "hsaco"]
 
 
 def test_wave_amd_pipeline_records_safe_ttir_cleanup_and_ttgir_reuse_plan():
@@ -998,6 +1004,30 @@ def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
     assert "wave.lds_size" not in wave
     assert "wave.index_expr" in wave
     assert "waveamd.buffer.range_bytes" in wave
+    assert "waveamd.fragment_pack" in wave
+    assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
+
+
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_to_native_wmma(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1, "enable_ttgir_wave_lowering": True})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
+
+    backend.make_ttgir(module, metadata, options)
+    assert "#ttg.amd_wmma" in str(module)
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "dot_kernel"
+    assert "func.func @dot_kernel" in wave
     assert "waveamd.fragment_pack" in wave
     assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
     assert "waveamd.fragment_unpack" in wave

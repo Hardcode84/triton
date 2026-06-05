@@ -11,7 +11,7 @@ from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn, _packaged_wave_translate
 from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
 from triton.backends.wave_amd.pipeline import clone_module_for_preview, run_wave_ttgir_preview_pipeline, \
-    run_wave_ttir_pipeline
+    run_wave_ttgir_pipeline, run_wave_ttir_pipeline
 
 
 def _warp_size_for_arch(arch: str) -> int:
@@ -65,6 +65,7 @@ class WaveAMDOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     enable_ttgir_preview: bool = False
+    enable_ttgir_wave_lowering: bool = False
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     backend_name: str = "wave_amd"
@@ -130,6 +131,10 @@ class WaveAMDBackend(BaseBackend):
         return run_wave_ttir_pipeline(mod)
 
     @staticmethod
+    def make_ttgir(src, metadata, options):
+        return run_wave_ttgir_pipeline(src, options)
+
+    @staticmethod
     def make_wave(src, metadata, options):
         wave_mlir, name = lower_ttir_to_wave_mlir(src, options)
         metadata["name"] = name
@@ -162,6 +167,8 @@ class WaveAMDBackend(BaseBackend):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         if options.enable_ttgir_preview:
             stages["ttgir_preview"] = lambda src, metadata: self.make_ttgir_preview(src, metadata, options)
+        if options.enable_ttgir_wave_lowering:
+            stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
