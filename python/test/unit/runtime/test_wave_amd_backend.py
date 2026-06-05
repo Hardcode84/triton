@@ -953,13 +953,13 @@ def test_wave_amd_make_wave_lowers_32x32_dot_to_native_wmma_grid(tmp_path, ttir,
 
 
 @pytest.mark.parametrize(
-    ("options_dict", "match"),
+    ("options_dict", "expected_marker"),
     [
-        ({"num_warps": 2}, "multi-warp tile ownership"),
-        ({"num_warps": 1, "num_ctas": 2}, "multi-CTA launch semantics"),
+        ({"num_warps": 2}, "wave.workitem_id 0"),
+        ({"num_warps": 1, "num_ctas": 2}, "wave.workgroup_id 0"),
     ],
 )
-def test_wave_amd_make_wave_rejects_dot_unsupported_scheduling(tmp_path, options_dict, match):
+def test_wave_amd_make_wave_lowers_dot_scheduled_across_workers(tmp_path, options_dict, expected_marker):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
         reason="Wave Python MLIR builder bindings are required",
@@ -968,10 +968,16 @@ def test_wave_amd_make_wave_rejects_dot_unsupported_scheduling(tmp_path, options
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
     options = backend.parse_options(options_dict)
+    metadata = {}
     module = _parse_ttir(tmp_path, backend, DOT_MATMUL_32X32_TTIR)
 
-    with pytest.raises(NotImplementedError, match=match):
-        backend.make_wave(module, {}, options)
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "dot_32x32_kernel"
+    assert expected_marker in wave
+    assert wave.count("wave.where") >= 4
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 4
+    assert wave.count("wave.store") == 32
 
 
 def test_wave_amd_make_wave_rejects_dot_k_not_multiple_of_16(tmp_path):
@@ -1658,6 +1664,37 @@ def test_wave_amd_make_hsaco_emits_dot_kernel_elf(tmp_path):
     assert len(hsaco) > 0
 
 
+@pytest.mark.parametrize("options_dict", [
+    {"num_warps": 2},
+    {"num_warps": 1, "num_ctas": 2},
+])
+def test_wave_amd_make_hsaco_emits_scheduled_dot_kernel_elf(tmp_path, options_dict):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+    pytest.importorskip("triton._C.libtriton.wave_amd")
+    pytest.importorskip("triton._C.libtriton.amd")
+    wave_translate = wave_emission._packaged_wave_translate()
+    if not wave_translate.is_file():
+        pytest.skip("packaged wave-translate is required")
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options(options_dict)
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_32X32_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+    amdgcn = backend.make_amdgcn(wave, metadata, options)
+    hsaco = backend.make_hsaco(amdgcn, metadata, options)
+
+    assert metadata["name"] == "dot_32x32_kernel"
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert len(hsaco) > 0
+
+
 def _require_wave_amd_runtime(tmp_path, monkeypatch, device):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -1788,8 +1825,13 @@ def test_wave_amd_runtime_launches_looped_dot_matmul_tile(tmp_path, monkeypatch,
     torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize(("m", "n", "k"), [(16, 16, 16), (16, 16, 32)])
-def test_wave_amd_e2e_triton_jit_matmul_tile(tmp_path, monkeypatch, device, m, n, k):
+@pytest.mark.parametrize(("m", "n", "k", "num_warps"), [
+    (16, 16, 16, 1),
+    (16, 16, 32, 1),
+    (32, 32, 16, 4),
+    (32, 32, 32, 4),
+])
+def test_wave_amd_e2e_triton_jit_matmul_tile(tmp_path, monkeypatch, device, m, n, k, num_warps):
     torch, _ = _require_wave_amd_runtime(tmp_path, monkeypatch, device)
 
     @triton.jit
@@ -1811,7 +1853,7 @@ def test_wave_amd_e2e_triton_jit_matmul_tile(tmp_path, monkeypatch, device, m, n
     b = b_matrix.to(torch.float16).t().contiguous()
     c = torch.full((m, n), -999.0, device=device, dtype=torch.float32)
 
-    matmul_tile_kernel[(1, 1, 1)](a, b, c, BLOCK_M=m, BLOCK_N=n, BLOCK_K=k, num_warps=1)
+    matmul_tile_kernel[(1, 1, 1)](a, b, c, BLOCK_M=m, BLOCK_N=n, BLOCK_K=k, num_warps=num_warps)
     getattr(torch, device).synchronize()
 
     expected = a.to(torch.float32) @ b_matrix.to(torch.float16).to(torch.float32)
@@ -1880,8 +1922,8 @@ def test_wave_amd_runtime_launches_realistic_matmul_tile_with_boundary_masks(tmp
 
     m, n, k = 13, 11, 9
     a_ld = b_ld = c_ld = 16
-    a_full = torch.zeros((16, a_ld), device=device, dtype=torch.float16)
-    b_matrix_full = torch.zeros((b_ld, 16), device=device, dtype=torch.float16)
+    a_full = torch.full((16, a_ld), 3.0, device=device, dtype=torch.float16)
+    b_matrix_full = torch.full((b_ld, 16), -2.0, device=device, dtype=torch.float16)
     a_values = (torch.arange(m * k, device=device, dtype=torch.float32).reshape(m, k) / 32.0).to(torch.float16)
     b_values = ((torch.arange(k * n, device=device, dtype=torch.float32).reshape(k, n) / 64.0) - 1.0).to(torch.float16)
     a_full[:m, :k] = a_values

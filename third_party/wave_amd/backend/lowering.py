@@ -14,6 +14,12 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
+def _log2_int(value: int) -> int:
+    if not _is_power_of_two(value):
+        raise ValueError(f"expected a power of two, got {value}")
+    return value.bit_length() - 1
+
+
 @dataclass(frozen=True)
 class _TensorInfo:
     shape: Tuple[int, ...]
@@ -174,6 +180,9 @@ class _Value:
     layout: Optional[_BlockedLayout] = None
     shape: Optional[Tuple[int, ...]] = None
     sym_index: Optional[_SymbolicIndex] = None
+    cmpi_predicate: Optional[str] = None
+    cmpi_lhs: Optional["_Value"] = None
+    cmpi_rhs: Optional["_Value"] = None
     coord_axis: Optional[int] = None
     coord_start: int = 0
 
@@ -906,10 +915,22 @@ class _TTIRToWaveLowerer:
                     elem_type="i1",
                     layout=layout,
                     shape=info.shape,
+                    cmpi_predicate=predicate,
+                    cmpi_lhs=lhs,
+                    cmpi_rhs=rhs,
                 ),
             )
             return
-        self._set_result(op, _Value(wave=self.func.cmpi(predicate, lhs.wave, rhs.wave), elem_type="i1"))
+        self._set_result(
+            op,
+            _Value(
+                wave=self.func.cmpi(predicate, lhs.wave, rhs.wave),
+                elem_type="i1",
+                cmpi_predicate=predicate,
+                cmpi_lhs=lhs,
+                cmpi_rhs=rhs,
+            ),
+        )
 
     def _lower_select(self, op) -> None:
         condition = self._value(op.get_operand(0))
@@ -1285,10 +1306,6 @@ class _TTIRToWaveLowerer:
 
     def _dot_config(self, lhs: Optional[_TensorInfo], rhs: Optional[_TensorInfo],
                     result: Optional[_TensorInfo]) -> _DotConfig:
-        if self.num_warps != 1:
-            raise NotImplementedError("wave_amd tt.dot multi-warp tile ownership is not yet implemented")
-        if self.num_ctas != 1:
-            raise NotImplementedError("wave_amd tt.dot multi-CTA launch semantics are not yet implemented")
         if lhs is None or rhs is None or result is None:
             raise NotImplementedError("wave_amd tt.dot requires ranked tensor operands and result")
         if lhs.elem_type != "f16" or rhs.elem_type != "f16" or result.elem_type != "f32":
@@ -1305,7 +1322,14 @@ class _TTIRToWaveLowerer:
             raise NotImplementedError("wave_amd tt.dot N dimension must be a positive multiple of 16")
         if k < 16 or k % 16 != 0:
             raise NotImplementedError("wave_amd tt.dot K dimension must be a positive multiple of 16")
-        return _DotConfig(m=m, n=n, k=k, m_tiles=m // 16, n_tiles=n // 16, k_steps=k // 16)
+        m_tiles = m // 16
+        n_tiles = n // 16
+        output_tiles = m_tiles * n_tiles
+        workers = self.num_warps * self.num_ctas
+        if output_tiles % workers != 0:
+            raise NotImplementedError(
+                "wave_amd tt.dot requires output 16x16 tile count to be divisible by num_warps * num_ctas")
+        return _DotConfig(m=m, n=n, k=k, m_tiles=m_tiles, n_tiles=n_tiles, k_steps=k // 16)
 
     def _dot_operand_grid(self, value: _Value, role: int, config: _DotConfig) -> Optional[_DotFragmentGrid]:
         if value.dot_grid is None:
@@ -1418,7 +1442,7 @@ class _TTIRToWaveLowerer:
                     bindings = {lane_sym: lane_mod}
                 index = self.func.index_expr(index_expr, bindings, index_type)
                 frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
-                fragment, token = self._emit_masked_dot_fragment_load(frag_ptr, role, info.elem_type, mask)
+                fragment, token = self._emit_masked_dot_fragment_load(frag_ptr, role, info.elem_type, mask, tile, step)
                 fragments.append(fragment)
                 tokens.append(token)
         return _DotFragmentGrid(
@@ -1430,15 +1454,86 @@ class _TTIRToWaveLowerer:
             tokens=tuple(tokens),
         )
 
-    def _emit_masked_dot_fragment_load(self, frag_ptr, role: int, elem_type: str, mask: Optional[_Value] = None):
+    def _emit_masked_dot_fragment_load(self, frag_ptr, role: int, elem_type: str, mask: Optional[_Value] = None,
+                                       tile: int = 0, step: int = 0):
         frag_type = self._dot_fragment_type(role=role, elem_type=elem_type)
         if mask is None:
             return self.func.fragment_load(frag_ptr, frag_type)
-        # Fragment load lanes use the WMMA fragment layout, which differs from
-        # the TTIR tensor layout used to materialize mask vectors. Current e2e
-        # coverage pads inactive A/B elements with zeros and relies on masked
-        # stores for output bounds.
-        return self.func.fragment_load(frag_ptr, frag_type)
+        frag = self.dsl.FragmentType(frag_type)
+        tuple_type = self.dsl.simd_type(self.dsl.vector_type(frag.registers, self.dsl.i32()), width=frag.wave_size)
+        regs, token = self.func.load(frag_ptr, tuple_type)
+        lane_mod = self._lane_mod_index()
+        lane_sym = self._sym("lane_mod")
+        coord_bindings = {lane_sym: lane_mod}
+        value_type = self.dsl.simd_type(self.dsl.i32(), self.width)
+        zero = self._splat_i32(0)
+        low_half = self._splat_i32(0x0000FFFF)
+        high_half = self._splat_i32(-0x00010000)
+        masked_regs = []
+        for register in range(frag.registers):
+            if role == 0:
+                low_coords = (tile * 16 + lane_sym, step * 16 + register * 2)
+                high_coords = (tile * 16 + lane_sym, step * 16 + register * 2 + 1)
+            else:
+                low_coords = (step * 16 + register * 2, tile * 16 + lane_sym)
+                high_coords = (step * 16 + register * 2 + 1, tile * 16 + lane_sym)
+            value = self.dsl.wave.ExtractOp(value_type, regs, register).result
+            low_conditions = self._mask_conditions_for_coords(mask, low_coords, coord_bindings, register)
+            high_conditions = self._mask_conditions_for_coords(mask, high_coords, coord_bindings, register)
+            if low_conditions or high_conditions:
+                valid_low = self._combine_mask_conditions(low_conditions) if low_conditions else None
+                valid_high = self._combine_mask_conditions(high_conditions) if high_conditions else None
+                keep_low = self.func.select(valid_low, low_half, zero) if valid_low is not None else low_half
+                keep_high = self.func.select(valid_high, high_half, zero) if valid_high is not None else high_half
+                keep = self.func.binary("ori", keep_low, keep_high)
+                value = self.func.binary("andi", value, keep)
+            masked_regs.append(value)
+        packed = self.dsl.wave.PackOp(tuple_type, masked_regs).result
+        return self.func.fragment_pack(packed, frag_type), token
+
+    def _mask_conditions_for_coords(self, mask: _Value, coords: Tuple[object, ...],
+                                    coord_bindings: Dict[object, object], register: int) -> Tuple[object, ...]:
+        if mask.mask_components:
+            conditions = []
+            for component in mask.mask_components:
+                conditions.extend(self._mask_conditions_for_coords(component, coords, coord_bindings, register))
+            return tuple(conditions)
+        if mask.cmpi_predicate is not None and mask.cmpi_lhs is not None and mask.cmpi_rhs is not None:
+            lhs = self._materialize_symbolic_value_at_coords(mask.cmpi_lhs, coords, coord_bindings)
+            rhs = self._materialize_symbolic_value_at_coords(mask.cmpi_rhs, coords, coord_bindings)
+            if lhs is not None and rhs is not None:
+                return (self.func.cmpi(mask.cmpi_predicate, lhs, rhs), )
+        return self._mask_conditions(mask, register)
+
+    def _materialize_symbolic_value_at_coords(self, value: _Value, coords: Tuple[object, ...],
+                                              coord_bindings: Dict[object, object]):
+        sym_index = value.sym_index
+        if sym_index is not None:
+            if len(sym_index.coeffs) == 0:
+                expr = sym_index.const
+            elif len(sym_index.coeffs) == len(coords):
+                expr = sym_index.const
+                for coord, coeff in zip(coords, sym_index.coeffs):
+                    expr = expr + coord * coeff
+            else:
+                return None
+            return self._materialize_mask_index_expr(expr, {**coord_bindings, **sym_index.bindings})
+        expr, bindings = self._expr_and_bindings(value)
+        if expr is not None:
+            return self._materialize_mask_index_expr(expr, {**coord_bindings, **bindings})
+        return None
+
+    def _materialize_mask_index_expr(self, expr, bindings: Dict[object, object]):
+        value = self.func.index_expr(expr, bindings)
+        if str(value.type) == "index":
+            return self.func.splat(value, self.dsl.index_type(), self.width)
+        return value
+
+    def _combine_mask_conditions(self, conditions: Tuple[object, ...]):
+        combined = conditions[0]
+        for condition in conditions[1:]:
+            combined = self.func.select(combined, condition, combined)
+        return combined
 
     def _mask_conditions(self, mask: _Value, register: int) -> Tuple[object, ...]:
         if mask.mask_components:
@@ -1498,18 +1593,21 @@ class _TTIRToWaveLowerer:
             for m_tile in range(grid.m_tiles):
                 for n_tile in range(grid.n_tiles):
                     tile_base = m_tile * 16 * n + n_tile * 16
+                    owner_conditions = self._dot_tile_owner_conditions(grid, m_tile, n_tile)
                     self._emit_dot_row_major_fragment_store(
                         ptr.ptr_base, grid.c(m_tile, n_tile), n, tile_base,
-                        dot_layout if ptr.ptr_offset_affine != fixed_affine else None, m_tile, n_tile, mask)
+                        dot_layout if ptr.ptr_offset_affine != fixed_affine else None, m_tile, n_tile, mask,
+                        owner_conditions)
         else:
             self._emit_dot_row_major_fragment_store(ptr.ptr_base, value.fragment, n, 0,
                                                     dot_layout if ptr.ptr_offset_affine != fixed_affine else None, 0, 0,
-                                                    mask)
+                                                    mask, self._dot_tile_owner_conditions(None, 0, 0))
         self.load_tokens.clear()
 
-    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment, leading_dim: int, tile_base: int,
-                                           dot_layout: Optional[_DotPointerLayout] = None, m_tile: int = 0,
-                                           n_tile: int = 0, mask: Optional[_Value] = None) -> None:
+    def _emit_dot_row_major_fragment_store(
+        self, ptr_base, fragment, leading_dim: int, tile_base: int, dot_layout: Optional[_DotPointerLayout] = None,
+        m_tile: int = 0, n_tile: int = 0, mask: Optional[_Value] = None, owner_conditions: Tuple[object,
+                                                                                                 ...] = ()) -> None:
         regs = self.func.fragment_unpack(fragment)
         lane_mod = self._lane_mod_index()
         lane_sym = self._sym("lane_mod")
@@ -1531,12 +1629,42 @@ class _TTIRToWaveLowerer:
             value = self.dsl.wave.ExtractOp(value_type, regs, register).result
             ptr = self.func.ptr_add(ptr_base, index)
             if mask is None:
-                self.func.store(value, ptr, after=after)
+                if owner_conditions:
+                    self._emit_under_mask(owner_conditions,
+                                          lambda value=value, ptr=ptr: self.func.store(value, ptr, after=after))
+                else:
+                    self.func.store(value, ptr, after=after)
             else:
                 conditions = self._mask_conditions(mask, register)
                 if not conditions:
                     raise NotImplementedError("wave_amd masked tt.dot fragment stores require a Wave mask")
-                self._emit_under_mask(conditions, lambda value=value, ptr=ptr: self.func.store(value, ptr, after=after))
+                self._emit_under_mask(owner_conditions + conditions,
+                                      lambda value=value, ptr=ptr: self.func.store(value, ptr, after=after))
+
+    def _dot_tile_owner_conditions(self, grid: Optional[_DotFragmentGrid], m_tile: int,
+                                   n_tile: int) -> Tuple[object, ...]:
+        if self.num_warps == 1 and self.num_ctas == 1:
+            return ()
+        n_tiles = 1 if grid is None else grid.n_tiles
+        tile_index = m_tile * n_tiles + n_tile
+        workers = self.num_warps * self.num_ctas
+        owner = tile_index % workers
+        conditions = []
+        if self.num_warps > 1:
+            conditions.append(self._wave_owner_condition(owner % self.num_warps))
+        if self.num_ctas > 1:
+            conditions.append(self._cta_owner_condition(owner // self.num_warps))
+        return tuple(conditions)
+
+    def _wave_owner_condition(self, owner: int):
+        workitem = self._workitem_id()
+        wave_id = self.func.binary("shri", workitem, self._splat_i32(_log2_int(self.width)))
+        return self.func.cmpi("eq", wave_id, self._splat_i32(owner))
+
+    def _cta_owner_condition(self, owner: int):
+        cta_wave = self.func.splat(self._workgroup_id(0), self.dsl.i32(), self.width)
+        cta_wave = self.func.binary("andi", cta_wave, self._splat_i32(self.num_ctas - 1))
+        return self.func.cmpi("eq", cta_wave, self._splat_i32(owner))
 
     def _expect_dot_pointer_layout(self, ptr: _Value, shape: Optional[Tuple[int, ...]], expected: _AffineIndex,
                                    description: str) -> None:
@@ -1687,9 +1815,12 @@ class _TTIRToWaveLowerer:
     def _thread_id_and_sym(self):
         if self.num_warps == 1:
             return self._lane_id(), self._sym("lid")
+        return self._workitem_id(), self._sym("wi")
+
+    def _workitem_id(self):
         if self._workitem_value is None:
             self._workitem_value = self.func.workitem_id(axis=0, element_type=self.dsl.i32(), width=self.width)
-        return self._workitem_value, self._sym("wi")
+        return self._workitem_value
 
     def _workgroup_id(self, axis: int):
         if axis not in self._workgroup_values:
