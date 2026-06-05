@@ -149,26 +149,57 @@ class _BlockedLayout:
 
 
 @dataclass
-class _Value:
+class _LanePayload:
     wave: object = None
     waves: Tuple[object, ...] = field(default_factory=tuple)
+
+
+@dataclass
+class _DotPayload:
     fragment: object = None
     fragments: Tuple[object, ...] = field(default_factory=tuple)
     dot_grid: Optional[_DotFragmentGrid] = None
-    elem_type: Optional[str] = None
+
+
+@dataclass
+class _ConstantPayload:
     const: Optional[int] = None
+    splat_const: Optional[Tuple[object, str, Optional[int]]] = None
+
+
+@dataclass
+class _SymbolicPayload:
     affine: Optional[_AffineIndex] = None
     expr: object = None
     exprs: Tuple[object, ...] = field(default_factory=tuple)
     bindings: Dict[object, object] = field(default_factory=dict)
     bindings_by_wave: Tuple[Dict[object, object], ...] = field(default_factory=tuple)
+    sym_index: Optional[_SymbolicIndex] = None
+    coord_axis: Optional[int] = None
+    coord_start: int = 0
+
+
+@dataclass
+class _IndexPayload:
     index: object = None
     indexes: Tuple[object, ...] = field(default_factory=tuple)
+
+
+@dataclass
+class _MemoryPayload:
     token: object = None
     tokens: Tuple[object, ...] = field(default_factory=tuple)
+
+
+@dataclass
+class _PointerPayload:
     ptr_base: object = None
     ptr_offset_affine: Optional[_AffineIndex] = None
     ptr_dot_layout: Optional[_DotPointerLayout] = None
+
+
+@dataclass
+class _MaskPayload:
     mask_id: Optional[int] = None
     mask_wave: object = None
     mask_waves: Tuple[object, ...] = field(default_factory=tuple)
@@ -176,15 +207,97 @@ class _Value:
     other_wave: object = None
     other_waves: Tuple[object, ...] = field(default_factory=tuple)
     other_splat_const: Optional[Tuple[object, str, Optional[int]]] = None
-    splat_const: Optional[Tuple[object, str, Optional[int]]] = None
-    layout: Optional[_BlockedLayout] = None
-    shape: Optional[Tuple[int, ...]] = None
-    sym_index: Optional[_SymbolicIndex] = None
     cmpi_predicate: Optional[str] = None
     cmpi_lhs: Optional["_Value"] = None
     cmpi_rhs: Optional["_Value"] = None
-    coord_axis: Optional[int] = None
-    coord_start: int = 0
+
+
+_VALUE_PAYLOAD_FIELDS = {
+    "wave": "lanes",
+    "waves": "lanes",
+    "fragment": "dot",
+    "fragments": "dot",
+    "dot_grid": "dot",
+    "const": "constant",
+    "splat_const": "constant",
+    "affine": "symbolic",
+    "expr": "symbolic",
+    "exprs": "symbolic",
+    "bindings": "symbolic",
+    "bindings_by_wave": "symbolic",
+    "sym_index": "symbolic",
+    "coord_axis": "symbolic",
+    "coord_start": "symbolic",
+    "index": "indexing",
+    "indexes": "indexing",
+    "token": "memory",
+    "tokens": "memory",
+    "ptr_base": "pointer",
+    "ptr_offset_affine": "pointer",
+    "ptr_dot_layout": "pointer",
+    "mask_id": "mask",
+    "mask_wave": "mask",
+    "mask_waves": "mask",
+    "mask_components": "mask",
+    "other_wave": "mask",
+    "other_waves": "mask",
+    "other_splat_const": "mask",
+    "cmpi_predicate": "mask",
+    "cmpi_lhs": "mask",
+    "cmpi_rhs": "mask",
+}
+
+
+@dataclass(init=False)
+class _Value:
+    """Lowered SSA value grouped by concern rather than one flat union.
+
+    The lowerer still has many existing call sites that read `value.wave` or
+    assign `value.ptr_base`; `__getattr__`/`__setattr__` route those names into
+    the payloads below so invariants live in one place while the refactor stays
+    low-risk.
+    """
+
+    elem_type: Optional[str]
+    layout: Optional[_BlockedLayout]
+    shape: Optional[Tuple[int, ...]]
+    lanes: _LanePayload
+    dot: _DotPayload
+    constant: _ConstantPayload
+    symbolic: _SymbolicPayload
+    indexing: _IndexPayload
+    memory: _MemoryPayload
+    pointer: _PointerPayload
+    mask: _MaskPayload
+
+    def __init__(self, elem_type: Optional[str] = None, layout: Optional[_BlockedLayout] = None,
+                 shape: Optional[Tuple[int, ...]] = None, **payload_fields) -> None:
+        object.__setattr__(self, "elem_type", elem_type)
+        object.__setattr__(self, "layout", layout)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "lanes", payload_fields.pop("lanes", _LanePayload()))
+        object.__setattr__(self, "dot", payload_fields.pop("dot", _DotPayload()))
+        object.__setattr__(self, "constant", payload_fields.pop("constant", _ConstantPayload()))
+        object.__setattr__(self, "symbolic", payload_fields.pop("symbolic", _SymbolicPayload()))
+        object.__setattr__(self, "indexing", payload_fields.pop("indexing", _IndexPayload()))
+        object.__setattr__(self, "memory", payload_fields.pop("memory", _MemoryPayload()))
+        object.__setattr__(self, "pointer", payload_fields.pop("pointer", _PointerPayload()))
+        object.__setattr__(self, "mask", payload_fields.pop("mask", _MaskPayload()))
+        for name, value in payload_fields.items():
+            setattr(self, name, value)
+
+    def __getattr__(self, name):
+        payload_name = _VALUE_PAYLOAD_FIELDS.get(name)
+        if payload_name is None:
+            raise AttributeError(name)
+        return getattr(getattr(self, payload_name), name)
+
+    def __setattr__(self, name, value) -> None:
+        payload_name = _VALUE_PAYLOAD_FIELDS.get(name)
+        if payload_name is None:
+            object.__setattr__(self, name, value)
+            return
+        setattr(getattr(self, payload_name), name, value)
 
 
 def lower_ttir_to_wave_mlir(src, options) -> Tuple[str, str]:
