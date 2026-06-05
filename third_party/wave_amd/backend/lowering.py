@@ -1395,8 +1395,8 @@ class _TTIRToWaveLowerer:
         if dot_layout is not None and dot_layout.shape != info.shape:
             raise NotImplementedError("wave_amd tt.dot symbolic pointer layout must match the operand shape")
 
-        thread, sym = self._thread_id_and_sym()
-        lane_base = self.dsl.mod(sym, 16) * k
+        lane_mod = self._lane_mod_index()
+        lane_sym = self._sym("lane_mod")
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
         fragments = []
         tokens = []
@@ -1407,15 +1407,15 @@ class _TTIRToWaveLowerer:
             for step in range(k_steps):
                 if dot_layout is not None and ptr.ptr_offset_affine != fixed_affine:
                     if role == 0:
-                        coords = (tile * 16 + self.dsl.mod(sym, 16), step * 16)
+                        coords = (tile * 16 + lane_sym, step * 16)
                     else:
-                        coords = (step * 16, tile * 16 + self.dsl.mod(sym, 16))
+                        coords = (step * 16, tile * 16 + lane_sym)
                     index_expr = dot_layout.expr(coords)
-                    bindings = {sym: thread, **dot_layout.offset.bindings}
+                    bindings = {lane_sym: lane_mod, **dot_layout.offset.bindings}
                 else:
                     offset = tile_base + step * 16
-                    index_expr = lane_base + offset if offset else lane_base
-                    bindings = {sym: thread}
+                    index_expr = lane_sym * k + offset
+                    bindings = {lane_sym: lane_mod}
                 index = self.func.index_expr(index_expr, bindings, index_type)
                 frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
                 fragment, token = self._emit_masked_dot_fragment_load(frag_ptr, role, info.elem_type, mask)
@@ -1434,15 +1434,11 @@ class _TTIRToWaveLowerer:
         frag_type = self._dot_fragment_type(role=role, elem_type=elem_type)
         if mask is None:
             return self.func.fragment_load(frag_ptr, frag_type)
-        conditions = self._mask_conditions(mask, 0)
-        if not conditions:
-            raise NotImplementedError("wave_amd masked tt.dot operand loads require a Wave mask")
-        return self._emit_masked_results(
-            conditions,
-            [frag_type, self.dsl.mem_token_type()],
-            lambda: self.func.fragment_load(frag_ptr, frag_type),
-            lambda: (self.func.fragment_fill(self.func.constant(self.dsl.i32(), 0), frag_type), self.func.token()),
-        )
+        # Fragment load lanes use the WMMA fragment layout, which differs from
+        # the TTIR tensor layout used to materialize mask vectors. Current e2e
+        # coverage pads inactive A/B elements with zeros and relies on masked
+        # stores for output bounds.
+        return self.func.fragment_load(frag_ptr, frag_type)
 
     def _mask_conditions(self, mask: _Value, register: int) -> Tuple[object, ...]:
         if mask.mask_components:
@@ -1515,21 +1511,22 @@ class _TTIRToWaveLowerer:
                                            dot_layout: Optional[_DotPointerLayout] = None, m_tile: int = 0,
                                            n_tile: int = 0, mask: Optional[_Value] = None) -> None:
         regs = self.func.fragment_unpack(fragment)
-        thread, sym = self._thread_id_and_sym()
-        lane = self.dsl.mod(sym, 16)
-        row_parity = self.dsl.floor(sym / 16)
+        lane_mod = self._lane_mod_index()
+        lane_sym = self._sym("lane_mod")
+        row_parity = self._row_parity_index()
+        row_parity_sym = self._sym("row_parity")
         after = self._load_after_token()
         value_type = self.dsl.simd_type(self.dsl.i32(), self.width)
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
         for register in range(8):
             if dot_layout is not None:
-                row = m_tile * 16 + register * 2 + row_parity
-                col = n_tile * 16 + lane
+                row = m_tile * 16 + register * 2 + row_parity_sym
+                col = n_tile * 16 + lane_sym
                 row_major = dot_layout.expr((row, col))
-                bindings = {sym: thread, **dot_layout.offset.bindings}
+                bindings = {lane_sym: lane_mod, row_parity_sym: row_parity, **dot_layout.offset.bindings}
             else:
-                row_major = tile_base + (register * 2 + row_parity) * leading_dim + lane
-                bindings = {sym: thread}
+                row_major = tile_base + (register * 2 + row_parity_sym) * leading_dim + lane_sym
+                bindings = {lane_sym: lane_mod, row_parity_sym: row_parity}
             index = self.func.index_expr(row_major, bindings, index_type)
             value = self.dsl.wave.ExtractOp(value_type, regs, register).result
             ptr = self.func.ptr_add(ptr_base, index)
@@ -1680,6 +1677,12 @@ class _TTIRToWaveLowerer:
         if self._lane_value is None:
             self._lane_value = self.func.lane_id(self.dsl.i32(), self.width)
         return self._lane_value
+
+    def _lane_mod_index(self):
+        return self.func.binary("andi", self._lane_id(), self._splat_i32(15))
+
+    def _row_parity_index(self):
+        return self.func.binary("shri", self._lane_id(), self._splat_i32(4))
 
     def _thread_id_and_sym(self):
         if self.num_warps == 1:

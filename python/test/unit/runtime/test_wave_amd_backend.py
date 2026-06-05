@@ -1818,8 +1818,6 @@ def test_wave_amd_e2e_triton_jit_matmul_tile(tmp_path, monkeypatch, device, m, n
     torch.testing.assert_close(c, expected, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.xfail(reason="real JIT scf.for matmul still needs AMDGCN full-address support for loop-IV expressions",
-                   strict=False)
 def test_wave_amd_e2e_triton_jit_looped_matmul(tmp_path, monkeypatch, device):
     torch, _ = _require_wave_amd_runtime(tmp_path, monkeypatch, device)
 
@@ -1890,8 +1888,6 @@ def test_wave_amd_runtime_launches_realistic_matmul_tile_with_boundary_masks(tmp
     b_matrix_full[:k, :n] = b_values
     b_physical = b_matrix_full.t().contiguous()
     c = torch.full((16, c_ld), -999.0, device=device, dtype=torch.float32)
-
-    pytest.xfail("masked dot fragment loads still require full-address support for lane mod/floor expressions")
 
     module_path = tmp_path / "realistic_matmul_tile.ttir"
     module_path.write_text(BOUNDARY_MATMUL_TILE_TTIR)
