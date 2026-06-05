@@ -14,6 +14,7 @@ driver_api = pytest.importorskip("triton.backends.driver")
 wave_compiler = pytest.importorskip("triton.backends.wave_amd.compiler")
 wave_emission = pytest.importorskip("triton.backends.wave_amd.emission")
 wave_lowering = pytest.importorskip("triton.backends.wave_amd.lowering")
+wave_pipeline = pytest.importorskip("triton.backends.wave_amd.pipeline")
 wave_driver = pytest.importorskip("triton.backends.wave_amd.driver")
 hip_driver = pytest.importorskip("triton.backends.amd.driver")
 
@@ -528,6 +529,30 @@ def test_wave_amd_backend_skeleton():
     stages = {}
     backend.add_stages(stages, options, Language.TRITON)
     assert list(stages) == ["ttir", "wave", "amdgcn", "hsaco"]
+
+
+def test_wave_amd_pipeline_records_safe_ttir_cleanup_and_ttgir_reuse_plan():
+    assert [stage.name for stage in wave_pipeline.wave_ttir_cleanup_plan()] == [
+        "common.inliner",
+        "common.canonicalizer",
+        "ttir.combine",
+        "ttir.reorder_broadcast",
+        "common.cse",
+        "ttir.triton_licm",
+        "common.symbol_dce",
+        "ttir.loop_unroll",
+    ]
+
+    ttgir_plan = {stage.name: stage.reuse for stage in wave_pipeline.wave_ttgir_reuse_plan()}
+    assert ttgir_plan["ttir.convert_to_ttgpuir"] == wave_pipeline.PassReuse.ADAPT
+    assert ttgir_plan["amd.accelerate_matmul"] == wave_pipeline.PassReuse.ADAPT
+    assert ttgir_plan["amd.schedule_loops"] == wave_pipeline.PassReuse.ADAPT
+    assert ttgir_plan["amd.convert_to_buffer_ops"] == wave_pipeline.PassReuse.AVOID
+    assert ttgir_plan["amd.block_pingpong"] == wave_pipeline.PassReuse.AVOID
+    assert "ttgpuir.remove_layout_conversions" in {
+        stage.name
+        for stage in wave_pipeline.ttgir_passes_by_reuse(wave_pipeline.PassReuse.REUSE_WITH_CONSTRAINTS)
+    }
 
 
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):

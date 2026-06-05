@@ -7,10 +7,10 @@ from types import ModuleType
 from typing import Any, Dict, Tuple
 
 from triton import knobs
-from triton._C.libtriton import ir, passes
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.backends.wave_amd.emission import emit_amdgcn_from_wave_mlir, emit_hsaco_from_amdgcn, _packaged_wave_translate
 from triton.backends.wave_amd.lowering import lower_ttir_to_wave_mlir
+from triton.backends.wave_amd.pipeline import run_wave_ttir_pipeline
 
 
 def _warp_size_for_arch(arch: str) -> int:
@@ -123,18 +123,7 @@ class WaveAMDBackend(BaseBackend):
 
     @staticmethod
     def make_ttir(mod, metadata, options):
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-        passes.common.add_inliner(pm)
-        passes.common.add_canonicalizer(pm)
-        passes.ttir.add_combine(pm)
-        passes.ttir.add_reorder_broadcast(pm)
-        passes.common.add_cse(pm)
-        passes.ttir.add_triton_licm(pm)
-        passes.common.add_symbol_dce(pm)
-        passes.ttir.add_loop_unroll(pm)
-        pm.run(mod, "wave_amd_make_ttir")
-        return mod
+        return run_wave_ttir_pipeline(mod)
 
     @staticmethod
     def make_wave(src, metadata, options):
