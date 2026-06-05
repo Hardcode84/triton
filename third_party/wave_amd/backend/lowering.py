@@ -5,6 +5,13 @@ from operator import mul
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
+from triton.backends.wave_amd.gemm_pipeline import (
+    BUFFER_RANGE_ATTR,
+    WaveBufferPlan,
+    WaveGemmPipelinePlan,
+    buffer_plan_for_static_footprint,
+)
+
 
 def _product(values: Sequence[int]) -> int:
     return reduce(mul, values, 1)
@@ -252,6 +259,12 @@ class _TTIRToWaveLowerer:
         self.width = int(options.warp_size)
         self.num_warps = int(getattr(options, "num_warps", 1))
         self.num_ctas = int(getattr(options, "num_ctas", 1))
+        self.gemm_pipeline = WaveGemmPipelinePlan(
+            use_buffer_ops=True,
+            num_stages=int(getattr(options, "num_stages", 1)),
+            num_warps=self.num_warps,
+            num_ctas=self.num_ctas,
+        )
         self.values: Dict[int, _Value] = {}
         self.func = None
         self.load_tokens = []
@@ -1039,6 +1052,26 @@ class _TTIRToWaveLowerer:
             return None
         return _DotPointerLayout(shape, offset_sym)
 
+    def _buffer_plan_for_static_footprint(self, info: Optional[_TensorInfo]) -> Optional[WaveBufferPlan]:
+        if info is None:
+            return None
+        return buffer_plan_for_static_footprint(self.gemm_pipeline, info.elem_type, info.shape)
+
+    def _ptr_add(self, base, index, plan: Optional[WaveBufferPlan] = None):
+        if plan is None:
+            return self.func.ptr_add(base, index)
+        base_simd = self.dsl.SimdType.isinstance(base.type)
+        offset_width = self.dsl._lane_width(index.type)
+        if base_simd:
+            result_type = base.type
+        elif offset_width:
+            result_type = self.dsl.simd_type(base.type, offset_width)
+        else:
+            result_type = base.type
+        op = self.dsl.wave.PtrAddOp(result_type, base, index)
+        op.operation.attributes[BUFFER_RANGE_ATTR] = self.dsl.IntegerAttr.get(self.dsl.i32(), plan.range_bytes)
+        return op.result
+
     def _lower_load(self, op) -> None:
         role = self.dot_operand_roles.get(op.get_result(0).id())
         if role is not None:
@@ -1416,6 +1449,9 @@ class _TTIRToWaveLowerer:
         if dot_layout is not None and dot_layout.shape != info.shape:
             raise NotImplementedError("wave_amd tt.dot symbolic pointer layout must match the operand shape")
 
+        plan = None
+        if dot_layout is None and ptr.pointer.ptr_offset_affine == fixed_affine:
+            plan = self._buffer_plan_for_static_footprint(info)
         lane_mod = self._lane_mod_index()
         lane_sym = self._sym("lane_mod")
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
@@ -1438,7 +1474,7 @@ class _TTIRToWaveLowerer:
                     index_expr = lane_sym * k + offset
                     bindings = {lane_sym: lane_mod}
                 index = self.func.index_expr(index_expr, bindings, index_type)
-                frag_ptr = self.func.ptr_add(ptr.pointer.ptr_base, index)
+                frag_ptr = self._ptr_add(ptr.pointer.ptr_base, index, plan)
                 fragment, token = self._emit_masked_dot_fragment_load(frag_ptr, role, info.elem_type, mask, tile, step)
                 fragments.append(fragment)
                 tokens.append(token)
@@ -1584,6 +1620,10 @@ class _TTIRToWaveLowerer:
         if mask is not None and (value.dot.dot_grid is None or value.dot.dot_grid.m_tiles != 1
                                  or value.dot.dot_grid.n_tiles != 1):
             raise NotImplementedError("wave_amd masked tt.dot fragment stores currently support one 16x16 tile")
+        plan = None
+        if dot_layout is None and ptr.pointer.ptr_offset_affine == fixed_affine:
+            store_info = _TensorInfo(value.shape, value.elem_type)
+            plan = self._buffer_plan_for_static_footprint(store_info)
         if value.dot.dot_grid is not None:
             grid = value.dot.dot_grid
             if grid.role != 2:
@@ -1595,18 +1635,19 @@ class _TTIRToWaveLowerer:
                     self._emit_dot_row_major_fragment_store(
                         ptr.pointer.ptr_base, grid.c(m_tile, n_tile), n, tile_base,
                         dot_layout if ptr.pointer.ptr_offset_affine != fixed_affine else None, m_tile, n_tile, mask,
-                        owner_conditions)
+                        owner_conditions, plan)
         else:
             self._emit_dot_row_major_fragment_store(
                 ptr.pointer.ptr_base, value.dot.fragment, n, 0,
                 dot_layout if ptr.pointer.ptr_offset_affine != fixed_affine else None, 0, 0, mask,
-                self._dot_tile_owner_conditions(None, 0, 0))
+                self._dot_tile_owner_conditions(None, 0, 0), plan)
         self.load_tokens.clear()
 
-    def _emit_dot_row_major_fragment_store(
-        self, ptr_base, fragment, leading_dim: int, tile_base: int, dot_layout: Optional[_DotPointerLayout] = None,
-        m_tile: int = 0, n_tile: int = 0, mask: Optional[_Value] = None, owner_conditions: Tuple[object,
-                                                                                                 ...] = ()) -> None:
+    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment, leading_dim: int, tile_base: int,
+                                           dot_layout: Optional[_DotPointerLayout] = None, m_tile: int = 0,
+                                           n_tile: int = 0, mask: Optional[_Value] = None,
+                                           owner_conditions: Tuple[object, ...] = (),
+                                           buffer_plan: Optional[WaveBufferPlan] = None) -> None:
         regs = self.func.fragment_unpack(fragment)
         lane_mod = self._lane_mod_index()
         lane_sym = self._sym("lane_mod")
@@ -1626,7 +1667,7 @@ class _TTIRToWaveLowerer:
                 bindings = {lane_sym: lane_mod, row_parity_sym: row_parity}
             index = self.func.index_expr(row_major, bindings, index_type)
             value = self.dsl.wave.ExtractOp(value_type, regs, register).result
-            ptr = self.func.ptr_add(ptr_base, index)
+            ptr = self._ptr_add(ptr_base, index, buffer_plan)
             if mask is None:
                 if owner_conditions:
                     self._emit_under_mask(owner_conditions,

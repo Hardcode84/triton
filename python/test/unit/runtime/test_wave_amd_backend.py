@@ -894,6 +894,7 @@ def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
     assert "func.func @dot_kernel" in wave
     assert "wave.lds_size" not in wave
     assert "wave.index_expr" in wave
+    assert "waveamd.buffer.range_bytes" in wave
     assert "waveamd.fragment_pack" in wave
     assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
     assert "waveamd.fragment_unpack" in wave
@@ -916,6 +917,7 @@ def test_wave_amd_make_wave_lowers_dot_k32_to_two_native_wmma_ops(tmp_path):
 
     assert metadata["name"] == "dot_k32_kernel"
     assert "func.func @dot_k32_kernel" in wave
+    assert "waveamd.buffer.range_bytes" in wave
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 2
     assert wave.count("waveamd.fragment_pack") == 4
     assert "32" in wave
@@ -946,6 +948,7 @@ def test_wave_amd_make_wave_lowers_32x32_dot_to_native_wmma_grid(tmp_path, ttir,
 
     assert metadata["name"] == kernel_name
     assert f"func.func @{kernel_name}" in wave
+    assert "waveamd.buffer.range_bytes" in wave
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == expected_mmas
     assert wave.count("waveamd.fragment_pack") == expected_packs
     assert wave.count("waveamd.fragment_unpack") == 4
@@ -1035,6 +1038,7 @@ def test_wave_amd_make_wave_lowers_realistic_matmul_tile_pattern(tmp_path):
     assert "func.func @realistic_matmul_tile_kernel" in wave
     assert "wave.workgroup_id 0" in wave
     assert "wave.index_expr" in wave
+    assert "waveamd.buffer.range_bytes" not in wave
     assert wave.count("wave.where") >= 3
     assert wave.count("waveamd.fragment_pack") == 2
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
@@ -1058,6 +1062,7 @@ def test_wave_amd_make_wave_lowers_realistic_matmul_k_loop(tmp_path):
 
     assert metadata["name"] == "realistic_matmul_loop_kernel"
     assert "scf.for" in wave
+    assert "waveamd.buffer.range_bytes" not in wave
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
     assert wave.count("waveamd.fragment_pack") == 2
     assert "waveamd.fragment_unpack" in wave
