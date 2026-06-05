@@ -105,6 +105,59 @@ def test_compile_only_dot() -> None:
     assert k.asm["cubin"] != b""
 
 
+def test_compile_only_realistic_matmul_tile_ttir_shape() -> None:
+
+    @triton.jit
+    def realistic_matmul_tile(a, b, c, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        pid_m = pid % 2
+        pid_n = pid // 2
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        a_ptrs = a + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        a_tile = tl.load(a_ptrs, mask=offs_m[:, None] < M, other=0.0)
+        b_tile = tl.load(b_ptrs, mask=offs_n[None, :] < N, other=0.0)
+        acc = tl.dot(a_tile, b_tile)
+        c_ptrs = c + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        tl.store(c_ptrs, acc, mask=offs_m[:, None] < M)
+
+    k = triton.compile(
+        ASTSource(
+            fn=realistic_matmul_tile,
+            signature={
+                "a": "*fp16",
+                "b": "*fp16",
+                "c": "*fp32",
+                "M": "i32",
+                "N": "i32",
+                "K": "i32",
+                "stride_am": "i32",
+                "stride_ak": "i32",
+                "stride_bk": "i32",
+                "stride_bn": "i32",
+                "stride_cm": "i32",
+                "stride_cn": "i32",
+                "BLOCK_M": "constexpr",
+                "BLOCK_N": "constexpr",
+                "BLOCK_K": "constexpr",
+            },
+            constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 16},
+        ),
+        target=GPUTarget("cuda", 100, 32),
+    )
+    ttir = k.asm["ttir"]
+
+    assert "tt.get_program_id" in ttir
+    assert "arith.remsi" in ttir
+    assert "arith.divsi" in ttir
+    assert "tt.load" in ttir
+    assert "tt.dot" in ttir
+    assert "tt.store" in ttir
+
+
 def test_compile_only_k_loop() -> None:
 
     @triton.jit

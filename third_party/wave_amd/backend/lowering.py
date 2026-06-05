@@ -28,6 +28,27 @@ class _AffineIndex:
 
 
 @dataclass(frozen=True)
+class _SymbolicIndex:
+    const: object
+    coeffs: Tuple[object, ...]
+    bindings: Dict[object, object]
+
+
+@dataclass(frozen=True)
+class _DotPointerLayout:
+    shape: Tuple[int, ...]
+    offset: _SymbolicIndex
+
+    def expr(self, coords: Tuple[object, ...]):
+        if len(coords) != len(self.offset.coeffs):
+            raise ValueError("coordinate rank must match symbolic pointer rank")
+        expr = self.offset.const
+        for coord, coeff in zip(coords, self.offset.coeffs):
+            expr = expr + coord * coeff
+        return expr
+
+
+@dataclass(frozen=True)
 class _DotConfig:
     m: int
     n: int
@@ -141,6 +162,7 @@ class _Value:
     tokens: Tuple[object, ...] = field(default_factory=tuple)
     ptr_base: object = None
     ptr_offset_affine: Optional[_AffineIndex] = None
+    ptr_dot_layout: Optional[_DotPointerLayout] = None
     mask_id: Optional[int] = None
     mask_wave: object = None
     mask_waves: Tuple[object, ...] = field(default_factory=tuple)
@@ -150,6 +172,7 @@ class _Value:
     splat_const: Optional[Tuple[object, str, Optional[int]]] = None
     layout: Optional[_BlockedLayout] = None
     shape: Optional[Tuple[int, ...]] = None
+    sym_index: Optional[_SymbolicIndex] = None
     coord_axis: Optional[int] = None
     coord_start: int = 0
 
@@ -243,6 +266,11 @@ class _TTIRToWaveLowerer:
             state = _Value(wave=wave_args[index], elem_type=_signature_element_type(signature))
             if signature.startswith("*"):
                 state.ptr_base = wave_args[index]
+            else:
+                sym = self._sym(f"arg_{index}")
+                state.expr = sym
+                state.bindings = {sym: wave_args[index]}
+                state.sym_index = _SymbolicIndex(sym, (), {sym: wave_args[index]})
             self.values[func_op.args(index).id()] = state
 
     def _lower_ops(self, ops: Sequence[object]) -> None:
@@ -264,11 +292,15 @@ class _TTIRToWaveLowerer:
         if name == "arith.constant":
             self._lower_constant(op)
         elif name == "arith.addi":
-            self._lower_binary(op, lambda lhs, rhs: lhs + rhs, self.func.addi, _affine_add)
+            self._lower_binary(op, lambda lhs, rhs: lhs + rhs, self.func.addi, _affine_add, _symbolic_add)
         elif name == "arith.subi":
             self._lower_subi(op)
         elif name == "arith.muli":
-            self._lower_binary(op, lambda lhs, rhs: lhs * rhs, self.func.muli, _affine_mul)
+            self._lower_binary(op, lambda lhs, rhs: lhs * rhs, self.func.muli, _affine_mul, _symbolic_mul)
+        elif name == "arith.divsi":
+            self._lower_scalar_index_divrem(op, "divsi")
+        elif name == "arith.remsi":
+            self._lower_scalar_index_divrem(op, "remsi")
         elif name == "arith.addf":
             self._lower_binary(op, None, self.func.fadd)
         elif name == "arith.subf":
@@ -297,6 +329,8 @@ class _TTIRToWaveLowerer:
             self._lower_load(op)
         elif name == "tt.store":
             self._lower_store(op)
+        elif name in {"scf.for", "scf.yield"}:
+            raise NotImplementedError("wave_amd TTIR lowering does not yet support scf.for K loops")
         else:
             raise NotImplementedError(f"wave_amd TTIR lowering does not support op: {name}")
 
@@ -310,6 +344,7 @@ class _TTIRToWaveLowerer:
             state.const = value if isinstance(value, int) and width is None else None
             if isinstance(value, int):
                 state.affine = _AffineIndex(value, ())
+                state.sym_index = _SymbolicIndex(value, (), {})
             state.splat_const = (value, elem_type, width)
             if width is None:
                 state.wave = scalar
@@ -326,6 +361,7 @@ class _TTIRToWaveLowerer:
                 state.shape = info.shape
                 if isinstance(value, int):
                     state.affine = _AffineIndex(value, (0, ) * len(info.shape))
+                    state.sym_index = _SymbolicIndex(value, (0, ) * len(info.shape), {})
         self._set_result(op, state)
 
     def _lower_program_id(self, op) -> None:
@@ -342,10 +378,15 @@ class _TTIRToWaveLowerer:
             pid = self.func.index_cast(pid_index, self.dsl.i32())
             self._set_result(
                 op,
-                _Value(wave=pid, elem_type="i32", expr=expr, bindings={wg_sym: self._workgroup_id(axis)}),
+                _Value(wave=pid, elem_type="i32", expr=expr, bindings={wg_sym: self._workgroup_id(axis)},
+                       sym_index=_SymbolicIndex(expr, (), {wg_sym: self._workgroup_id(axis)})),
             )
             return
-        self._set_result(op, _Value(wave=pid, elem_type="i32", expr=sym, bindings={sym: pid}))
+        self._set_result(
+            op,
+            _Value(wave=pid, elem_type="i32", expr=sym, bindings={sym: pid},
+                   sym_index=_SymbolicIndex(sym, (), {sym: pid})),
+        )
 
     def _lower_make_range(self, op) -> None:
         start = op.get_int_attr("start")
@@ -365,6 +406,7 @@ class _TTIRToWaveLowerer:
                     _Value(
                         elem_type="i32",
                         shape=info.shape,
+                        sym_index=_symbolic_coord(len(info.shape), 0, start),
                         coord_axis=0,
                         coord_start=start,
                     ),
@@ -385,6 +427,7 @@ class _TTIRToWaveLowerer:
                 bindings_by_wave=state.bindings_by_wave,
                 layout=layout,
                 shape=info.shape,
+                sym_index=state.sym_index,
                 coord_axis=0,
                 coord_start=start,
             ),
@@ -397,7 +440,25 @@ class _TTIRToWaveLowerer:
         if info is None:
             raise NotImplementedError("wave_amd tt.expand_dims requires tensor result type metadata")
         if src.coord_axis is None:
-            raise NotImplementedError("wave_amd tt.expand_dims currently supports coordinate tensors")
+            sym_index = _symbolic_expand_dims(src.sym_index, axis, len(info.shape))
+            if sym_index is None:
+                raise NotImplementedError("wave_amd tt.expand_dims currently supports symbolic index tensors")
+            try:
+                layout = self._layout_for_info(info)
+            except NotImplementedError:
+                if self._can_defer_coordinate_layout(info):
+                    self._set_result(
+                        op,
+                        _Value(
+                            elem_type=src.elem_type or info.elem_type,
+                            shape=info.shape,
+                            sym_index=sym_index,
+                        ),
+                    )
+                    return
+                raise
+            self._set_result(op, self._symbolic_tensor_value(layout, info, sym_index, materialize_waves=False))
+            return
         coord_axis = src.coord_axis + 1 if axis <= src.coord_axis else src.coord_axis
         try:
             layout = self._layout_for_info(info)
@@ -408,6 +469,7 @@ class _TTIRToWaveLowerer:
                     _Value(
                         elem_type=src.elem_type or info.elem_type,
                         shape=info.shape,
+                        sym_index=_symbolic_coord(len(info.shape), coord_axis, src.coord_start),
                         coord_axis=coord_axis,
                         coord_start=src.coord_start,
                     ),
@@ -427,6 +489,9 @@ class _TTIRToWaveLowerer:
         if src.coord_axis is not None:
             state = self._coordinate_value(layout, _TensorInfo(info.shape, src.elem_type or info.elem_type),
                                            src.coord_axis, src.coord_start)
+        elif src.sym_index is not None and not src.waves:
+            state = self._symbolic_tensor_value(layout, info, _symbolic_broadcast(src.sym_index, len(info.shape)),
+                                                materialize_waves=False)
         else:
             state = self._coerce_tensor(src, layout, info)
         self._set_result(op, state)
@@ -434,7 +499,30 @@ class _TTIRToWaveLowerer:
     def _lower_splat(self, op) -> None:
         src = self._value(op.get_operand(0))
         info = self._result_tensor_info(op)
-        layout = self._layout_for_info(info) if info is not None else None
+        layout = None
+        if info is not None:
+            try:
+                layout = self._layout_for_info(info)
+            except NotImplementedError:
+                if not self._can_defer_coordinate_layout(info) or src.ptr_base is not None:
+                    raise
+                expr, bindings = self._expr_and_bindings(src)
+                self._set_result(
+                    op,
+                    _Value(
+                        elem_type=src.elem_type or info.elem_type,
+                        const=src.const,
+                        affine=_affine_splat(src.affine, len(info.shape)),
+                        expr=expr,
+                        bindings=bindings,
+                        mask_id=src.mask_id,
+                        splat_const=(src.splat_const[0], src.splat_const[1],
+                                     _product(info.shape)) if src.splat_const is not None else None,
+                        shape=info.shape,
+                        sym_index=_symbolic_splat(src.sym_index, len(info.shape)),
+                    ),
+                )
+                return
         if src.ptr_base is not None:
             state = _Value(
                 wave=src.ptr_base,
@@ -450,6 +538,7 @@ class _TTIRToWaveLowerer:
             if src.splat_const is not None and src.splat_const[2] is None and layout is not None:
                 splat_const = (src.splat_const[0], src.splat_const[1], _product(info.shape))
             affine = _affine_splat(src.affine, len(info.shape)) if layout is not None else src.affine
+            sym_index = _symbolic_splat(src.sym_index, len(info.shape)) if layout is not None else src.sym_index
             if layout is not None:
                 waves = tuple(
                     self.func.splat(src.wave, self._scalar_type(src.elem_type), self.width)
@@ -470,6 +559,7 @@ class _TTIRToWaveLowerer:
                     splat_const=splat_const,
                     layout=layout,
                     shape=info.shape,
+                    sym_index=sym_index,
                 )
             else:
                 wave = self.func.splat(src.wave, self._scalar_type(src.elem_type), self.width)
@@ -485,16 +575,32 @@ class _TTIRToWaveLowerer:
                     bindings_by_wave=(bindings, ),
                     mask_id=src.mask_id,
                     splat_const=splat_const,
+                    sym_index=sym_index,
                 )
         self._set_result(op, state)
 
-    def _lower_binary(self, op, expr_builder, wave_builder, affine_builder=None) -> None:
+    def _lower_binary(self, op, expr_builder, wave_builder, affine_builder=None, symbolic_builder=None) -> None:
         lhs = self._value(op.get_operand(0))
         rhs = self._value(op.get_operand(1))
         mask_id = _merge_mask_ids(lhs, rhs)
         info = self._result_tensor_info(op)
         if info is not None:
-            layout = self._layout_for_info(info)
+            try:
+                layout = self._layout_for_info(info)
+            except NotImplementedError:
+                if not self._can_defer_coordinate_layout(info) or symbolic_builder is None:
+                    raise
+                self._set_result(
+                    op,
+                    _Value(
+                        elem_type=lhs.elem_type or rhs.elem_type,
+                        affine=affine_builder(lhs.affine, rhs.affine) if affine_builder is not None else None,
+                        mask_id=mask_id,
+                        shape=info.shape,
+                        sym_index=symbolic_builder(lhs.sym_index, rhs.sym_index),
+                    ),
+                )
+                return
             lhs = self._coerce_tensor(lhs, layout, info)
             rhs = self._coerce_tensor(rhs, layout, info)
             waves = ()
@@ -516,6 +622,7 @@ class _TTIRToWaveLowerer:
             else:
                 exprs = [None] * layout.registers
                 bindings_by_wave = [{} for _ in range(layout.registers)]
+            sym_index = symbolic_builder(lhs.sym_index, rhs.sym_index) if symbolic_builder is not None else None
             self._set_result(
                 op,
                 _Value(
@@ -530,6 +637,7 @@ class _TTIRToWaveLowerer:
                     mask_id=mask_id,
                     layout=layout,
                     shape=info.shape,
+                    sym_index=sym_index,
                 ),
             )
             return
@@ -544,6 +652,7 @@ class _TTIRToWaveLowerer:
                 expr = expr_builder(lhs_expr, rhs_expr)
                 bindings = {**lhs_bindings, **rhs_bindings}
         affine = affine_builder(lhs.affine, rhs.affine) if affine_builder is not None else None
+        sym_index = symbolic_builder(lhs.sym_index, rhs.sym_index) if symbolic_builder is not None else None
         self._set_result(
             op,
             _Value(
@@ -553,6 +662,7 @@ class _TTIRToWaveLowerer:
                 expr=expr,
                 bindings=bindings,
                 mask_id=mask_id,
+                sym_index=sym_index,
             ),
         )
 
@@ -597,6 +707,7 @@ class _TTIRToWaveLowerer:
                     mask_id=mask_id,
                     layout=layout,
                     shape=info.shape,
+                    sym_index=_symbolic_sub(lhs.sym_index, rhs.sym_index),
                 ),
             )
             return
@@ -620,6 +731,36 @@ class _TTIRToWaveLowerer:
                 expr=expr,
                 bindings=bindings,
                 mask_id=mask_id,
+                sym_index=_symbolic_sub(lhs.sym_index, rhs.sym_index),
+            ),
+        )
+
+    def _lower_scalar_index_divrem(self, op, kind: str) -> None:
+        lhs = self._value(op.get_operand(0))
+        rhs = self._value(op.get_operand(1))
+        if self._result_tensor_info(op) is not None:
+            raise NotImplementedError(f"wave_amd {kind} currently supports only scalar integer values")
+        if rhs.const is None or rhs.const <= 0:
+            raise NotImplementedError(f"wave_amd {kind} currently requires a positive constant divisor")
+        lhs_expr, lhs_bindings = self._expr_and_bindings(lhs)
+        if lhs_expr is None:
+            raise NotImplementedError(f"wave_amd {kind} currently requires a symbolic dividend")
+        if kind == "divsi":
+            expr = self.dsl.floor(lhs_expr / rhs.const)
+        elif kind == "remsi":
+            expr = self.dsl.mod(lhs_expr, rhs.const)
+        else:
+            raise AssertionError(kind)
+        index = self.func.index_expr(expr, lhs_bindings, self.dsl.index_type())
+        value = self.func.index_cast(index, self.dsl.i32())
+        self._set_result(
+            op,
+            _Value(
+                wave=value,
+                elem_type=lhs.elem_type or "i32",
+                expr=expr,
+                bindings=lhs_bindings,
+                sym_index=_SymbolicIndex(expr, (), dict(lhs_bindings)),
             ),
         )
 
@@ -635,6 +776,12 @@ class _TTIRToWaveLowerer:
             layout = self._layout_for_info(info)
             lhs = self._coerce_tensor(lhs, layout, info)
             rhs = self._coerce_tensor(rhs, layout, info)
+            if not lhs.waves and lhs.sym_index is not None:
+                lhs = self._symbolic_tensor_value(layout, _TensorInfo(info.shape, lhs.elem_type or info.elem_type),
+                                                  lhs.sym_index)
+            if not rhs.waves and rhs.sym_index is not None:
+                rhs = self._symbolic_tensor_value(layout, _TensorInfo(info.shape, rhs.elem_type or info.elem_type),
+                                                  rhs.sym_index)
             waves = tuple(
                 self.func.cmpi(predicate, lhs_wave, rhs_wave) for lhs_wave, rhs_wave in zip(lhs.waves, rhs.waves))
             self._set_result(
@@ -708,6 +855,8 @@ class _TTIRToWaveLowerer:
                 elem_type=ptr.elem_type,
                 ptr_base=ptr.ptr_base,
                 ptr_offset_affine=offset.affine,
+                ptr_dot_layout=_DotPointerLayout(info.shape, offset.sym_index)
+                if offset.sym_index is not None else None,
                 layout=layout,
                 shape=info.shape,
             ),
@@ -716,11 +865,20 @@ class _TTIRToWaveLowerer:
     def _lower_load(self, op) -> None:
         role = self.dot_operand_roles.get(op.get_result(0).id())
         if role is not None:
-            if self._memory_mask(op) is not None:
-                raise NotImplementedError("wave_amd tt.dot operand loads do not yet support masks")
             ptr = self._value(op.get_operand(0))
             info = self._result_tensor_info(op)
-            grid = self._emit_dot_fragment_load(ptr, info, role)
+            mask = self._memory_mask(op)
+            mask_value = None
+            if mask is not None:
+                if op.get_num_operands() != 3:
+                    raise NotImplementedError("wave_amd masked tt.dot operand loads require an explicit zero `other`")
+                self._expect_zero_dot_load_other(self._value(op.get_operand(2)), ptr.elem_type)
+                if info is None or info.shape != (16, 16):
+                    raise NotImplementedError("wave_amd masked tt.dot operand loads currently support one 16x16 tile")
+                mask_value = self._value(mask)
+                layout = ptr.layout or self._layout_for_info(info)
+                mask_value = self._coerce_tensor(mask_value, layout, _TensorInfo(info.shape, "i1"))
+            grid = self._emit_dot_fragment_load(ptr, info, role, mask_value)
             self.load_tokens.extend(grid.tokens)
             self._set_result(
                 op,
@@ -822,9 +980,16 @@ class _TTIRToWaveLowerer:
         value = self._value(op.get_operand(1))
         mask = self._memory_mask(op)
         if value.fragment is not None:
+            mask_value = None
             if mask is not None:
-                raise NotImplementedError("wave_amd tt.dot fragment stores do not yet support masks")
-            self._emit_fragment_store(ptr, value)
+                if value.shape != (16, 16):
+                    raise NotImplementedError("wave_amd masked tt.dot fragment stores currently support one 16x16 tile")
+                mask_value = self._value(mask)
+                if mask_value.wave is None and not mask_value.waves:
+                    raise NotImplementedError("wave_amd masked tt.dot fragment stores require a Wave mask")
+                layout = ptr.layout or self._layout_for_info(_TensorInfo(value.shape, "i1"))
+                mask_value = self._coerce_tensor(mask_value, layout, _TensorInfo(value.shape, "i1"))
+            self._emit_fragment_store(ptr, value, mask_value)
             return
         if mask is None and value.other_wave is not None and value.mask_wave is not None:
             self._emit_unmasked_store_of_masked_load_other(ptr, value)
@@ -948,33 +1113,41 @@ class _TTIRToWaveLowerer:
                 return self.func.fragment_fill(self.func.constant(self.dsl.i32(), 0), frag_type)
         raise NotImplementedError("wave_amd tt.dot currently supports only zero-splat f32 accumulators")
 
-    def _emit_dot_fragment_load(self, ptr: _Value, info: Optional[_TensorInfo], role: int):
+    def _emit_dot_fragment_load(self, ptr: _Value, info: Optional[_TensorInfo], role: int,
+                                mask: Optional[_Value] = None):
         if info is None:
             raise NotImplementedError("wave_amd tt.dot operand load requires ranked tensor result metadata")
         if info.elem_type != "f16" or len(info.shape) != 2:
             raise NotImplementedError("wave_amd tt.dot operand loads currently support rank-2 f16 tensors")
         if ptr.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot operand loads require a splatted pointer base")
+        dot_layout = ptr.ptr_dot_layout
+        fixed_affine = None
         if role == 0:
             m, k = info.shape
             if m < 16 or m % 16 != 0:
                 raise NotImplementedError("wave_amd tt.dot A operand M dimension must be a positive multiple of 16")
-            self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (k, 1)),
-                                            f"A operand row-major {m}x{k} offsets")
+            fixed_affine = _AffineIndex(0, (k, 1))
+            if ptr.ptr_offset_affine != fixed_affine and dot_layout is None:
+                self._expect_dot_pointer_layout(ptr, info.shape, fixed_affine, f"A operand row-major {m}x{k} offsets")
             m_tiles = m // 16
             n_tiles = 0
         elif role == 1:
             k, n = info.shape
             if n < 16 or n % 16 != 0:
                 raise NotImplementedError("wave_amd tt.dot B operand N dimension must be a positive multiple of 16")
-            self._expect_dot_pointer_layout(ptr, info.shape, _AffineIndex(0, (1, k)),
-                                            f"B operand K-contiguous column-major {k}x{n} offsets")
+            fixed_affine = _AffineIndex(0, (1, k))
+            if ptr.ptr_offset_affine != fixed_affine and dot_layout is None:
+                self._expect_dot_pointer_layout(ptr, info.shape, fixed_affine,
+                                                f"B operand K-contiguous column-major {k}x{n} offsets")
             m_tiles = 0
             n_tiles = n // 16
         else:
             raise AssertionError(f"unexpected dot operand role {role}")
         if k < 16 or k % 16 != 0:
             raise NotImplementedError("wave_amd tt.dot operand K dimension must be a positive multiple of 16")
+        if dot_layout is not None and dot_layout.shape != info.shape:
+            raise NotImplementedError("wave_amd tt.dot symbolic pointer layout must match the operand shape")
 
         thread, sym = self._thread_id_and_sym()
         lane_base = self.dsl.mod(sym, 16) * k
@@ -986,12 +1159,20 @@ class _TTIRToWaveLowerer:
         for tile in range(outer_tiles):
             tile_base = tile * 16 * k
             for step in range(k_steps):
-                offset = tile_base + step * 16
-                index_expr = lane_base + offset if offset else lane_base
-                index = self.func.index_expr(index_expr, {sym: thread}, index_type)
+                if dot_layout is not None and ptr.ptr_offset_affine != fixed_affine:
+                    if role == 0:
+                        coords = (tile * 16 + self.dsl.mod(sym, 16), step * 16)
+                    else:
+                        coords = (step * 16, tile * 16 + self.dsl.mod(sym, 16))
+                    index_expr = dot_layout.expr(coords)
+                    bindings = {sym: thread, **dot_layout.offset.bindings}
+                else:
+                    offset = tile_base + step * 16
+                    index_expr = lane_base + offset if offset else lane_base
+                    bindings = {sym: thread}
+                index = self.func.index_expr(index_expr, bindings, index_type)
                 frag_ptr = self.func.ptr_add(ptr.ptr_base, index)
-                fragment, token = self.func.fragment_load(frag_ptr,
-                                                          self._dot_fragment_type(role=role, elem_type=info.elem_type))
+                fragment, token = self._emit_masked_dot_fragment_load(frag_ptr, role, info.elem_type, mask)
                 fragments.append(fragment)
                 tokens.append(token)
         return _DotFragmentGrid(
@@ -1003,14 +1184,36 @@ class _TTIRToWaveLowerer:
             tokens=tuple(tokens),
         )
 
-    def _emit_fragment_store(self, ptr: _Value, value: _Value) -> None:
+    def _emit_masked_dot_fragment_load(self, frag_ptr, role: int, elem_type: str, mask: Optional[_Value] = None):
+        frag_type = self._dot_fragment_type(role=role, elem_type=elem_type)
+        if mask is None:
+            return self.func.fragment_load(frag_ptr, frag_type)
+        if not mask.waves:
+            raise NotImplementedError("wave_amd masked tt.dot operand loads require a Wave mask")
+        with self.func.where(mask.waves[0], [frag_type, self.dsl.mem_token_type()]) as where_op:
+            fragment, token = self.func.fragment_load(frag_ptr, frag_type)
+            self.func.yield_([fragment, token])
+        return where_op.results
+
+    def _expect_zero_dot_load_other(self, other: _Value, elem_type: str) -> None:
+        if other.splat_const is None:
+            raise NotImplementedError("wave_amd masked tt.dot operand loads require zero-splat `other`")
+        value, other_elem_type, _ = other.splat_const
+        if value != 0 or other_elem_type not in {elem_type, "f32"}:
+            raise NotImplementedError("wave_amd masked tt.dot operand loads require zero-splat `other`")
+
+    def _emit_fragment_store(self, ptr: _Value, value: _Value, mask: Optional[_Value] = None) -> None:
         if ptr.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot result stores require a splatted pointer base")
         if value.shape is None or len(value.shape) != 2:
             raise NotImplementedError("wave_amd tt.dot result stores require a rank-2 matrix result")
         m, n = value.shape
-        self._expect_dot_pointer_layout(ptr, value.shape, _AffineIndex(0, (n, 1)),
-                                        f"C result row-major {m}x{n} offsets")
+        fixed_affine = _AffineIndex(0, (n, 1))
+        dot_layout = ptr.ptr_dot_layout
+        if ptr.ptr_offset_affine != fixed_affine and dot_layout is None:
+            self._expect_dot_pointer_layout(ptr, value.shape, fixed_affine, f"C result row-major {m}x{n} offsets")
+        if mask is not None and (value.dot_grid is None or value.dot_grid.m_tiles != 1 or value.dot_grid.n_tiles != 1):
+            raise NotImplementedError("wave_amd masked tt.dot fragment stores currently support one 16x16 tile")
         if value.dot_grid is not None:
             grid = value.dot_grid
             if grid.role != 2:
@@ -1018,12 +1221,18 @@ class _TTIRToWaveLowerer:
             for m_tile in range(grid.m_tiles):
                 for n_tile in range(grid.n_tiles):
                     tile_base = m_tile * 16 * n + n_tile * 16
-                    self._emit_dot_row_major_fragment_store(ptr.ptr_base, grid.c(m_tile, n_tile), n, tile_base)
+                    self._emit_dot_row_major_fragment_store(
+                        ptr.ptr_base, grid.c(m_tile, n_tile), n, tile_base,
+                        dot_layout if ptr.ptr_offset_affine != fixed_affine else None, m_tile, n_tile, mask)
         else:
-            self._emit_dot_row_major_fragment_store(ptr.ptr_base, value.fragment, n, 0)
+            self._emit_dot_row_major_fragment_store(ptr.ptr_base, value.fragment, n, 0,
+                                                    dot_layout if ptr.ptr_offset_affine != fixed_affine else None, 0, 0,
+                                                    mask)
         self.load_tokens.clear()
 
-    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment, leading_dim: int, tile_base: int) -> None:
+    def _emit_dot_row_major_fragment_store(self, ptr_base, fragment, leading_dim: int, tile_base: int,
+                                           dot_layout: Optional[_DotPointerLayout] = None, m_tile: int = 0,
+                                           n_tile: int = 0, mask: Optional[_Value] = None) -> None:
         regs = self.func.fragment_unpack(fragment)
         thread, sym = self._thread_id_and_sym()
         lane = self.dsl.mod(sym, 16)
@@ -1032,10 +1241,22 @@ class _TTIRToWaveLowerer:
         value_type = self.dsl.simd_type(self.dsl.i32(), self.width)
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
         for register in range(8):
-            row_major = tile_base + (register * 2 + row_parity) * leading_dim + lane
-            index = self.func.index_expr(row_major, {sym: thread}, index_type)
+            if dot_layout is not None:
+                row = m_tile * 16 + register * 2 + row_parity
+                col = n_tile * 16 + lane
+                row_major = dot_layout.expr((row, col))
+                bindings = {sym: thread, **dot_layout.offset.bindings}
+            else:
+                row_major = tile_base + (register * 2 + row_parity) * leading_dim + lane
+                bindings = {sym: thread}
+            index = self.func.index_expr(row_major, bindings, index_type)
             value = self.dsl.wave.ExtractOp(value_type, regs, register).result
-            self.func.store(value, self.func.ptr_add(ptr_base, index), after=after)
+            ptr = self.func.ptr_add(ptr_base, index)
+            if mask is None:
+                self.func.store(value, ptr, after=after)
+            else:
+                with self.func.where(mask.waves[register]):
+                    self.func.store(value, ptr, after=after)
 
     def _expect_dot_pointer_layout(self, ptr: _Value, shape: Optional[Tuple[int, ...]], expected: _AffineIndex,
                                    description: str) -> None:
@@ -1245,29 +1466,42 @@ class _TTIRToWaveLowerer:
             splat_const=state.splat_const,
             layout=layout,
             shape=info.shape,
+            sym_index=_symbolic_splat(state.sym_index, len(info.shape)),
         )
 
     def _coordinate_value(self, layout: _BlockedLayout, info: _TensorInfo, axis: int, start: int = 0) -> _Value:
+        return self._symbolic_tensor_value(layout, info, _symbolic_coord(len(info.shape), axis, start), axis, start,
+                                           materialize_waves=len(info.shape) == 1)
+
+    def _symbolic_tensor_value(self, layout: _BlockedLayout, info: _TensorInfo, sym_index: Optional[_SymbolicIndex],
+                               coord_axis: Optional[int] = None, coord_start: int = 0,
+                               materialize_waves: bool = True) -> _Value:
+        if sym_index is None:
+            raise NotImplementedError("wave_amd requires symbolic tensor metadata")
         thread, sym = self._thread_id_and_sym()
         cta_expr, cta_bindings = self._cta_expr_and_bindings()
         waves = []
         exprs = []
         bindings_by_wave = []
         for register in range(layout.registers):
-            expr = layout.coord_expr(self.dsl, sym, cta_expr, register, axis)
-            if start:
-                expr = expr + start
+            coords = tuple(
+                layout.coord_expr(self.dsl, sym, cta_expr, register, axis) for axis in range(len(info.shape)))
+            expr = sym_index.const
+            for coord, coeff in zip(coords, sym_index.coeffs):
+                expr = expr + coord * coeff
             bindings = {sym: thread, **cta_bindings}
-            if len(layout.shape) == 1:
-                offset = register * layout.threads_per_cta + start
-                if cta_expr is None:
-                    wave = thread if offset == 0 else self.func.addi(thread, self._splat_i32(offset))
+            bindings.update(sym_index.bindings)
+            if materialize_waves:
+                if coord_axis is not None and len(layout.shape) == 1 and not sym_index.bindings:
+                    offset = register * layout.threads_per_cta + coord_start
+                    if cta_expr is None:
+                        wave = thread if offset == 0 else self.func.addi(thread, self._splat_i32(offset))
+                    else:
+                        wave = self.func.index_expr(expr, bindings,
+                                                    self.dsl.simd_type(self.dsl.index_type(), self.width))
                 else:
-                    flat_expr = layout.index_expr(self.dsl, sym, cta_expr, register)
-                    if start:
-                        flat_expr = flat_expr + start
-                    wave = self.func.index_expr(flat_expr, bindings,
-                                                self.dsl.simd_type(self.dsl.index_type(), self.width))
+                    wave = self.func.index_expr(expr, bindings,
+                                                self.dsl.simd_type(self._scalar_type(info.elem_type), self.width))
                 waves.append(wave)
             exprs.append(expr)
             bindings_by_wave.append(bindings)
@@ -1275,15 +1509,16 @@ class _TTIRToWaveLowerer:
             wave=waves[0] if waves else None,
             waves=tuple(waves),
             elem_type=info.elem_type,
-            affine=_affine_coord(len(info.shape), axis, start),
+            affine=_affine_coord(len(info.shape), coord_axis, coord_start) if coord_axis is not None else None,
             expr=exprs[0],
             exprs=tuple(exprs),
             bindings=bindings_by_wave[0],
             bindings_by_wave=tuple(bindings_by_wave),
             layout=layout,
             shape=info.shape,
-            coord_axis=axis,
-            coord_start=start,
+            sym_index=sym_index,
+            coord_axis=coord_axis,
+            coord_start=coord_start,
         )
 
     def _result_tensor_info(self, op) -> Optional[_TensorInfo]:
@@ -1440,6 +1675,95 @@ def _affine_is_constant(value: _AffineIndex) -> bool:
 
 def _affine_scale(value: _AffineIndex, scale: int) -> _AffineIndex:
     return _AffineIndex(value.const * scale, tuple(coeff * scale for coeff in value.coeffs))
+
+
+def _symbolic_coord(rank: int, axis: int, start: int = 0) -> _SymbolicIndex:
+    coeffs = [0] * rank
+    coeffs[axis] = 1
+    return _SymbolicIndex(start, tuple(coeffs), {})
+
+
+def _symbolic_splat(value: Optional[_SymbolicIndex], rank: int) -> Optional[_SymbolicIndex]:
+    if value is None:
+        return None
+    if len(value.coeffs) == rank:
+        return value
+    if value.coeffs and not _symbolic_is_uniform(value):
+        return None
+    return _SymbolicIndex(value.const, (0, ) * rank, dict(value.bindings))
+
+
+def _symbolic_expand_dims(value: Optional[_SymbolicIndex], axis: int, rank: int) -> Optional[_SymbolicIndex]:
+    if value is None or len(value.coeffs) != rank - 1:
+        return None
+    coeffs = list(value.coeffs)
+    coeffs.insert(axis, 0)
+    return _SymbolicIndex(value.const, tuple(coeffs), dict(value.bindings))
+
+
+def _symbolic_broadcast(value: Optional[_SymbolicIndex], rank: int) -> Optional[_SymbolicIndex]:
+    if value is None:
+        return None
+    if len(value.coeffs) == rank:
+        return value
+    if _symbolic_is_uniform(value):
+        return _SymbolicIndex(value.const, (0, ) * rank, dict(value.bindings))
+    return None
+
+
+def _symbolic_add(lhs: Optional[_SymbolicIndex], rhs: Optional[_SymbolicIndex]) -> Optional[_SymbolicIndex]:
+    lhs, rhs = _symbolic_common_rank(lhs, rhs)
+    if lhs is None or rhs is None:
+        return None
+    return _SymbolicIndex(lhs.const + rhs.const, tuple(l + r for l, r in zip(lhs.coeffs, rhs.coeffs)),
+                          {**lhs.bindings, **rhs.bindings})
+
+
+def _symbolic_sub(lhs: Optional[_SymbolicIndex], rhs: Optional[_SymbolicIndex]) -> Optional[_SymbolicIndex]:
+    lhs, rhs = _symbolic_common_rank(lhs, rhs)
+    if lhs is None or rhs is None:
+        return None
+    return _SymbolicIndex(lhs.const - rhs.const, tuple(l - r for l, r in zip(lhs.coeffs, rhs.coeffs)),
+                          {**lhs.bindings, **rhs.bindings})
+
+
+def _symbolic_mul(lhs: Optional[_SymbolicIndex], rhs: Optional[_SymbolicIndex]) -> Optional[_SymbolicIndex]:
+    lhs, rhs = _symbolic_common_rank(lhs, rhs)
+    if lhs is None or rhs is None:
+        return None
+    if _symbolic_is_uniform(lhs):
+        return _symbolic_scale(rhs, lhs.const, lhs.bindings)
+    if _symbolic_is_uniform(rhs):
+        return _symbolic_scale(lhs, rhs.const, rhs.bindings)
+    return None
+
+
+def _symbolic_common_rank(lhs: Optional[_SymbolicIndex],
+                          rhs: Optional[_SymbolicIndex]) -> Tuple[Optional[_SymbolicIndex], Optional[_SymbolicIndex]]:
+    if lhs is None or rhs is None:
+        return lhs, rhs
+    lhs_rank = len(lhs.coeffs)
+    rhs_rank = len(rhs.coeffs)
+    if lhs_rank == rhs_rank:
+        return lhs, rhs
+    if lhs_rank == 0:
+        return _SymbolicIndex(lhs.const, (0, ) * rhs_rank, dict(lhs.bindings)), rhs
+    if rhs_rank == 0:
+        return lhs, _SymbolicIndex(rhs.const, (0, ) * lhs_rank, dict(rhs.bindings))
+    if _symbolic_is_uniform(lhs):
+        return _SymbolicIndex(lhs.const, (0, ) * rhs_rank, dict(lhs.bindings)), rhs
+    if _symbolic_is_uniform(rhs):
+        return lhs, _SymbolicIndex(rhs.const, (0, ) * lhs_rank, dict(rhs.bindings))
+    return None, None
+
+
+def _symbolic_is_uniform(value: _SymbolicIndex) -> bool:
+    return all(coeff == 0 for coeff in value.coeffs)
+
+
+def _symbolic_scale(value: _SymbolicIndex, scale, scale_bindings: Dict[object, object]) -> _SymbolicIndex:
+    return _SymbolicIndex(value.const * scale, tuple(coeff * scale for coeff in value.coeffs),
+                          {**value.bindings, **scale_bindings})
 
 
 def _pack_tensor_info(info) -> Optional[_TensorInfo]:

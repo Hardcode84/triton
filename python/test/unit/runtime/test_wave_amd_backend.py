@@ -206,6 +206,98 @@ DOT_MATMUL_32X32_K32_TTIR = _dot_matmul_ttir(32, 32, 32, "dot_32x32_k32_kernel")
 DOT_MATMUL_M8_TTIR = _dot_matmul_ttir(8, 32, 16, "dot_m8_kernel")
 DOT_MATMUL_N8_TTIR = _dot_matmul_ttir(32, 8, 16, "dot_n8_kernel")
 
+REALISTIC_MATMUL_TILE_TTIR = """
+module {
+  tt.func public @realistic_matmul_tile_kernel(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+                                               %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+                                               %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                               %arg3: i32,
+                                               %arg4: i32,
+                                               %arg5: i32,
+                                               %arg6: i32,
+                                               %arg7: i32,
+                                               %arg8: i32,
+                                               %arg9: i32,
+                                               %arg10: i32,
+                                               %arg11: i32) attributes {noinline = false} {
+    %c2 = arith.constant 2 : i32
+    %c16 = arith.constant 16 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    %other = arith.constant dense<0.000000e+00> : tensor<16x16xf16>
+    %pid = tt.get_program_id x : i32
+    %pid_m = arith.remsi %pid, %c2 : i32
+    %pid_n = arith.divsi %pid, %c2 : i32
+    %pid_m_block = arith.muli %pid_m, %c16 : i32
+    %pid_n_block = arith.muli %pid_n, %c16 : i32
+    %pid_m_vec = tt.splat %pid_m_block : i32 -> tensor<16xi32>
+    %pid_n_vec = tt.splat %pid_n_block : i32 -> tensor<16xi32>
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %cols = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %ks = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+    %offs_m = arith.addi %pid_m_vec, %rows : tensor<16xi32>
+    %offs_n = arith.addi %pid_n_vec, %cols : tensor<16xi32>
+    %rows_a = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %ks_a = tt.expand_dims %ks {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %rows_a_b = tt.broadcast %rows_a : tensor<16x1xi32> -> tensor<16x16xi32>
+    %ks_a_b = tt.broadcast %ks_a : tensor<1x16xi32> -> tensor<16x16xi32>
+    %stride_am = tt.splat %arg6 : i32 -> tensor<16x16xi32>
+    %stride_ak = tt.splat %arg7 : i32 -> tensor<16x16xi32>
+    %a_row_offsets = arith.muli %rows_a_b, %stride_am : tensor<16x16xi32>
+    %a_k_offsets = arith.muli %ks_a_b, %stride_ak : tensor<16x16xi32>
+    %a_offsets = arith.addi %a_row_offsets, %a_k_offsets : tensor<16x16xi32>
+    %m_vec = tt.splat %arg3 : i32 -> tensor<16x16xi32>
+    %a_mask = arith.cmpi ult, %rows_a_b, %m_vec : tensor<16x16xi32>
+    %ks_b = tt.expand_dims %ks {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cols_b = tt.expand_dims %offs_n {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %ks_b_b = tt.broadcast %ks_b : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cols_b_b = tt.broadcast %cols_b : tensor<1x16xi32> -> tensor<16x16xi32>
+    %stride_bk = tt.splat %arg8 : i32 -> tensor<16x16xi32>
+    %stride_bn = tt.splat %arg9 : i32 -> tensor<16x16xi32>
+    %b_k_offsets = arith.muli %ks_b_b, %stride_bk : tensor<16x16xi32>
+    %b_col_offsets = arith.muli %cols_b_b, %stride_bn : tensor<16x16xi32>
+    %b_offsets = arith.addi %b_k_offsets, %b_col_offsets : tensor<16x16xi32>
+    %n_vec = tt.splat %arg4 : i32 -> tensor<16x16xi32>
+    %b_mask = arith.cmpi ult, %cols_b_b, %n_vec : tensor<16x16xi32>
+    %rows_c = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cols_c = tt.expand_dims %offs_n {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %rows_c_b = tt.broadcast %rows_c : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cols_c_b = tt.broadcast %cols_c : tensor<1x16xi32> -> tensor<16x16xi32>
+    %stride_cm = tt.splat %arg10 : i32 -> tensor<16x16xi32>
+    %stride_cn = tt.splat %arg11 : i32 -> tensor<16x16xi32>
+    %c_row_offsets = arith.muli %rows_c_b, %stride_cm : tensor<16x16xi32>
+    %c_col_offsets = arith.muli %cols_c_b, %stride_cn : tensor<16x16xi32>
+    %c_offsets = arith.addi %c_row_offsets, %c_col_offsets : tensor<16x16xi32>
+    %c_mask = arith.cmpi ult, %rows_c_b, %m_vec : tensor<16x16xi32>
+    %a_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %b_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %c_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
+    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
+    %a = tt.load %a_ptrs, %a_mask, %other : tensor<16x16x!tt.ptr<f16>>
+    %b = tt.load %b_ptrs, %b_mask, %other : tensor<16x16x!tt.ptr<f16>>
+    %acc = tt.dot %a, %b, %zero : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+    tt.store %c_ptrs, %acc, %c_mask : tensor<16x16x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+REALISTIC_MATMUL_LOOP_TTIR = """
+module {
+  tt.func public @realistic_matmul_loop_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    %acc = scf.for %i = %c0 to %c2 step %c1 iter_args(%iter = %zero) -> (tensor<16x16xf32>) {
+      scf.yield %iter : tensor<16x16xf32>
+    }
+    tt.return
+  }
+}
+"""
+
 MASKED_ADD_TTIR = """
 module {
   tt.func public @masked_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
@@ -824,6 +916,46 @@ def test_wave_amd_make_wave_rejects_dot_mn_not_multiple_of_16(tmp_path, ttir, ma
     module = _parse_ttir(tmp_path, backend, ttir)
 
     with pytest.raises(NotImplementedError, match=match):
+        backend.make_wave(module, {}, options)
+
+
+def test_wave_amd_make_wave_lowers_realistic_matmul_tile_pattern(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    metadata = {}
+    module = _parse_ttir(tmp_path, backend, REALISTIC_MATMUL_TILE_TTIR)
+
+    wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "realistic_matmul_tile_kernel"
+    assert "func.func @realistic_matmul_tile_kernel" in wave
+    assert "wave.workgroup_id 0" in wave
+    assert "wave.index_expr" in wave
+    assert wave.count("wave.where") >= 3
+    assert wave.count("waveamd.fragment_pack") == 2
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
+
+
+def test_wave_amd_make_wave_rejects_realistic_matmul_k_loop(tmp_path):
+    pytest.importorskip(
+        "mlir.dialects.wave_dsl",
+        reason="Wave Python MLIR builder bindings are required",
+    )
+
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    module = _parse_ttir(tmp_path, backend, REALISTIC_MATMUL_LOOP_TTIR)
+
+    with pytest.raises(NotImplementedError, match="scf.for K loops"):
         backend.make_wave(module, {}, options)
 
 
