@@ -65,7 +65,6 @@ class WaveAMDOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     enable_ttgir_preview: bool = False
-    enable_ttgir_wave_lowering: bool = True
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     backend_name: str = "wave_amd"
@@ -167,8 +166,7 @@ class WaveAMDBackend(BaseBackend):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         if options.enable_ttgir_preview:
             stages["ttgir_preview"] = lambda src, metadata: self.make_ttgir_preview(src, metadata, options)
-        if options.enable_ttgir_wave_lowering:
-            stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
+        stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)

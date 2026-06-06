@@ -524,17 +524,11 @@ def test_wave_amd_backend_skeleton():
     assert backend.get_target_name(options) == "wave_amd:gfx1100"
     assert options.backend_name == "wave_amd"
     assert options.warp_size == 32
-    assert options.enable_ttgir_wave_lowering
     assert backend.pack_metadata(SimpleNamespace(num_warps=4, num_ctas=1)) == (4, 1, 0)
 
     stages = {}
     backend.add_stages(stages, options, Language.TRITON)
     assert list(stages) == ["ttir", "ttgir", "wave", "amdgcn", "hsaco"]
-
-    direct_options = backend.parse_options({"enable_ttgir_wave_lowering": False})
-    direct_stages = {}
-    backend.add_stages(direct_stages, direct_options, Language.TRITON)
-    assert list(direct_stages) == ["ttir", "wave", "amdgcn", "hsaco"]
 
     preview_options = backend.parse_options({"enable_ttgir_preview": True})
     preview_stages = {}
@@ -599,7 +593,7 @@ def _ttgir_preview_text(tmp_path, ttir, options_dict=None):
 def _accelerated_ttgir_text(tmp_path, ttir, options_dict=None):
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
-    opts = {"num_warps": 1, "enable_ttgir_wave_lowering": True}
+    opts = {"num_warps": 1}
     if options_dict is not None:
         opts.update(options_dict)
     options = backend.parse_options(opts)
@@ -613,7 +607,7 @@ def _accelerated_ttgir_text(tmp_path, ttir, options_dict=None):
 def _accelerated_ttgir_convert_layout_types(tmp_path, ttir):
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1, "enable_ttgir_wave_lowering": True})
+    options = backend.parse_options({"num_warps": 1})
     module = _parse_ttir(tmp_path, backend, ttir)
     pairs = []
 
@@ -705,6 +699,51 @@ def test_wave_amd_ttgir_convert_layout_classifier_accepts_matrix_core_shapes():
     assert wave_lowering._ttgir_convert_layout_kind(blocked, blocked) is None
     assert wave_lowering._ttgir_dot_operand_role(dot_a) == 0
     assert wave_lowering._ttgir_dot_operand_role(dot_b) == 1
+
+    with pytest.raises(NotImplementedError, match="only matrix-core ttg.convert_layout ops"):
+        wave_lowering._expect_ttgir_convert_layout_kind(blocked, blocked)
+
+
+def test_wave_amd_dot_role_collection_uses_ttgir_encodings_only():
+
+    class FakeValue:
+
+        def __init__(self, value_id, value_type="tensor<16x16xf16, #ttg.blocked<{}>>"):
+            self._id = value_id
+            self._type = value_type
+
+        def id(self):
+            return self._id
+
+        def get_type(self):
+            return self._type
+
+    class FakeOp:
+
+        def __init__(self, name, operands, results=()):
+            self._name = name
+            self._operands = operands
+            self._results = results
+
+        def get_name(self):
+            return self._name
+
+        def get_operand(self, index):
+            return self._operands[index]
+
+        def get_result(self, index):
+            return self._results[index]
+
+    encoded_src = FakeValue(4)
+    encoded_dst = FakeValue(5, "tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>")
+    encoded_convert = FakeOp("ttg.convert_layout", (encoded_src, ), (encoded_dst, ))
+
+    lowerer = wave_lowering._TTIRToWaveLowerer.__new__(wave_lowering._TTIRToWaveLowerer)
+    lowerer.dot_operand_roles = {}
+    lowerer.producers_by_result = {}
+    lowerer._collect_dot_operand_roles((FakeOp("tt.dot", (FakeValue(1), FakeValue(2), FakeValue(3))), encoded_convert))
+
+    assert lowerer.dot_operand_roles == {4: 1, 5: 1}
 
 
 def test_wave_amd_ttgir_stage_uses_supported_matrix_core_convert_layouts(tmp_path):
@@ -1064,7 +1103,7 @@ def test_wave_amd_make_wave_lowers_2d_offsets_across_two_ctas(tmp_path, monkeypa
     assert wave.count("wave.store") == 32
 
 
-def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
+def _lower_accelerated_ttgir_to_wave_with_backend(tmp_path, ttir, options_dict=None):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
         reason="Wave Python MLIR builder bindings are required",
@@ -1072,32 +1111,7 @@ def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
 
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert metadata["name"] == "dot_kernel"
-    assert "func.func @dot_kernel" in wave
-    assert "wave.lds_size" not in wave
-    assert "wave.index_expr" in wave
-    assert "waveamd.buffer.range_bytes" in wave
-    assert "waveamd.fragment_pack" in wave
-    assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
-    assert "waveamd.fragment_unpack" in wave
-    assert "wave.store" in wave
-
-
-def _lower_accelerated_ttgir_to_wave(tmp_path, ttir, options_dict=None):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    opts = {"num_warps": 1, "enable_ttgir_wave_lowering": True}
+    opts = {"num_warps": 1}
     if options_dict is not None:
         opts.update(options_dict)
     options = backend.parse_options(opts)
@@ -1107,6 +1121,11 @@ def _lower_accelerated_ttgir_to_wave(tmp_path, ttir, options_dict=None):
     backend.make_ttgir(module, metadata, options)
     assert "#ttg.amd_wmma" in str(module)
     wave = backend.make_wave(module, metadata, options)
+    return backend, options, wave, metadata
+
+
+def _lower_accelerated_ttgir_to_wave(tmp_path, ttir, options_dict=None):
+    _, _, wave, metadata = _lower_accelerated_ttgir_to_wave_with_backend(tmp_path, ttir, options_dict)
     return wave, metadata
 
 
@@ -1129,60 +1148,6 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_k32_to_two_native_wmma_
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 2
     assert wave.count("waveamd.fragment_pack") == 4
     assert "wave.store" in wave
-
-
-def test_wave_amd_make_wave_lowers_dot_k32_to_two_native_wmma_ops(tmp_path):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_K32_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert metadata["name"] == "dot_k32_kernel"
-    assert "func.func @dot_k32_kernel" in wave
-    assert "waveamd.buffer.range_bytes" in wave
-    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 2
-    assert wave.count("waveamd.fragment_pack") == 4
-    assert "32" in wave
-    assert "wave.store" in wave
-
-
-@pytest.mark.parametrize(
-    ("ttir", "kernel_name", "expected_mmas", "expected_packs"),
-    [
-        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4),
-        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8),
-    ],
-)
-def test_wave_amd_make_wave_lowers_32x32_dot_to_native_wmma_grid(tmp_path, ttir, kernel_name, expected_mmas,
-                                                                 expected_packs):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, ttir)
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert metadata["name"] == kernel_name
-    assert f"func.func @{kernel_name}" in wave
-    assert "waveamd.buffer.range_bytes" in wave
-    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == expected_mmas
-    assert wave.count("waveamd.fragment_pack") == expected_packs
-    assert wave.count("waveamd.fragment_unpack") == 4
-    assert wave.count("wave.store") == 32
 
 
 @pytest.mark.parametrize(
@@ -1211,34 +1176,6 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_32x32_dot_to_native_wmma_gr
         ({"num_warps": 1, "num_ctas": 2}, "wave.workgroup_id 0"),
     ],
 )
-def test_wave_amd_make_wave_lowers_dot_scheduled_across_workers(tmp_path, options_dict, expected_marker):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options(options_dict)
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_32X32_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert metadata["name"] == "dot_32x32_kernel"
-    assert expected_marker in wave
-    assert wave.count("wave.where") >= 4
-    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 4
-    assert wave.count("wave.store") == 32
-
-
-@pytest.mark.parametrize(
-    ("options_dict", "expected_marker"),
-    [
-        ({"num_warps": 2}, "wave.workitem_id 0"),
-        ({"num_warps": 1, "num_ctas": 2}, "wave.workgroup_id 0"),
-    ],
-)
 def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_scheduled_across_workers(tmp_path, options_dict,
                                                                                   expected_marker):
     wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, DOT_MATMUL_32X32_TTIR, options_dict)
@@ -1248,69 +1185,6 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_scheduled_across_worker
     assert wave.count("wave.where") >= 4
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 4
     assert wave.count("wave.store") == 32
-
-
-def test_wave_amd_make_wave_rejects_dot_k_not_multiple_of_16(tmp_path):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_K8_TTIR)
-
-    with pytest.raises(NotImplementedError, match="K dimension.*multiple of 16"):
-        backend.make_wave(module, {}, options)
-
-
-@pytest.mark.parametrize(
-    ("ttir", "match"),
-    [
-        (DOT_MATMUL_M8_TTIR, "M dimension.*multiple of 16"),
-        (DOT_MATMUL_N8_TTIR, "N dimension.*multiple of 16"),
-    ],
-)
-def test_wave_amd_make_wave_rejects_dot_mn_not_multiple_of_16(tmp_path, ttir, match):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    module = _parse_ttir(tmp_path, backend, ttir)
-
-    with pytest.raises(NotImplementedError, match=match):
-        backend.make_wave(module, {}, options)
-
-
-def test_wave_amd_make_wave_lowers_realistic_matmul_tile_pattern(tmp_path):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, REALISTIC_MATMUL_TILE_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert metadata["name"] == "realistic_matmul_tile_kernel"
-    assert "func.func @realistic_matmul_tile_kernel" in wave
-    assert "wave.workgroup_id 0" in wave
-    assert "wave.index_expr" in wave
-    assert "waveamd.buffer.range_bytes" not in wave
-    assert wave.count("wave.where") >= 3
-    assert wave.count("waveamd.fragment_pack") == 2
-    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
-    assert "waveamd.fragment_unpack" in wave
-    assert "wave.store" in wave
 
 
 def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_tile_pattern(tmp_path):
@@ -1323,29 +1197,6 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_tile_patte
     assert wave.count("wave.where") >= 3
     assert wave.count("waveamd.fragment_pack") == 2
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
-    assert "waveamd.fragment_unpack" in wave
-    assert "wave.store" in wave
-
-
-def test_wave_amd_make_wave_lowers_realistic_matmul_k_loop(tmp_path):
-    pytest.importorskip(
-        "mlir.dialects.wave_dsl",
-        reason="Wave Python MLIR builder bindings are required",
-    )
-
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, REALISTIC_MATMUL_LOOP_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
-
-    assert metadata["name"] == "realistic_matmul_loop_kernel"
-    assert "scf.for" in wave
-    assert "waveamd.buffer.range_bytes" not in wave
-    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
-    assert wave.count("waveamd.fragment_pack") == 2
     assert "waveamd.fragment_unpack" in wave
     assert "wave.store" in wave
 
@@ -1729,13 +1580,7 @@ def test_wave_amd_make_amdgcn_emits_dot_with_packaged_wave_translate(tmp_path):
     if not wave_translate.is_file():
         pytest.skip("packaged wave-translate is required")
 
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
+    backend, options, wave, metadata = _lower_accelerated_ttgir_to_wave_with_backend(tmp_path, DOT_MATMUL_TTIR)
     amdgcn = backend.make_amdgcn(wave, metadata, options)
 
     assert metadata["name"] == "dot_kernel"
@@ -1945,13 +1790,7 @@ def test_wave_amd_make_hsaco_emits_dot_kernel_elf(tmp_path):
     if not wave_translate.is_file():
         pytest.skip("packaged wave-translate is required")
 
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
+    backend, options, wave, metadata = _lower_accelerated_ttgir_to_wave_with_backend(tmp_path, DOT_MATMUL_TTIR)
     amdgcn = backend.make_amdgcn(wave, metadata, options)
     hsaco = backend.make_hsaco(amdgcn, metadata, options)
 
@@ -1976,13 +1815,8 @@ def test_wave_amd_make_hsaco_emits_scheduled_dot_kernel_elf(tmp_path, options_di
     if not wave_translate.is_file():
         pytest.skip("packaged wave-translate is required")
 
-    target = GPUTarget("wave_amd", "gfx1100", 32)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options(options_dict)
-    metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_32X32_TTIR)
-
-    wave = backend.make_wave(module, metadata, options)
+    backend, options, wave, metadata = _lower_accelerated_ttgir_to_wave_with_backend(
+        tmp_path, DOT_MATMUL_32X32_TTIR, options_dict)
     amdgcn = backend.make_amdgcn(wave, metadata, options)
     hsaco = backend.make_hsaco(amdgcn, metadata, options)
 

@@ -352,19 +352,6 @@ class _TTIRToWaveLowerer:
                 continue
             self._record_dot_operand_role(op.get_result(0).id(), role)
             self._record_dot_operand_role(op.get_operand(0).id(), role)
-        for op in ops:
-            if op.get_name() != "tt.dot":
-                continue
-            for role in (0, 1):
-                value_id = op.get_operand(role).id()
-                if value_id not in self.dot_operand_roles:
-                    self._record_dot_operand_role(value_id, role)
-                producer = self.producers_by_result.get(value_id)
-                while producer is not None and producer.get_name() == "ttg.convert_layout":
-                    value_id = producer.get_operand(0).id()
-                    if value_id not in self.dot_operand_roles:
-                        self._record_dot_operand_role(value_id, role)
-                    producer = self.producers_by_result.get(value_id)
 
     def _record_dot_operand_role(self, value_id: int, role: int) -> None:
         existing = self.dot_operand_roles.get(value_id)
@@ -741,10 +728,7 @@ class _TTIRToWaveLowerer:
         info = self._result_tensor_info(op)
         src_type = op.get_operand(0).get_type()
         dst_type = op.get_result(0).get_type()
-        conversion = _ttgir_convert_layout_kind(src_type, dst_type)
-        if conversion is None:
-            raise NotImplementedError(
-                "wave_amd TTGIR lowering currently supports only matrix-core ttg.convert_layout ops")
+        conversion = _expect_ttgir_convert_layout_kind(src_type, dst_type)
         if conversion == "dot_operand":
             role = _ttgir_dot_operand_role(dst_type)
             if role is None:
@@ -2331,6 +2315,14 @@ def _ttgir_convert_layout_kind(src_type, dst_type) -> Optional[str]:
     if _is_ttgir_amd_mma_type(src):
         return "mma_result"
     return None
+
+
+def _expect_ttgir_convert_layout_kind(src_type, dst_type) -> str:
+    conversion = _ttgir_convert_layout_kind(src_type, dst_type)
+    if conversion is None:
+        raise NotImplementedError("wave_amd TTGIR lowering currently supports only matrix-core ttg.convert_layout ops "
+                                  f"(got {src_type} -> {dst_type})")
+    return conversion
 
 
 def _is_ttgir_dot_operand_type(type_text: str) -> bool:
