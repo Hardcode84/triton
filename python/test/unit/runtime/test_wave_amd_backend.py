@@ -596,6 +596,20 @@ def _ttgir_preview_text(tmp_path, ttir, options_dict=None):
     return metadata["wave_ttgir_preview"]
 
 
+def _accelerated_ttgir_text(tmp_path, ttir, options_dict=None):
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    opts = {"num_warps": 1, "enable_ttgir_wave_lowering": True}
+    if options_dict is not None:
+        opts.update(options_dict)
+    options = backend.parse_options(opts)
+    module = _parse_ttir(tmp_path, backend, ttir)
+
+    backend.make_ttgir(module, {}, options)
+
+    return str(module)
+
+
 @pytest.mark.parametrize(
     ("ttir", "kernel_name", "expected_min_blocked"),
     [
@@ -637,6 +651,26 @@ def test_wave_amd_ttgir_preview_preserves_matmul_k_loop_structure(tmp_path):
     assert "#ttg.amd_wmma" in ttgir
     assert "#ttg.dot_op" in ttgir
     assert "ttg.convert_layout" in ttgir
+
+
+@pytest.mark.parametrize(
+    ("ttir", "kernel_name", "expected_dot_ops"),
+    [
+        (DOT_MATMUL_K32_TTIR, "dot_k32_kernel", 1),
+        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 1),
+        (REALISTIC_MATMUL_TILE_TTIR, "realistic_matmul_tile_kernel", 1),
+        (REALISTIC_MATMUL_LOOP_TTIR, "realistic_matmul_loop_kernel", 1),
+    ],
+)
+def test_wave_amd_ttgir_stage_accelerates_expanded_matmul_cases(tmp_path, ttir, kernel_name, expected_dot_ops):
+    ttgir = _accelerated_ttgir_text(tmp_path, ttir)
+
+    assert f"@{kernel_name}" in ttgir
+    assert "#ttg.amd_wmma" in ttgir
+    assert "#ttg.dot_op<{opIdx = 0" in ttgir
+    assert "#ttg.dot_op<{opIdx = 1" in ttgir
+    assert ttgir.count("tt.dot") == expected_dot_ops
+    assert ttgir.count("ttg.convert_layout") >= 3
 
 
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):
@@ -1010,7 +1044,7 @@ def test_wave_amd_make_wave_lowers_dot_to_native_wmma(tmp_path):
     assert "wave.store" in wave
 
 
-def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_to_native_wmma(tmp_path):
+def _lower_accelerated_ttgir_to_wave(tmp_path, ttir, options_dict=None):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
         reason="Wave Python MLIR builder bindings are required",
@@ -1018,19 +1052,37 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_to_native_wmma(tmp_path
 
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1, "enable_ttgir_wave_lowering": True})
+    opts = {"num_warps": 1, "enable_ttgir_wave_lowering": True}
+    if options_dict is not None:
+        opts.update(options_dict)
+    options = backend.parse_options(opts)
     metadata = {}
-    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
+    module = _parse_ttir(tmp_path, backend, ttir)
 
     backend.make_ttgir(module, metadata, options)
     assert "#ttg.amd_wmma" in str(module)
     wave = backend.make_wave(module, metadata, options)
+    return wave, metadata
+
+
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_to_native_wmma(tmp_path):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, DOT_MATMUL_TTIR)
 
     assert metadata["name"] == "dot_kernel"
     assert "func.func @dot_kernel" in wave
     assert "waveamd.fragment_pack" in wave
     assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
     assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
+
+
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_k32_to_two_native_wmma_ops(tmp_path):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, DOT_MATMUL_K32_TTIR)
+
+    assert metadata["name"] == "dot_k32_kernel"
+    assert "func.func @dot_k32_kernel" in wave
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 2
+    assert wave.count("waveamd.fragment_pack") == 4
     assert "wave.store" in wave
 
 
@@ -1089,6 +1141,25 @@ def test_wave_amd_make_wave_lowers_32x32_dot_to_native_wmma_grid(tmp_path, ttir,
 
 
 @pytest.mark.parametrize(
+    ("ttir", "kernel_name", "expected_mmas", "expected_packs"),
+    [
+        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4),
+        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8),
+    ],
+)
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_32x32_dot_to_native_wmma_grid(tmp_path, ttir, kernel_name,
+                                                                                   expected_mmas, expected_packs):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, ttir)
+
+    assert metadata["name"] == kernel_name
+    assert f"func.func @{kernel_name}" in wave
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == expected_mmas
+    assert wave.count("waveamd.fragment_pack") == expected_packs
+    assert wave.count("waveamd.fragment_unpack") == 4
+    assert wave.count("wave.store") == 32
+
+
+@pytest.mark.parametrize(
     ("options_dict", "expected_marker"),
     [
         ({"num_warps": 2}, "wave.workitem_id 0"),
@@ -1108,6 +1179,24 @@ def test_wave_amd_make_wave_lowers_dot_scheduled_across_workers(tmp_path, option
     module = _parse_ttir(tmp_path, backend, DOT_MATMUL_32X32_TTIR)
 
     wave = backend.make_wave(module, metadata, options)
+
+    assert metadata["name"] == "dot_32x32_kernel"
+    assert expected_marker in wave
+    assert wave.count("wave.where") >= 4
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 4
+    assert wave.count("wave.store") == 32
+
+
+@pytest.mark.parametrize(
+    ("options_dict", "expected_marker"),
+    [
+        ({"num_warps": 2}, "wave.workitem_id 0"),
+        ({"num_warps": 1, "num_ctas": 2}, "wave.workgroup_id 0"),
+    ],
+)
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_scheduled_across_workers(tmp_path, options_dict,
+                                                                                  expected_marker):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, DOT_MATMUL_32X32_TTIR, options_dict)
 
     assert metadata["name"] == "dot_32x32_kernel"
     assert expected_marker in wave
@@ -1179,6 +1268,20 @@ def test_wave_amd_make_wave_lowers_realistic_matmul_tile_pattern(tmp_path):
     assert "wave.store" in wave
 
 
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_tile_pattern(tmp_path):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, REALISTIC_MATMUL_TILE_TTIR)
+
+    assert metadata["name"] == "realistic_matmul_tile_kernel"
+    assert "func.func @realistic_matmul_tile_kernel" in wave
+    assert "wave.workgroup_id 0" in wave
+    assert "wave.index_expr" in wave
+    assert wave.count("wave.where") >= 3
+    assert wave.count("waveamd.fragment_pack") == 2
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
+
+
 def test_wave_amd_make_wave_lowers_realistic_matmul_k_loop(tmp_path):
     pytest.importorskip(
         "mlir.dialects.wave_dsl",
@@ -1196,6 +1299,17 @@ def test_wave_amd_make_wave_lowers_realistic_matmul_k_loop(tmp_path):
     assert metadata["name"] == "realistic_matmul_loop_kernel"
     assert "scf.for" in wave
     assert "waveamd.buffer.range_bytes" not in wave
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
+    assert wave.count("waveamd.fragment_pack") == 2
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
+
+
+def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_k_loop(tmp_path):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, REALISTIC_MATMUL_LOOP_TTIR)
+
+    assert metadata["name"] == "realistic_matmul_loop_kernel"
+    assert "scf.for" in wave
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 1
     assert wave.count("waveamd.fragment_pack") == 2
     assert "waveamd.fragment_unpack" in wave
