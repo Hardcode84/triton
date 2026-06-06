@@ -2318,6 +2318,8 @@ def _ttgir_convert_layout_kind(src_type, dst_type) -> Optional[str]:
 
 
 def _expect_ttgir_convert_layout_kind(src_type, dst_type) -> str:
+    if _is_ttgir_amd_mfma_type(src_type) or _is_ttgir_amd_mfma_type(dst_type):
+        raise NotImplementedError("wave_amd TTGIR lowering does not yet support AMD MFMA encodings")
     conversion = _ttgir_convert_layout_kind(src_type, dst_type)
     if conversion is None:
         raise NotImplementedError("wave_amd TTGIR lowering currently supports only matrix-core ttg.convert_layout ops "
@@ -2332,6 +2334,10 @@ def _is_ttgir_dot_operand_type(type_text: str) -> bool:
 def _is_ttgir_amd_mma_type(type_text: str) -> bool:
     text = str(type_text)
     return "#ttg.amd_wmma" in text or "#ttg.amd_mfma" in text
+
+
+def _is_ttgir_amd_mfma_type(type_text: str) -> bool:
+    return "#ttg.amd_mfma" in str(type_text)
 
 
 def _ttgir_dot_operand_role(type_text) -> Optional[int]:
