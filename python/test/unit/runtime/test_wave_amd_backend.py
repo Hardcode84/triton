@@ -524,22 +524,22 @@ def test_wave_amd_backend_skeleton():
     assert backend.get_target_name(options) == "wave_amd:gfx1100"
     assert options.backend_name == "wave_amd"
     assert options.warp_size == 32
-    assert not options.enable_ttgir_wave_lowering
+    assert options.enable_ttgir_wave_lowering
     assert backend.pack_metadata(SimpleNamespace(num_warps=4, num_ctas=1)) == (4, 1, 0)
 
     stages = {}
     backend.add_stages(stages, options, Language.TRITON)
-    assert list(stages) == ["ttir", "wave", "amdgcn", "hsaco"]
+    assert list(stages) == ["ttir", "ttgir", "wave", "amdgcn", "hsaco"]
+
+    direct_options = backend.parse_options({"enable_ttgir_wave_lowering": False})
+    direct_stages = {}
+    backend.add_stages(direct_stages, direct_options, Language.TRITON)
+    assert list(direct_stages) == ["ttir", "wave", "amdgcn", "hsaco"]
 
     preview_options = backend.parse_options({"enable_ttgir_preview": True})
     preview_stages = {}
     backend.add_stages(preview_stages, preview_options, Language.TRITON)
-    assert list(preview_stages) == ["ttir", "ttgir_preview", "wave", "amdgcn", "hsaco"]
-
-    ttgir_options = backend.parse_options({"enable_ttgir_wave_lowering": True})
-    ttgir_stages = {}
-    backend.add_stages(ttgir_stages, ttgir_options, Language.TRITON)
-    assert list(ttgir_stages) == ["ttir", "ttgir", "wave", "amdgcn", "hsaco"]
+    assert list(preview_stages) == ["ttir", "ttgir_preview", "ttgir", "wave", "amdgcn", "hsaco"]
 
 
 def test_wave_amd_pipeline_records_safe_ttir_cleanup_and_ttgir_reuse_plan():

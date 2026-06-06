@@ -65,7 +65,7 @@ class WaveAMDOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     enable_ttgir_preview: bool = False
-    enable_ttgir_wave_lowering: bool = False
+    enable_ttgir_wave_lowering: bool = True
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     backend_name: str = "wave_amd"
