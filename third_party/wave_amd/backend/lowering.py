@@ -1,3 +1,4 @@
+import re
 import sys
 from dataclasses import dataclass, field
 from functools import reduce
@@ -344,15 +345,25 @@ class _TTIRToWaveLowerer:
 
     def _collect_dot_operand_roles(self, ops: Sequence[object]) -> None:
         for op in ops:
+            if op.get_name() != "ttg.convert_layout":
+                continue
+            role = _ttgir_dot_operand_role(op.get_result(0).get_type())
+            if role is None:
+                continue
+            self._record_dot_operand_role(op.get_result(0).id(), role)
+            self._record_dot_operand_role(op.get_operand(0).id(), role)
+        for op in ops:
             if op.get_name() != "tt.dot":
                 continue
             for role in (0, 1):
                 value_id = op.get_operand(role).id()
-                self._record_dot_operand_role(value_id, role)
+                if value_id not in self.dot_operand_roles:
+                    self._record_dot_operand_role(value_id, role)
                 producer = self.producers_by_result.get(value_id)
                 while producer is not None and producer.get_name() == "ttg.convert_layout":
                     value_id = producer.get_operand(0).id()
-                    self._record_dot_operand_role(value_id, role)
+                    if value_id not in self.dot_operand_roles:
+                        self._record_dot_operand_role(value_id, role)
                     producer = self.producers_by_result.get(value_id)
 
     def _record_dot_operand_role(self, value_id: int, role: int) -> None:
@@ -728,36 +739,65 @@ class _TTIRToWaveLowerer:
     def _lower_convert_layout(self, op) -> None:
         src = self._value(op.get_operand(0))
         info = self._result_tensor_info(op)
+        src_type = op.get_operand(0).get_type()
+        dst_type = op.get_result(0).get_type()
+        conversion = _ttgir_convert_layout_kind(src_type, dst_type)
+        if conversion is None:
+            raise NotImplementedError(
+                "wave_amd TTGIR lowering currently supports only matrix-core ttg.convert_layout ops")
+        if conversion == "dot_operand":
+            role = _ttgir_dot_operand_role(dst_type)
+            if role is None:
+                raise NotImplementedError("wave_amd TTGIR dot operand conversion must carry opIdx")
+            self._expect_ttgir_dot_operand_payload(src, role)
+        elif conversion == "mma_result":
+            self._expect_ttgir_mma_result_payload(src)
 
         # TTGIR layout conversions encode Triton's SIMT distribution contract.
         # Wave lowering owns its own subgroup representation, so conversions are
-        # mechanical value forwards except when the forwarded value carries a
-        # matrix fragment payload for tt.dot.
-        self._set_result(
-            op,
-            _Value(
-                elem_type=src.elem_type if src.elem_type is not None else (None if info is None else info.elem_type),
-                layout=src.layout,
-                shape=src.shape if src.shape is not None else (None if info is None else info.shape),
-                lanes=_LanePayload(wave=src.lanes.wave, waves=src.lanes.waves),
-                dot=_DotPayload(fragment=src.dot.fragment, fragments=src.dot.fragments, dot_grid=src.dot.dot_grid),
-                constant=_ConstantPayload(const=src.constant.const, splat_const=src.constant.splat_const),
-                symbolic=_SymbolicPayload(affine=src.symbolic.affine, expr=src.symbolic.expr, exprs=src.symbolic.exprs,
-                                          bindings=src.symbolic.bindings,
-                                          bindings_by_wave=src.symbolic.bindings_by_wave,
-                                          sym_index=src.symbolic.sym_index, coord_axis=src.symbolic.coord_axis,
-                                          coord_start=src.symbolic.coord_start),
-                indexing=_IndexPayload(index=src.indexing.index, indexes=src.indexing.indexes),
-                memory=_MemoryPayload(token=src.memory.token, tokens=src.memory.tokens),
-                pointer=_PointerPayload(ptr_base=src.pointer.ptr_base, ptr_offset_affine=src.pointer.ptr_offset_affine,
-                                        ptr_dot_layout=src.pointer.ptr_dot_layout),
-                mask=_MaskPayload(mask_id=src.mask.mask_id, mask_wave=src.mask.mask_wave,
-                                  mask_waves=src.mask.mask_waves, mask_components=src.mask.mask_components,
-                                  other_wave=src.mask.other_wave, other_waves=src.mask.other_waves,
-                                  other_splat_const=src.mask.other_splat_const, cmpi_predicate=src.mask.cmpi_predicate,
-                                  cmpi_lhs=src.mask.cmpi_lhs, cmpi_rhs=src.mask.cmpi_rhs),
-            ),
+        # mechanical value forwards for the supported matrix-core conversions.
+        self._set_result(op, self._copy_value_for_convert_layout(src, info))
+
+    def _copy_value_for_convert_layout(self, src: _Value, info: Optional[_TensorInfo]) -> _Value:
+        return _Value(
+            elem_type=src.elem_type if src.elem_type is not None else (None if info is None else info.elem_type),
+            layout=src.layout,
+            shape=src.shape if src.shape is not None else (None if info is None else info.shape),
+            lanes=_LanePayload(wave=src.lanes.wave, waves=src.lanes.waves),
+            dot=_DotPayload(fragment=src.dot.fragment, fragments=src.dot.fragments, dot_grid=src.dot.dot_grid),
+            constant=_ConstantPayload(const=src.constant.const, splat_const=src.constant.splat_const),
+            symbolic=_SymbolicPayload(affine=src.symbolic.affine, expr=src.symbolic.expr, exprs=src.symbolic.exprs,
+                                      bindings=src.symbolic.bindings, bindings_by_wave=src.symbolic.bindings_by_wave,
+                                      sym_index=src.symbolic.sym_index, coord_axis=src.symbolic.coord_axis,
+                                      coord_start=src.symbolic.coord_start),
+            indexing=_IndexPayload(index=src.indexing.index, indexes=src.indexing.indexes),
+            memory=_MemoryPayload(token=src.memory.token, tokens=src.memory.tokens),
+            pointer=_PointerPayload(ptr_base=src.pointer.ptr_base, ptr_offset_affine=src.pointer.ptr_offset_affine,
+                                    ptr_dot_layout=src.pointer.ptr_dot_layout),
+            mask=_MaskPayload(mask_id=src.mask.mask_id, mask_wave=src.mask.mask_wave, mask_waves=src.mask.mask_waves,
+                              mask_components=src.mask.mask_components, other_wave=src.mask.other_wave,
+                              other_waves=src.mask.other_waves, other_splat_const=src.mask.other_splat_const,
+                              cmpi_predicate=src.mask.cmpi_predicate, cmpi_lhs=src.mask.cmpi_lhs,
+                              cmpi_rhs=src.mask.cmpi_rhs),
         )
+
+    def _expect_ttgir_dot_operand_payload(self, src: _Value, role: int) -> None:
+        grid = src.dot.dot_grid
+        if grid is not None:
+            if grid.role != role:
+                raise NotImplementedError("wave_amd TTGIR dot operand conversion role does not match its fragment")
+            return
+        if src.dot.fragment is None and not src.dot.fragments:
+            raise NotImplementedError("wave_amd TTGIR dot operand conversion requires a Wave fragment payload")
+
+    def _expect_ttgir_mma_result_payload(self, src: _Value) -> None:
+        grid = src.dot.dot_grid
+        if grid is not None:
+            if grid.role != 2:
+                raise NotImplementedError("wave_amd TTGIR MMA result conversion requires accumulator fragments")
+            return
+        if src.dot.fragment is None and not src.dot.fragments:
+            raise NotImplementedError("wave_amd TTGIR MMA result conversion requires a Wave fragment payload")
 
     def _lower_binary(self, op, expr_builder, wave_builder, affine_builder=None, symbolic_builder=None) -> None:
         lhs = self._value(op.get_operand(0))
@@ -2279,6 +2319,34 @@ def _symbolic_is_uniform(value: _SymbolicIndex) -> bool:
 def _symbolic_scale(value: _SymbolicIndex, scale, scale_bindings: Dict[object, object]) -> _SymbolicIndex:
     return _SymbolicIndex(value.const * scale, tuple(coeff * scale for coeff in value.coeffs),
                           {**value.bindings, **scale_bindings})
+
+
+def _ttgir_convert_layout_kind(src_type, dst_type) -> Optional[str]:
+    src = str(src_type)
+    dst = str(dst_type)
+    if _is_ttgir_dot_operand_type(dst):
+        return "dot_operand"
+    if _is_ttgir_amd_mma_type(dst):
+        return "mma_accumulator"
+    if _is_ttgir_amd_mma_type(src):
+        return "mma_result"
+    return None
+
+
+def _is_ttgir_dot_operand_type(type_text: str) -> bool:
+    return "#ttg.dot_op" in str(type_text)
+
+
+def _is_ttgir_amd_mma_type(type_text: str) -> bool:
+    text = str(type_text)
+    return "#ttg.amd_wmma" in text or "#ttg.amd_mfma" in text
+
+
+def _ttgir_dot_operand_role(type_text) -> Optional[int]:
+    match = re.search(r"opIdx\s*=\s*([01])", str(type_text))
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _pack_tensor_info(info) -> Optional[_TensorInfo]:

@@ -610,6 +610,23 @@ def _accelerated_ttgir_text(tmp_path, ttir, options_dict=None):
     return str(module)
 
 
+def _accelerated_ttgir_convert_layout_types(tmp_path, ttir):
+    target = GPUTarget("wave_amd", "gfx1100", 32)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1, "enable_ttgir_wave_lowering": True})
+    module = _parse_ttir(tmp_path, backend, ttir)
+    pairs = []
+
+    backend.make_ttgir(module, {}, options)
+
+    def collect(op):
+        if op.get_name() == "ttg.convert_layout":
+            pairs.append((str(op.get_operand(0).get_type()), str(op.get_result(0).get_type())))
+
+    module.walk(collect)
+    return pairs
+
+
 @pytest.mark.parametrize(
     ("ttir", "kernel_name", "expected_min_blocked"),
     [
@@ -671,6 +688,34 @@ def test_wave_amd_ttgir_stage_accelerates_expanded_matmul_cases(tmp_path, ttir, 
     assert "#ttg.dot_op<{opIdx = 1" in ttgir
     assert ttgir.count("tt.dot") == expected_dot_ops
     assert ttgir.count("ttg.convert_layout") >= 3
+
+
+def test_wave_amd_ttgir_convert_layout_classifier_accepts_matrix_core_shapes():
+    blocked = "tensor<16x16xf16, #ttg.blocked<{}>>"
+    dot_a = ("tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.amd_wmma<{version = 1}>, "
+             "kWidth = 16}>>")
+    dot_b = ("tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.amd_wmma<{version = 1}>, "
+             "kWidth = 16}>>")
+    mma = "tensor<16x16xf32, #ttg.amd_wmma<{version = 1}>>"
+
+    assert wave_lowering._ttgir_convert_layout_kind(blocked, dot_a) == "dot_operand"
+    assert wave_lowering._ttgir_convert_layout_kind(blocked, dot_b) == "dot_operand"
+    assert wave_lowering._ttgir_convert_layout_kind(blocked, mma) == "mma_accumulator"
+    assert wave_lowering._ttgir_convert_layout_kind(mma, blocked) == "mma_result"
+    assert wave_lowering._ttgir_convert_layout_kind(blocked, blocked) is None
+    assert wave_lowering._ttgir_dot_operand_role(dot_a) == 0
+    assert wave_lowering._ttgir_dot_operand_role(dot_b) == 1
+
+
+def test_wave_amd_ttgir_stage_uses_supported_matrix_core_convert_layouts(tmp_path):
+    pairs = _accelerated_ttgir_convert_layout_types(tmp_path, DOT_MATMUL_TTIR)
+
+    assert pairs
+    assert [wave_lowering._ttgir_convert_layout_kind(src, dst) for src, dst in pairs] == [
+        "dot_operand",
+        "dot_operand",
+        "mma_result",
+    ]
 
 
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):
