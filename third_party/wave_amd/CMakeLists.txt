@@ -1,3 +1,7 @@
+# Triton-tree Wave AMD TTIR/TTGIR preparation passes (built against Triton's
+# LLVM and registered into triton-opt / the TritonWaveAMD plugin).
+add_subdirectory(backend/passes)
+
 # Build the Wave translation tool as a Triton-managed backend artifact.
 set(WAVE_AMD_WAVE_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/wave)
 set(WAVE_AMD_WAVE_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/wave)
@@ -75,7 +79,8 @@ add_custom_target(WaveAMDWaveTranslate
 
 if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonWaveAMD ${CMAKE_CURRENT_SOURCE_DIR}/python/triton_wave_amd.cc)
-  target_link_libraries(TritonWaveAMD PRIVATE Python3::Module pybind11::headers)
+  target_link_libraries(TritonWaveAMD PRIVATE Python3::Module pybind11::headers
+                        TritonWaveAMDBackendPasses)
 endif()
 
 if(TRITON_BUILD_PYTHON_MODULE)

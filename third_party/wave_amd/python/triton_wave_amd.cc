@@ -2,7 +2,9 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Pass/PassManager.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "wave_amd/backend/passes/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 #include <optional>
@@ -105,6 +107,12 @@ py::object packTensorInfo(mlir::Type type) {
 
 void init_triton_wave_amd(py::module &&m) {
   m.doc() = "Wave AMDGPU backend native hooks";
+
+  // TTGIR GEMM preparation: legalize dots against Wave AMD architecture policy
+  // and attach typed dot-plan attributes for the bridge.
+  m.def("add_legalize_dots", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::createTritonWaveAMDLegalizeDots());
+  });
 
   m.def("get_program_id_axis", [](mlir::Operation *op) -> py::object {
     if (!op)

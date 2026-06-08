@@ -1,5 +1,13 @@
 get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
 
+# The Wave AMD backend contributes Triton-tree preparation passes that are only
+# built when its codegen backend is enabled. Gate their registration so the opt
+# tools still build without the backend.
+set(TRITON_OPT_TOOL_DEFINITIONS "")
+if("wave_amd" IN_LIST TRITON_CODEGEN_BACKENDS)
+  list(APPEND TRITON_OPT_TOOL_DEFINITIONS TRITON_WAVE_AMD_ENABLED)
+endif()
+
 add_executable(triton-opt triton-opt.cpp)
 
 target_compile_options(triton-opt PRIVATE ${TRITON_DISABLE_EH_RTTI_FLAGS})
@@ -89,6 +97,12 @@ target_link_libraries(triton-tensor-layout PRIVATE
   MLIRRegisterAllPasses
   MLIRTransforms
 )
+
+if(TRITON_OPT_TOOL_DEFINITIONS)
+  foreach(_triton_opt_tool triton-opt triton-reduce triton-lsp triton-tensor-layout)
+    target_compile_definitions(${_triton_opt_tool} PRIVATE ${TRITON_OPT_TOOL_DEFINITIONS})
+  endforeach()
+endif()
 
 install(TARGETS
   triton-opt

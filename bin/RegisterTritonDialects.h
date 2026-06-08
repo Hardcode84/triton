@@ -16,6 +16,10 @@
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
+#ifdef TRITON_WAVE_AMD_ENABLED
+#include "wave_amd/backend/passes/Passes.h"
+#endif
+
 // Below headers will allow registration to ROCm passes
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
@@ -136,6 +140,11 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDGPUFpSanitizer();
   mlir::triton::amdgpu::registerTritonAMDGPUOptimizeDotOperands();
   mlir::registerConSanAMDHooks();
+
+#ifdef TRITON_WAVE_AMD_ENABLED
+  // Wave AMD backend TTIR/TTGIR preparation passes.
+  mlir::registerTritonWaveAMDLegalizeDots();
+#endif
 
   // NVWS passes
   mlir::triton::registerNVWSTransformsPasses();

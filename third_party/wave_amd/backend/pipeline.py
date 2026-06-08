@@ -3,7 +3,7 @@ from enum import Enum
 import tempfile
 from typing import Callable, Optional, Sequence
 
-from triton._C.libtriton import amd, ir, passes
+from triton._C.libtriton import amd, ir, passes, wave_amd
 
 
 class PassReuse(str, Enum):
@@ -134,6 +134,9 @@ def add_wave_ttgir_passes(pm, options) -> None:
     passes.ttgpuir.add_remove_layout_conversions(pm)
     passes.common.add_canonicalizer(pm)
     passes.common.add_cse(pm)
+    # Wave TTGIR GEMM preparation: own dot architecture policy in C++ so the
+    # bridge consumes typed attrs instead of parsing TTGIR type strings.
+    wave_amd.add_legalize_dots(pm)
 
 
 def run_wave_ttgir_pipeline(mod, options, label: str = "wave_amd_make_ttgir"):
