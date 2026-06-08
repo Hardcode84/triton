@@ -114,6 +114,12 @@ void init_triton_wave_amd(py::module &&m) {
     pm.addPass(mlir::createTritonWaveAMDLegalizeDots());
   });
 
+  // TTGIR GEMM preparation: decide buffer descriptor ranges for static
+  // footprints so the bridge emits Wave buffer descriptors mechanically.
+  m.def("add_plan_buffer_descriptors", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::createTritonWaveAMDPlanBufferDescriptors());
+  });
+
   m.def("get_program_id_axis", [](mlir::Operation *op) -> py::object {
     if (!op)
       return py::none();

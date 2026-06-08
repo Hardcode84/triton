@@ -30,4 +30,26 @@ def TritonWaveAMDLegalizeDots
   ];
 }
 
+def TritonWaveAMDPlanBufferDescriptors
+    : Pass<"tritonwaveamd-plan-buffer-descriptors", "mlir::ModuleOp"> {
+  let summary = "Plan Wave AMD buffer descriptor ranges for static footprints";
+
+  let description = [{
+    Wave TTGIR GEMM preparation step that decides buffer descriptor ranges in
+    TTGIR instead of a post-bridge Wave-dialect materialization pass.
+
+    For every `tt.load` / `tt.store` over a statically-shaped tensor of a
+    supported element type, the pass attaches `waveamd.buffer.range_bytes` with
+    the footprint size in bytes (product of the static shape times the element
+    byte width). The bridge then emits a Wave buffer descriptor mechanically
+    from this attribute. Dynamic footprints and unsupported element types are
+    left unannotated.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 #endif // WAVE_AMD_BACKEND_PASSES

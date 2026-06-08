@@ -134,9 +134,11 @@ def add_wave_ttgir_passes(pm, options) -> None:
     passes.ttgpuir.add_remove_layout_conversions(pm)
     passes.common.add_canonicalizer(pm)
     passes.common.add_cse(pm)
-    # Wave TTGIR GEMM preparation: own dot architecture policy in C++ so the
-    # bridge consumes typed attrs instead of parsing TTGIR type strings.
+    # Wave TTGIR GEMM preparation: own dot architecture policy and buffer
+    # descriptor planning in C++ so the bridge consumes typed attrs instead of
+    # parsing TTGIR type strings or inferring ranges.
     wave_amd.add_legalize_dots(pm)
+    wave_amd.add_plan_buffer_descriptors(pm)
 
 
 def run_wave_ttgir_pipeline(mod, options, label: str = "wave_amd_make_ttgir"):
