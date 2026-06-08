@@ -13,6 +13,7 @@ triton_compiler = pytest.importorskip("triton.compiler.compiler")
 driver_api = pytest.importorskip("triton.backends.driver")
 wave_compiler = pytest.importorskip("triton.backends.wave_amd.compiler")
 wave_emission = pytest.importorskip("triton.backends.wave_amd.emission")
+wave_gemm_pipeline = pytest.importorskip("triton.backends.wave_amd.gemm_pipeline")
 wave_lowering = pytest.importorskip("triton.backends.wave_amd.lowering")
 wave_pipeline = pytest.importorskip("triton.backends.wave_amd.pipeline")
 wave_driver = pytest.importorskip("triton.backends.wave_amd.driver")
@@ -206,8 +207,17 @@ DOT_MATMUL_K32_TTIR = _dot_matmul_ttir(16, 16, 32, "dot_k32_kernel")
 DOT_MATMUL_K8_TTIR = _dot_matmul_ttir(16, 16, 8, "dot_k8_kernel")
 DOT_MATMUL_32X32_TTIR = _dot_matmul_ttir(32, 32, 16, "dot_32x32_kernel")
 DOT_MATMUL_32X32_K32_TTIR = _dot_matmul_ttir(32, 32, 32, "dot_32x32_k32_kernel")
+DOT_MATMUL_32X32_K64_TTIR = _dot_matmul_ttir(32, 32, 64, "dot_32x32_k64_kernel")
 DOT_MATMUL_M8_TTIR = _dot_matmul_ttir(8, 32, 16, "dot_m8_kernel")
 DOT_MATMUL_N8_TTIR = _dot_matmul_ttir(32, 8, 16, "dot_n8_kernel")
+
+DOT_MATMUL_IDENTITY_EPILOGUE_TTIR = DOT_MATMUL_TTIR.replace("dot_kernel", "dot_identity_epilogue_kernel").replace(
+    """    %acc = tt.dot %a, %b, %zero : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+    tt.store %c_ptrs, %acc : tensor<16x16x!tt.ptr<f32>>""",
+    """    %acc = tt.dot %a, %b, %zero : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+    %epilogue_zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
+    %epilogue = arith.addf %acc, %epilogue_zero : tensor<16x16xf32>
+    tt.store %c_ptrs, %epilogue : tensor<16x16x!tt.ptr<f32>>""")
 
 REALISTIC_MATMUL_TILE_TTIR = """
 module {
@@ -560,6 +570,25 @@ def test_wave_amd_pipeline_records_safe_ttir_cleanup_and_ttgir_reuse_plan():
     }
 
 
+def test_wave_amd_gemm_schedule_plans_k_stages_and_lds_slots():
+    pipeline = wave_gemm_pipeline.WaveGemmPipelinePlan(
+        use_buffer_ops=True,
+        use_lds_staging=True,
+        num_stages=2,
+        num_warps=8,
+        num_ctas=1,
+        warp_size=32,
+    )
+    schedule = wave_gemm_pipeline.schedule_for_dot(pipeline, (32, 64), (64, 32), (32, 32))
+
+    assert schedule is not None
+    assert (schedule.m_tiles, schedule.n_tiles, schedule.k_steps) == (2, 2, 4)
+    assert [stage.pipeline_stage for stage in schedule.stages] == [0, 1, 0, 1]
+    assert [(stage.a_lds_slot, stage.b_lds_slot) for stage in schedule.stages] == [(0, 1)] * 4
+    assert schedule.lds is not None
+    assert schedule.lds.bytes == 2 * 32 * 8 * 8 * 4
+
+
 def test_wave_amd_ttgir_preview_keeps_ttir_as_lowering_input(tmp_path):
     target = GPUTarget("wave_amd", "gfx1100", 32)
     backend = WaveAMDBackend(target)
@@ -655,6 +684,25 @@ def test_wave_amd_ttgir_preview_accelerates_matmul_to_amd_wmma_encoding(tmp_path
     assert ttgir.count("tt.store") == 1
 
 
+def test_wave_amd_ttgir_preview_accepts_canonical_hip_gemm_knobs(tmp_path):
+    ttgir = _ttgir_preview_text(
+        tmp_path,
+        DOT_MATMUL_32X32_K64_TTIR,
+        {
+            "num_warps": 8,
+            "num_stages": 2,
+            "matrix_instr_nonkdim": 16,
+        },
+    )
+
+    assert "@dot_32x32_k64_kernel" in ttgir
+    assert "#ttg.amd_wmma" in ttgir
+    assert "#ttg.dot_op<{opIdx = 0" in ttgir
+    assert "#ttg.dot_op<{opIdx = 1" in ttgir
+    assert ttgir.count("tt.dot") == 1
+    assert ttgir.count("ttg.convert_layout") >= 3
+
+
 def test_wave_amd_ttgir_preview_preserves_matmul_k_loop_structure(tmp_path):
     ttgir = _ttgir_preview_text(tmp_path, REALISTIC_MATMUL_LOOP_TTIR)
 
@@ -724,6 +772,12 @@ def test_wave_amd_ttgir_convert_layout_rejects_mfma_encodings():
         wave_lowering._expect_ttgir_convert_layout_kind(blocked, mfma_acc)
     with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
         wave_lowering._expect_ttgir_convert_layout_kind(mfma_acc, blocked)
+
+
+def test_wave_amd_architecture_policy_documents_wmma_only_gemm():
+    assert "WMMA" in wave_lowering.ARCHITECTURE_POLICY
+    assert "MFMA" in wave_lowering.ARCHITECTURE_POLICY
+    assert "rejected" in wave_lowering.ARCHITECTURE_POLICY
 
 
 def test_wave_amd_dot_role_collection_uses_ttgir_encodings_only():
@@ -1185,6 +1239,25 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_k32_to_two_native_wmma_
     assert "wave.store" in wave
 
 
+def test_wave_amd_make_wave_stages_dot_operands_through_lds(tmp_path):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(
+        tmp_path,
+        DOT_MATMUL_K32_TTIR,
+        {
+            "num_stages": 2,
+        },
+    )
+
+    assert metadata["name"] == "dot_k32_kernel"
+    assert "wave.lds_size = 2048 : i64" in wave
+    assert wave.count("wave.lds_base") >= 4
+    assert wave.count("wave.barrier") >= 4
+    assert "waveamd.gemm.lds_slot = 0" in wave
+    assert "waveamd.gemm.lds_slot = 1" in wave
+    assert "waveamd.gemm.stage = 0" in wave
+    assert "waveamd.gemm.stage = 1" in wave
+
+
 @pytest.mark.parametrize(
     ("ttir", "kernel_name", "expected_mmas", "expected_packs"),
     [
@@ -1245,6 +1318,16 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_k_loop(tmp
     assert wave.count("waveamd.fragment_pack") == 2
     assert "waveamd.fragment_unpack" in wave
     assert "wave.store" in wave
+
+
+def test_wave_amd_make_wave_preserves_identity_dot_epilogue_as_accumulator_fragment(tmp_path):
+    wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, DOT_MATMUL_IDENTITY_EPILOGUE_TTIR)
+
+    assert metadata["name"] == "dot_identity_epilogue_kernel"
+    assert 'waveamd.mma "wmma.f32.16x16x16.f16"' in wave
+    assert "waveamd.fragment_unpack" in wave
+    assert "wave.store" in wave
+    assert "wave.fadd" not in wave
 
 
 def test_wave_amd_make_wave_lowers_same_mask_loads_and_store(tmp_path, monkeypatch):

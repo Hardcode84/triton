@@ -8,10 +8,19 @@ from typing import Dict, Optional, Sequence, Tuple
 
 from triton.backends.wave_amd.gemm_pipeline import (
     BUFFER_RANGE_ATTR,
+    WAVE_GEMM_LDS_BYTES_ATTR,
+    WAVE_GEMM_LDS_SLOT_ATTR,
+    WAVE_GEMM_STAGE_ATTR,
     WaveBufferPlan,
     WaveGemmPipelinePlan,
+    WaveGemmSchedule,
     buffer_plan_for_static_footprint,
+    schedule_for_dot,
 )
+
+ARCHITECTURE_POLICY = (
+    "wave_amd lowers Triton GEMM through TTGIR matrix-core encodings and currently supports gfx11+ WMMA "
+    "encodings only; MFMA encodings are rejected before Wave lowering.")
 
 
 def _product(values: Sequence[int]) -> int:
@@ -262,9 +271,11 @@ class _TTIRToWaveLowerer:
         self.num_ctas = int(getattr(options, "num_ctas", 1))
         self.gemm_pipeline = WaveGemmPipelinePlan(
             use_buffer_ops=True,
+            use_lds_staging=True,
             num_stages=int(getattr(options, "num_stages", 1)),
             num_warps=self.num_warps,
             num_ctas=self.num_ctas,
+            warp_size=self.width,
         )
         self.values: Dict[int, _Value] = {}
         self.func = None
@@ -278,6 +289,7 @@ class _TTIRToWaveLowerer:
         self.all_entry_ops: Tuple[object, ...] = ()
         self.ops_by_region: Dict[int, Tuple[object, ...]] = {}
         self.loop_yields: Dict[int, _Value] = {}
+        self.gemm_schedule: Optional[WaveGemmSchedule] = None
 
     def lower(self) -> Tuple[str, str]:
         name = self.module.get_entry_func_name()
@@ -287,13 +299,14 @@ class _TTIRToWaveLowerer:
         ops = self._collect_entry_ops(name)
         func_op = self.module.get_function(name)
         self._collect_dot_operand_roles(self.all_entry_ops)
+        self.gemm_schedule = self._collect_gemm_schedule(self.all_entry_ops)
         target = f"amdgcn-amd-amdhsa--{self.options.arch}"
 
         with self.dsl.module() as module_builder:
             arg_types = [self._signature_type(ty) for ty in self.module.get_function_signature(func_op)]
             del module_builder.module.operation.attributes["gpu.container_module"]
             module_builder.module.operation.attributes["waveamdmachine.target"] = self.dsl.StringAttr.get(target)
-            with module_builder.function(name, arg_types, kernel=True) as func:
+            with module_builder.function(name, arg_types, kernel=True, lds_size=self._kernel_lds_size()) as func:
                 self.func = func
                 self._bind_arguments(func_op, func.args)
                 self._lower_ops(ops)
@@ -358,6 +371,31 @@ class _TTIRToWaveLowerer:
         if existing is not None and existing != role:
             raise NotImplementedError("wave_amd tt.dot lowering cannot reuse one value as both dot operands")
         self.dot_operand_roles[value_id] = role
+
+    def _collect_gemm_schedule(self, ops: Sequence[object]) -> Optional[WaveGemmSchedule]:
+        schedules = []
+        for op in ops:
+            if op.get_name() != "tt.dot":
+                continue
+            lhs = self._value_tensor_info(op.get_operand(0))
+            rhs = self._value_tensor_info(op.get_operand(1))
+            result = self._result_tensor_info(op)
+            schedule = schedule_for_dot(
+                self.gemm_pipeline,
+                None if lhs is None else lhs.shape,
+                None if rhs is None else rhs.shape,
+                None if result is None else result.shape,
+            )
+            if schedule is not None:
+                schedules.append(schedule)
+        if not schedules:
+            return None
+        return max(schedules, key=lambda schedule: 0 if schedule.lds is None else schedule.lds.bytes)
+
+    def _kernel_lds_size(self) -> Optional[int]:
+        if self.gemm_schedule is None or self.gemm_schedule.lds is None:
+            return None
+        return self.gemm_schedule.lds.bytes
 
     def _bind_arguments(self, func_op, wave_args) -> None:
         signatures = self.module.get_function_signature(func_op)
@@ -788,6 +826,16 @@ class _TTIRToWaveLowerer:
         rhs = self._value(op.get_operand(1))
         mask_id = _merge_mask_ids(lhs, rhs)
         info = self._result_tensor_info(op)
+        if info is not None and (self._has_dot_accumulator(lhs) or self._has_dot_accumulator(rhs)):
+            preserved = self._identity_dot_epilogue_value(op.get_name(), lhs, rhs)
+            if preserved is None:
+                raise NotImplementedError(
+                    "wave_amd fused dot epilogues currently preserve accumulator fragments only for identity "
+                    "add/sub/mul operations")
+            preserved.shape = info.shape
+            preserved.elem_type = info.elem_type
+            self._set_result(op, preserved)
+            return
         if info is not None:
             try:
                 layout = self._layout_for_info(info)
@@ -867,6 +915,37 @@ class _TTIRToWaveLowerer:
                 mask=_MaskPayload(mask_id=mask_id),
             ),
         )
+
+    def _has_dot_accumulator(self, value: _Value) -> bool:
+        grid = value.dot.dot_grid
+        if grid is not None:
+            return grid.role == 2
+        if value.dot.fragment is None:
+            return False
+        return str(value.dot.fragment.type).startswith("!waveamd.fragment<2,")
+
+    def _identity_dot_epilogue_value(self, op_name: str, lhs: _Value, rhs: _Value) -> Optional[_Value]:
+        lhs_dot = self._has_dot_accumulator(lhs)
+        rhs_dot = self._has_dot_accumulator(rhs)
+        if op_name == "arith.addf":
+            if lhs_dot and self._is_splat_constant(rhs, 0):
+                return lhs
+            if rhs_dot and self._is_splat_constant(lhs, 0):
+                return rhs
+        if op_name == "arith.subf" and lhs_dot and self._is_splat_constant(rhs, 0):
+            return lhs
+        if op_name == "arith.mulf":
+            if lhs_dot and self._is_splat_constant(rhs, 1):
+                return lhs
+            if rhs_dot and self._is_splat_constant(lhs, 1):
+                return rhs
+        return None
+
+    def _is_splat_constant(self, value: _Value, expected) -> bool:
+        if value.constant.splat_const is None:
+            return False
+        constant, _elem_type, _width = value.constant.splat_const
+        return constant == expected or constant == float(expected)
 
     def _lower_subi(self, op) -> None:
         lhs = self._value(op.get_operand(0))
@@ -1567,10 +1646,12 @@ class _TTIRToWaveLowerer:
     def _emit_masked_dot_fragment_load(self, frag_ptr, role: int, elem_type: str, mask: Optional[_Value] = None,
                                        tile: int = 0, step: int = 0):
         frag_type = self._dot_fragment_type(role=role, elem_type=elem_type)
-        if mask is None:
-            return self.func.fragment_load(frag_ptr, frag_type)
         frag = self.dsl.FragmentType(frag_type)
         tuple_type = self.dsl.simd_type(self.dsl.vector_type(frag.registers, self.dsl.i32()), width=frag.wave_size)
+        if mask is None:
+            regs, token = self.func.load(frag_ptr, tuple_type)
+            regs, token = self._stage_dot_registers_through_lds(regs, token, role, step, frag.registers)
+            return self.func.fragment_pack(regs, frag_type), token
         regs, token = self.func.load(frag_ptr, tuple_type)
         lane_mod = self._lane_mod_index()
         lane_sym = self._sym("lane_mod")
@@ -1599,7 +1680,38 @@ class _TTIRToWaveLowerer:
                 value = self.func.binary("andi", value, keep)
             masked_regs.append(value)
         packed = self.dsl.wave.PackOp(tuple_type, masked_regs).result
+        packed, token = self._stage_dot_registers_through_lds(packed, token, role, step, frag.registers)
         return self.func.fragment_pack(packed, frag_type), token
+
+    def _stage_dot_registers_through_lds(self, regs, token, role: int, step: int, register_count: int):
+        if self.gemm_schedule is None or self.gemm_schedule.lds is None:
+            return regs, token
+        lds_ptr = self._dot_lds_slot_ptr(role, register_count, step)
+        store_token = self.func.store(regs, lds_ptr, after=token)
+        barrier_token = self.func.barrier(store_token)
+        staged_regs, staged_token = self.func.load(lds_ptr, regs.type, after=barrier_token)
+        return staged_regs, staged_token
+
+    def _dot_lds_slot_ptr(self, role: int, register_count: int, step: int):
+        if self.gemm_schedule is None or self.gemm_schedule.lds is None:
+            raise AssertionError("dot LDS slot requested without a GEMM schedule")
+        slot = 0 if role == 0 else 1
+        lds = self.func.lds_base(self.dsl.i32())
+        wi = self._workitem_id()
+        wi_sym = self._sym("wi")
+        wave_id = self.dsl.floor(wi_sym / self.width)
+        lane = self.dsl.mod(wi_sym, self.width)
+        offset = self.gemm_schedule.lds.slot_offset_dwords(slot, wave_id, lane, register_count)
+        index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
+        index = self.func.index_expr(offset, {wi_sym: wi}, index_type)
+        ptr_type = self.dsl.simd_ptr_type(self.dsl.i32(), self.dsl.shared_address_space(), self.width)
+        op = self.dsl.wave.PtrAddOp(ptr_type, lds, index)
+        op.operation.attributes[WAVE_GEMM_LDS_SLOT_ATTR] = self.dsl.IntegerAttr.get(self.dsl.i32(), slot)
+        op.operation.attributes[WAVE_GEMM_STAGE_ATTR] = self.dsl.IntegerAttr.get(
+            self.dsl.i32(), step % max(1, self.gemm_pipeline.num_stages))
+        op.operation.attributes[WAVE_GEMM_LDS_BYTES_ATTR] = self.dsl.IntegerAttr.get(
+            self.dsl.i32(), self.gemm_schedule.lds.bytes)
+        return op.result
 
     def _mask_conditions_for_coords(self, mask: _Value, coords: Tuple[object, ...],
                                     coord_bindings: Dict[object, object], register: int) -> Tuple[object, ...]:

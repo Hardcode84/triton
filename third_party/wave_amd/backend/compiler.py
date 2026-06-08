@@ -53,6 +53,7 @@ class WaveAMDOptions:
     waves_per_eu: int = 0
     num_stages: int = 2
     num_ctas: int = 1
+    matrix_instr_nonkdim: int = 16
     extern_libs: dict = None
     debug: bool = False
     instrumentation_mode: str = ""
