@@ -833,17 +833,26 @@ def test_wave_amd_ttgir_stage_uses_supported_matrix_core_convert_layouts(tmp_pat
     ]
 
 
-def test_wave_amd_ttgir_stage_rejects_gfx9_mfma_convert_layouts(tmp_path):
-    ttgir = _accelerated_ttgir_text_for_target(tmp_path, DOT_MATMUL_TTIR, arch="gfx90a", warp_size=64)
-    pairs = _accelerated_ttgir_convert_layout_types(tmp_path, DOT_MATMUL_TTIR, arch="gfx90a", warp_size=64)
+def test_wave_amd_ttgir_stage_rejects_gfx9_mfma_convert_layouts(tmp_path, capfd):
+    # gfx9 targets select MFMA matrix-core encodings. Wave TTGIR preparation
+    # (the tritonwaveamd-legalize-dots pass) rejects MFMA during make_ttgir,
+    # before the bridge, per WaveAMDGemmPipelineDesign.md.
+    target = GPUTarget("wave_amd", "gfx90a", 64)
+    backend = WaveAMDBackend(target)
+    options = backend.parse_options({"num_warps": 1})
+    module = _parse_ttir(tmp_path, backend, DOT_MATMUL_TTIR)
 
-    assert "#ttg.amd_mfma" in ttgir
-    assert "#ttg.amd_wmma" not in ttgir
-    assert pairs
-    assert all("#ttg.amd_mfma" in src or "#ttg.amd_mfma" in dst for src, dst in pairs)
-    for src, dst in pairs:
-        with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
-            wave_lowering._expect_ttgir_convert_layout_kind(src, dst)
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        backend.make_ttgir(module, {}, options)
+
+    err = capfd.readouterr().err
+    assert "does not support AMD MFMA" in err
+    assert "TritonWaveAMDLegalizeDots" in err
+
+    # The bridge keeps a defensive guard for direct callers of the helper.
+    mfma_type = "tensor<16x16xf32, #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1]}>>"
+    with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
+        wave_lowering._expect_ttgir_convert_layout_kind(mfma_type, mfma_type)
 
 
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):
