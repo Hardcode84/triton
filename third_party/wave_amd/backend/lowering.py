@@ -1683,8 +1683,8 @@ class _TTIRToWaveLowerer:
                 valid_high = self._combine_mask_conditions(high_conditions) if high_conditions else None
                 keep_low = self.func.select(valid_low, low_half, zero) if valid_low is not None else low_half
                 keep_high = self.func.select(valid_high, high_half, zero) if valid_high is not None else high_half
-                keep = self.func.binary("ori", keep_low, keep_high)
-                value = self.func.binary("andi", value, keep)
+                keep = self.func.binary(self.dsl.BinaryKind.OrI, keep_low, keep_high)
+                value = self.func.binary(self.dsl.BinaryKind.AndI, value, keep)
             masked_regs.append(value)
         packed = self.dsl.wave.PackOp(tuple_type, masked_regs).result
         packed, token = self._stage_dot_registers_through_lds(packed, token, role, step, frag.registers)
@@ -1894,12 +1894,12 @@ class _TTIRToWaveLowerer:
 
     def _wave_owner_condition(self, owner: int):
         workitem = self._workitem_id()
-        wave_id = self.func.binary("shri", workitem, self._splat_i32(_log2_int(self.width)))
+        wave_id = self.func.binary(self.dsl.BinaryKind.ShRUI, workitem, self._splat_i32(_log2_int(self.width)))
         return self.func.cmpi("eq", wave_id, self._splat_i32(owner))
 
     def _cta_owner_condition(self, owner: int):
         cta_wave = self.func.splat(self._workgroup_id(0), self.dsl.i32(), self.width)
-        cta_wave = self.func.binary("andi", cta_wave, self._splat_i32(self.num_ctas - 1))
+        cta_wave = self.func.binary(self.dsl.BinaryKind.AndI, cta_wave, self._splat_i32(self.num_ctas - 1))
         return self.func.cmpi("eq", cta_wave, self._splat_i32(owner))
 
     def _expect_dot_pointer_layout(self, ptr: _Value, shape: Optional[Tuple[int, ...]], expected: _AffineIndex,
@@ -2047,10 +2047,10 @@ class _TTIRToWaveLowerer:
         return self._lane_value
 
     def _lane_mod_index(self):
-        return self.func.binary("andi", self._lane_id(), self._splat_i32(15))
+        return self.func.binary(self.dsl.BinaryKind.AndI, self._lane_id(), self._splat_i32(15))
 
     def _row_parity_index(self):
-        return self.func.binary("shri", self._lane_id(), self._splat_i32(4))
+        return self.func.binary(self.dsl.BinaryKind.ShRUI, self._lane_id(), self._splat_i32(4))
 
     def _thread_id_and_sym(self):
         if self.num_warps == 1:
