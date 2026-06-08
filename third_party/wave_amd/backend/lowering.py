@@ -529,6 +529,13 @@ class _TTIRToWaveLowerer:
                 if isinstance(value, int):
                     state.symbolic.affine = _AffineIndex(value, (0, ) * len(info.shape))
                     state.symbolic.sym_index = _SymbolicIndex(value, (0, ) * len(info.shape), {})
+                    # A splat constant tensor is a uniform value: expose it as a
+                    # per-register symbolic expression so it can feed pointer
+                    # offset arithmetic (muli/addi) instead of poisoning the
+                    # chain with a missing expr.
+                    state.symbolic.expr = value
+                    state.symbolic.exprs = (value, ) * layout.registers
+                    state.symbolic.bindings_by_wave = ({}, ) * layout.registers
         self._set_result(op, state)
 
     def _lower_program_id(self, op) -> None:
@@ -2471,7 +2478,11 @@ def _tensor_element_type_name(tensor_type) -> Optional[str]:
     if not text.startswith("tensor<") or not text.endswith(">"):
         return None
     body = text[len("tensor<"):-1]
-    element = body.rsplit("x", 1)[-1].split(",", 1)[0].strip()
+    # Drop the optional layout encoding before splitting the shape: an encoding
+    # like #ttg.dot_op<{opIdx = 0, ...}> contains an "x" (opIdx) that otherwise
+    # corrupts the shape/element split.
+    shape_and_elem = body.split(",", 1)[0]
+    element = shape_and_elem.rsplit("x", 1)[-1].strip()
     if element in {"f16", "bf16", "f32", "i1", "i8", "i32", "i64"}:
         return element
     return None
