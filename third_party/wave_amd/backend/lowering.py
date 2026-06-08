@@ -1704,13 +1704,19 @@ class _TTIRToWaveLowerer:
             raise AssertionError("dot LDS slot requested without a GEMM schedule")
         slot = 0 if role == 0 else 1
         lds = self.func.lds_base(self.dsl.i32())
-        wi = self._workitem_id()
-        wi_sym = self._sym("wi")
-        wave_id = self.dsl.floor(wi_sym / self.width)
-        lane = self.dsl.mod(wi_sym, self.width)
-        offset = self.gemm_schedule.lds.slot_offset_dwords(slot, wave_id, lane, register_count)
+        # Bind lane and wave to andi-masked values so the machine address
+        # planner can prove the offset fits the DS voffset field (no soffset
+        # exists for DS ops). The mask gives the index simplifier an explicit
+        # [0, width) / [0, num_warps) bound, which a bare lane_id/shift does not.
+        lane_val = self.func.binary(self.dsl.BinaryKind.AndI, self._lane_id(), self._splat_i32(self.width - 1))
+        wave_raw = self.func.binary(self.dsl.BinaryKind.ShRUI, self._workitem_id(),
+                                    self._splat_i32(_log2_int(self.width)))
+        wave_val = self.func.binary(self.dsl.BinaryKind.AndI, wave_raw, self._splat_i32(max(self.num_warps - 1, 0)))
+        lane_sym = self._sym("lds_lane")
+        wave_sym = self._sym("lds_wave")
+        offset = self.gemm_schedule.lds.slot_offset_dwords(slot, wave_sym, lane_sym, register_count)
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
-        index = self.func.index_expr(offset, {wi_sym: wi}, index_type)
+        index = self.func.index_expr(offset, {lane_sym: lane_val, wave_sym: wave_val}, index_type)
         ptr_type = self.dsl.simd_ptr_type(self.dsl.i32(), self.dsl.shared_address_space(), self.width)
         op = self.dsl.wave.PtrAddOp(ptr_type, lds, index)
         op.operation.attributes[WAVE_GEMM_LDS_SLOT_ATTR] = self.dsl.IntegerAttr.get(self.dsl.i32(), slot)
