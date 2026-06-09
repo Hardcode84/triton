@@ -2,12 +2,51 @@
 
 ## Status
 
-Design proposal for the Wave AMD Triton backend GEMM path.
+Design for the Wave AMD Triton backend GEMM path. Partially implemented.
 
-Current code proves the pieces can work: Triton TTIR/TTGIR reaches the Wave
-dialect, dot operands can be staged through LDS, and WMMA fragments lower to
-Wave AMD machine code. The next step is to move policy and analysis out of the
-TTGIR-to-Wave bridge and into explicit preparation passes.
+A canonical f16 GEMM now compiles and runs end to end through the Wave AMD
+backend with correct numerics, including `num_warps=4` and a K loop, verified on
+gfx1100 (RDNA3, WMMA). The Triton-tree C++ pass infrastructure the design calls
+for exists, and three TTGIR preparation passes have landed.
+
+### Implementation status (2026-06-09)
+
+C++ TTGIR preparation passes (Triton tree, `backend/passes/`, registered into
+`triton-opt` and the `TritonWaveAMD` plugin):
+
+- `tritonwaveamd-legalize-dots`: rejects MFMA with a diagnostic; attaches
+  `waveamd.dot.{instr_kind,a_op_idx,b_op_idx}` and `waveamd.dot.role` on operand
+  convert_layouts. **Consumed** by the bridge.
+- `tritonwaveamd-plan-gemm-schedule`: attaches GEMM tiling + LDS plan attrs.
+  **Latent** -- see below, LDS staging was removed.
+- `tritonwaveamd-plan-buffer-descriptors`: attaches `waveamd.buffer.range_bytes`.
+  Bridge consumes it, but the static-affine buffer-ops path is currently
+  unexercised by the test kernels (they take the symbolic dot-layout path).
+
+Migration phase scorecard (details inline in Migration Plan below):
+
+- Phase 2 (architecture policy): DONE and consumed.
+- Phase 5 (dot planning, dot slice): DONE -- bridge reads `instr_kind`/`role`.
+- Phase 6 (LDS/schedule): the dot-fragment LDS staging turned out to be an
+  identity round-trip (no data movement); it was REMOVED, kernels reserve no
+  shared memory, and the schedule pass is now a latent producer.
+- Phase 7 (buffer descriptors): pass + consumer landed; path latent.
+- Phase 8 (delete bridge analysis): dot-path type-string parsing deleted; layout
+  and epilogue analysis still live.
+- Phases 3 (replace `add_convert_to_ttgpuir`) and 4 (layout exprs to C++): NOT
+  STARTED. The pipeline still calls `add_convert_to_ttgpuir`.
+
+Corrections to the original assumptions below:
+
+- The bridge does NOT reconstruct blocked layouts for the GEMM path; it builds
+  symbolic dot-layouts and `wave.index_expr` directly. Phase 4 is therefore
+  "move the symbolic layout construction from Python to C++", not "remove
+  blocked-layout reconstruction".
+- LDS staging is not a load-bearing step today; the WMMA fragments are already in
+  a usable layout without it.
+- Structural attribute APIs are sufficient through existing Python MLIR bindings
+  (`op.get_int_attr` / `op.get_str_attr` return None when absent); no C API
+  additions were needed for the passes landed so far.
 
 ## Goals
 
@@ -50,6 +89,11 @@ Python Triton AST
 The bridge should see a Wave-ready TTGIR module. It may map operations, copy
 attributes, and materialize prepared expressions. It should not infer missing
 structure from arbitrary TTIR/TTGIR graphs.
+
+Current divergence: the "Wave C++ TTIR-to-TTGIR conversion" step is not yet
+implemented. The pipeline still runs base `add_convert_to_ttgpuir` plus reused
+TTGIR cleanup, then the three Wave C++ TTGIR preparation passes. "Wave C++ TTIR
+preparation" is also not a separate step yet.
 
 ## Repository Ownership
 
@@ -365,66 +409,101 @@ Useful Wave tests:
 
 ## Migration Plan
 
-1. Freeze the bridge contract.
+1. Freeze the bridge contract. [PARTIAL]
    - Add bridge tests that require prepared attrs for GEMM lowering.
    - Keep current behavior only behind temporary compatibility helpers.
+   - Status: bridge/lit/e2e tests exist; the bridge does not yet fail fast when
+     preparation has not run (it falls back to local analysis for layouts).
 
-2. Move architecture policy out of `lowering.py`.
+2. Move architecture policy out of `lowering.py`. [DONE]
    - Add a Wave TTGIR legalization step.
    - Reuse Triton AMD target feature and intrinsic legality logic where possible.
    - Fix option plumbing so `matrix_instr_nonkdim` has one default.
+   - Status: `tritonwaveamd-legalize-dots` rejects MFMA in TTGIR; the bridge no
+     longer parses encodings for dot policy. Option plumbing still TODO.
 
-3. Replace `add_convert_to_ttgpuir`.
+3. Replace `add_convert_to_ttgpuir`. [NOT STARTED]
    - Add a Triton-tree C++ TTIR-to-TTGIR conversion for Wave.
    - Emit Wave-compatible layout contracts directly.
    - Remove dependence on TritonGPU layout approximations for the Wave path.
+   - Status: the linchpin. Pipeline still calls `add_convert_to_ttgpuir`. Open
+     question (below) about intrinsic selection is the main unknown.
 
-4. Move layout expression construction out of `lowering.py`.
+4. Move layout expression construction out of `lowering.py`. [NOT STARTED]
    - Introduce symbolic layout/index metadata in TTIR/TTGIR preparation.
    - Lower those expressions to `wave.index_expr` in the bridge.
    - Remove bridge-side blocked layout reconstruction.
+   - Status: the bridge already builds symbolic dot-layouts / `wave.index_expr`
+     (no blocked reconstruction on the GEMM path), but it CONSTRUCTS them in
+     Python. The work is moving that construction to C++. Depends on phase 3.
 
-5. Move dot planning out of `lowering.py`.
+5. Move dot planning out of `lowering.py`. [DONE, dot slice]
    - Emit explicit dot plans with operand roles, fragment geometry, and
      accumulator layout.
    - Bridge maps plans to fragment pack/unpack and `waveamd.mma`.
+   - Status: bridge reads `waveamd.dot.instr_kind` and `waveamd.dot.role` from
+     legalize-dots. Fragment geometry / accumulator layout are still derived in
+     `_dot_config` in the bridge.
 
-6. Move LDS and software pipeline planning out of `lowering.py`.
+6. Move LDS and software pipeline planning out of `lowering.py`. [SUPERSEDED]
    - Turn `WaveGemmSchedule` into preparation output.
    - Attach stage, LDS slot, token, and resource attrs before bridge lowering.
    - Bridge emits only the prepared Wave ops.
+   - Status: the dot-fragment LDS staging was a verified identity round-trip and
+     was removed; GEMM kernels reserve no shared memory. The schedule pass
+     attaches the plan but is currently a latent producer. Revisit if a real
+     layout-changing LDS staging is needed.
 
-7. Move buffer descriptor planning out of `lowering.py`.
+7. Move buffer descriptor planning out of `lowering.py`. [DONE, latent]
    - Prepare static footprint/range attrs earlier.
    - Keep Wave descriptor materialization in the Wave pass pipeline.
+   - Status: `tritonwaveamd-plan-buffer-descriptors` attaches the range; the
+     bridge consumes it. The static-affine buffer-ops path is unexercised by the
+     current test kernels.
 
-8. Delete compatibility analysis from the bridge.
+8. Delete compatibility analysis from the bridge. [PARTIAL]
    - Remove TTGIR type-string parsing except structural assertions.
    - Remove schedule, layout, LDS, ownership, and epilogue analysis.
    - Fail fast when preparation did not run.
+   - Status: dot-path type-string parsing (opIdx regex, MFMA/convert-layout kind
+     string matching) and the schedule/LDS analysis are gone. Layout discovery,
+     element-type string parsing, and epilogue folding remain in the bridge.
 
 ## Open Questions
 
-- Which structural attribute APIs are available through current Python MLIR
-  bindings, and which need C API additions?
+- ~~Which structural attribute APIs are available through current Python MLIR
+  bindings, and which need C API additions?~~ ANSWERED: `op.get_int_attr` /
+  `op.get_str_attr` (return None when absent) cover the prepared-attr reads for
+  the passes landed so far; no C API additions were needed.
 - How much of Triton AMD intrinsic selection can be factored without depending
-  on TritonGPU layout attr construction?
+  on TritonGPU layout attr construction? Still open -- this is the main unknown
+  blocking phase 3 (`add_convert_to_ttgpuir` replacement).
 - What is the first MFMA target shape to support once WMMA preparation is
   stable?
 
 ## Acceptance Criteria
 
-- `lowering.py` contains no GEMM schedule, layout discovery, LDS slot selection,
-  buffer range inference, or epilogue preservation analysis.
-- Wave TTIR and TTGIR preparation, including TTIR-to-TTGIR conversion, is
-  implemented as Triton-tree C++ passes.
-- Python compiler code is limited to the mechanical TTGIR-to-Wave bridge.
-- The Wave pipeline does not call `add_convert_to_ttgpuir`.
-- All memory and fragment layout math appears as prepared symbolic expressions
-  and lowers to `wave.index_expr`.
-- Canonical Triton GEMM examples compile through Wave AMD with HIP autotune
-  knobs accepted.
-- Unsupported layouts and architectures fail in preparation passes with stable
-  diagnostics.
-- Bridge tests prove lowering is mechanical by feeding already-prepared IR and
-  checking Wave dialect output.
+Status as of 2026-06-09 in brackets.
+
+- [PARTIAL] `lowering.py` contains no GEMM schedule, layout discovery, LDS slot
+  selection, buffer range inference, or epilogue preservation analysis. (Schedule,
+  LDS slot, and buffer range are gone; layout discovery and epilogue folding
+  remain.)
+- [PARTIAL] Wave TTIR and TTGIR preparation, including TTIR-to-TTGIR conversion,
+  is implemented as Triton-tree C++ passes. (Three TTGIR preparation passes exist;
+  TTIR preparation and TTIR-to-TTGIR conversion do not.)
+- [NO] Python compiler code is limited to the mechanical TTGIR-to-Wave bridge.
+  (`lowering.py` still constructs layouts and folds epilogues.)
+- [NO] The Wave pipeline does not call `add_convert_to_ttgpuir`. (It still does.)
+- [PARTIAL] All memory and fragment layout math appears as prepared symbolic
+  expressions and lowers to `wave.index_expr`. (Layout math is symbolic
+  `wave.index_expr` already, but constructed in the Python bridge, not prepared.)
+- [YES] Canonical Triton GEMM examples compile through Wave AMD. f16 GEMM runs
+  e2e on gfx1100 with `num_warps` accepted; other HIP autotune knobs
+  (`matrix_instr_nonkdim`, `kpack`, `num_stages`) are accepted but not fully
+  exercised.
+- [PARTIAL] Unsupported layouts and architectures fail in preparation passes with
+  stable diagnostics. (MFMA fails in `tritonwaveamd-legalize-dots`; other
+  unsupported shapes still fail later in the bridge.)
+- [NO] Bridge tests prove lowering is mechanical by feeding already-prepared IR
+  and checking Wave dialect output. (Tests feed TTIR and run the full pipeline.)
