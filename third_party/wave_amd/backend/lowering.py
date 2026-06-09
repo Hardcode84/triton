@@ -11,11 +11,9 @@ from triton.backends.wave_amd.gemm_pipeline import (
     WAVE_GEMM_LDS_BYTES_ATTR,
     WAVE_GEMM_LDS_SLOT_ATTR,
     WAVE_GEMM_STAGE_ATTR,
-    WaveBufferPlan,
     WaveGemmPipelinePlan,
     WaveGemmSchedule,
     WaveLdsPlan,
-    buffer_plan_for_static_footprint,
 )
 
 ARCHITECTURE_POLICY = (
@@ -1218,13 +1216,8 @@ class _TTIRToWaveLowerer:
             return None
         return _DotPointerLayout(shape, offset_sym)
 
-    def _buffer_plan_for_static_footprint(self, info: Optional[_TensorInfo]) -> Optional[WaveBufferPlan]:
-        if info is None:
-            return None
-        return buffer_plan_for_static_footprint(self.gemm_pipeline, info.elem_type, info.shape)
-
-    def _ptr_add(self, base, index, plan: Optional[WaveBufferPlan] = None):
-        if plan is None:
+    def _ptr_add(self, base, index, range_bytes: Optional[int] = None):
+        if range_bytes is None:
             return self.func.ptr_add(base, index)
         base_simd = self.dsl.SimdType.isinstance(base.type)
         offset_width = self.dsl._lane_width(index.type)
@@ -1235,7 +1228,7 @@ class _TTIRToWaveLowerer:
         else:
             result_type = base.type
         op = self.dsl.wave.PtrAddOp(result_type, base, index)
-        op.operation.attributes[BUFFER_RANGE_ATTR] = self.dsl.IntegerAttr.get(self.dsl.i32(), plan.range_bytes)
+        op.operation.attributes[BUFFER_RANGE_ATTR] = self.dsl.IntegerAttr.get(self.dsl.i32(), range_bytes)
         return op.result
 
     def _lower_load(self, op) -> None:
@@ -1255,7 +1248,8 @@ class _TTIRToWaveLowerer:
                 if not mask_value.mask.mask_components:
                     layout = ptr.layout or self._layout_for_info(info)
                     mask_value = self._coerce_tensor(mask_value, layout, _TensorInfo(info.shape, "i1"))
-            grid = self._emit_dot_fragment_load(ptr, info, role, mask_value)
+            range_bytes = op.get_int_attr(BUFFER_RANGE_ATTR)
+            grid = self._emit_dot_fragment_load(ptr, info, role, mask_value, range_bytes)
             self.load_tokens.extend(grid.tokens)
             self._set_result(
                 op,
@@ -1355,7 +1349,7 @@ class _TTIRToWaveLowerer:
                 if not mask_value.mask.mask_components:
                     layout = ptr.layout or self._layout_for_info(_TensorInfo(value.shape, "i1"))
                     mask_value = self._coerce_tensor(mask_value, layout, _TensorInfo(value.shape, "i1"))
-            self._emit_fragment_store(ptr, value, mask_value)
+            self._emit_fragment_store(ptr, value, mask_value, op.get_int_attr(BUFFER_RANGE_ATTR))
             return
         if mask is None and value.mask.other_wave is not None and value.mask.mask_wave is not None:
             self._emit_unmasked_store_of_masked_load_other(ptr, value)
@@ -1580,7 +1574,7 @@ class _TTIRToWaveLowerer:
         )
 
     def _emit_dot_fragment_load(self, ptr: _Value, info: Optional[_TensorInfo], role: int,
-                                mask: Optional[_Value] = None):
+                                mask: Optional[_Value] = None, range_bytes: Optional[int] = None):
         if info is None:
             raise NotImplementedError("wave_amd tt.dot operand load requires ranked tensor result metadata")
         if info.elem_type != "f16" or len(info.shape) != 2:
@@ -1615,9 +1609,12 @@ class _TTIRToWaveLowerer:
         if dot_layout is not None and dot_layout.shape != info.shape:
             raise NotImplementedError("wave_amd tt.dot symbolic pointer layout must match the operand shape")
 
-        plan = None
+        # The buffer descriptor range is prepared in TTGIR by
+        # tritonwaveamd-plan-buffer-descriptors; apply it only for the fixed
+        # static-affine footprint where Wave buffer ops are used.
+        plan_range = None
         if dot_layout is None and ptr.pointer.ptr_offset_affine == fixed_affine:
-            plan = self._buffer_plan_for_static_footprint(info)
+            plan_range = range_bytes
         lane_mod = self._lane_mod_index()
         lane_sym = self._sym("lane_mod")
         index_type = self.dsl.simd_type(self.dsl.index_type(), self.width)
@@ -1640,7 +1637,7 @@ class _TTIRToWaveLowerer:
                     index_expr = lane_sym * k + offset
                     bindings = {lane_sym: lane_mod}
                 index = self.func.index_expr(index_expr, bindings, index_type)
-                frag_ptr = self._ptr_add(ptr.pointer.ptr_base, index, plan)
+                frag_ptr = self._ptr_add(ptr.pointer.ptr_base, index, plan_range)
                 fragment, token = self._emit_masked_dot_fragment_load(frag_ptr, role, info.elem_type, mask, tile, step)
                 fragments.append(fragment)
                 tokens.append(token)
@@ -1812,7 +1809,8 @@ class _TTIRToWaveLowerer:
         if value != 0 or other_elem_type not in {elem_type, "f32"}:
             raise NotImplementedError("wave_amd masked tt.dot operand loads require zero-splat `other`")
 
-    def _emit_fragment_store(self, ptr: _Value, value: _Value, mask: Optional[_Value] = None) -> None:
+    def _emit_fragment_store(self, ptr: _Value, value: _Value, mask: Optional[_Value] = None,
+                             range_bytes: Optional[int] = None) -> None:
         if ptr.pointer.ptr_base is None:
             raise NotImplementedError("wave_amd tt.dot result stores require a splatted pointer base")
         if value.shape is None or len(value.shape) != 2:
@@ -1825,10 +1823,11 @@ class _TTIRToWaveLowerer:
         if mask is not None and (value.dot.dot_grid is None or value.dot.dot_grid.m_tiles != 1
                                  or value.dot.dot_grid.n_tiles != 1):
             raise NotImplementedError("wave_amd masked tt.dot fragment stores currently support one 16x16 tile")
-        plan = None
+        # Buffer descriptor range is prepared in TTGIR; apply only for the fixed
+        # static-affine footprint where Wave buffer ops are used.
+        plan_range = None
         if dot_layout is None and ptr.pointer.ptr_offset_affine == fixed_affine:
-            store_info = _TensorInfo(value.shape, value.elem_type)
-            plan = self._buffer_plan_for_static_footprint(store_info)
+            plan_range = range_bytes
         if value.dot.dot_grid is not None:
             grid = value.dot.dot_grid
             if grid.role != 2:
@@ -1840,19 +1839,19 @@ class _TTIRToWaveLowerer:
                     self._emit_dot_row_major_fragment_store(
                         ptr.pointer.ptr_base, grid.c(m_tile, n_tile), n, tile_base,
                         dot_layout if ptr.pointer.ptr_offset_affine != fixed_affine else None, m_tile, n_tile, mask,
-                        owner_conditions, plan)
+                        owner_conditions, plan_range)
         else:
             self._emit_dot_row_major_fragment_store(
                 ptr.pointer.ptr_base, value.dot.fragment, n, 0,
                 dot_layout if ptr.pointer.ptr_offset_affine != fixed_affine else None, 0, 0, mask,
-                self._dot_tile_owner_conditions(None, 0, 0), plan)
+                self._dot_tile_owner_conditions(None, 0, 0), plan_range)
         self.load_tokens.clear()
 
     def _emit_dot_row_major_fragment_store(self, ptr_base, fragment, leading_dim: int, tile_base: int,
                                            dot_layout: Optional[_DotPointerLayout] = None, m_tile: int = 0,
                                            n_tile: int = 0, mask: Optional[_Value] = None,
                                            owner_conditions: Tuple[object, ...] = (),
-                                           buffer_plan: Optional[WaveBufferPlan] = None) -> None:
+                                           range_bytes: Optional[int] = None) -> None:
         regs = self.func.fragment_unpack(fragment)
         lane_mod = self._lane_mod_index()
         lane_sym = self._sym("lane_mod")
@@ -1872,7 +1871,7 @@ class _TTIRToWaveLowerer:
                 bindings = {lane_sym: lane_mod, row_parity_sym: row_parity}
             index = self.func.index_expr(row_major, bindings, index_type)
             value = self.dsl.wave.ExtractOp(value_type, regs, register).result
-            ptr = self._ptr_add(ptr_base, index, buffer_plan)
+            ptr = self._ptr_add(ptr_base, index, range_bytes)
             if mask is None:
                 if owner_conditions:
                     self._emit_under_mask(owner_conditions,
