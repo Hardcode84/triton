@@ -1725,60 +1725,78 @@ public:
 #define GEN_PASS_DEF_TRITONAMDGPUACCELERATEMATMUL
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
+// Shared body of tritonamdgpu-accelerate-matmul. Exposed through the forwarder
+// mlir::triton::amdgpu::accelerateMatmul (defined below) so the Wave AMD
+// backend can reuse the exact dot legalization instead of duplicating it. Kept
+// in namespace mlir so name resolution matches the pass that originally held
+// this body.
+static LogicalResult doAccelerateMatmul(ModuleOp m, StringRef gfxArch,
+                                        int matrixInstructionSize, int kPack) {
+  MLIRContext *context = m.getContext();
+
+  RewritePatternSet mfmaPatterns(context);
+  TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
+  auto isaFamily = targetFeatures.getISAFamily();
+  unsigned wmmaVersion = getWmmaVersion(isaFamily);
+  switch (isaFamily) {
+  case ISAFamily::GFX1250:
+    mfmaPatterns.add<ScaledBlockedToScaledWMMAF8F6F4>(context, wmmaVersion,
+                                                      /*benefit=*/4);
+    mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
+                                                  /*benefit=*/3);
+    mfmaPatterns.add<BlockedToWMMA>(context, wmmaVersion, 16, /*benefit=*/2);
+    break;
+  case ISAFamily::CDNA4:
+    mfmaPatterns.add<::ScaledBlockedToScaledMFMAF8F6F4>(
+        context, getMfmaVersion(isaFamily), matrixInstructionSize,
+        /*benefit=*/4);
+    [[fallthrough]];
+  case ISAFamily::CDNA3:
+  case ISAFamily::CDNA2:
+  case ISAFamily::CDNA1:
+    mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
+                                                  /*benefit=*/3);
+    mfmaPatterns.add<::BlockedToMFMA>(context, getMfmaVersion(isaFamily),
+                                      matrixInstructionSize, kPack,
+                                      /*benefit=*/2);
+    break;
+  case ISAFamily::RDNA3:
+  case ISAFamily::RDNA4:
+    ttg::populateDecomposeScaledBlockedPatterns(mfmaPatterns,
+                                                /*benefit=*/3);
+    mfmaPatterns.add<::BlockedToWMMA>(context, wmmaVersion,
+                                      matrixInstructionSize,
+                                      /*benefit=*/2);
+    break;
+  default:
+    break;
+  }
+  if (applyPatternsGreedily(m, std::move(mfmaPatterns)).failed())
+    return failure();
+
+  RewritePatternSet patterns(context);
+  patterns.add<AccelerateBlocked>(context, targetFeatures, /*benefit=*/1);
+  if (applyPatternsGreedily(m, std::move(patterns)).failed())
+    return failure();
+  decomposeMixedModeDotOp(m);
+  return success();
+}
+
 struct TritonAMDGPUAccelerateMatmulPass
     : impl::TritonAMDGPUAccelerateMatmulBase<TritonAMDGPUAccelerateMatmulPass> {
   using Base::Base;
 
   void runOnOperation() override {
-    MLIRContext *context = &getContext();
-    ModuleOp m = getOperation();
-
-    RewritePatternSet mfmaPatterns(context);
-    TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
-    auto isaFamily = targetFeatures.getISAFamily();
-    unsigned wmmaVersion = getWmmaVersion(isaFamily);
-    switch (isaFamily) {
-    case ISAFamily::GFX1250:
-      mfmaPatterns.add<ScaledBlockedToScaledWMMAF8F6F4>(context, wmmaVersion,
-                                                        /*benefit=*/4);
-      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
-                                                    /*benefit=*/3);
-      mfmaPatterns.add<BlockedToWMMA>(context, wmmaVersion, 16, /*benefit=*/2);
-      break;
-    case ISAFamily::CDNA4:
-      mfmaPatterns.add<::ScaledBlockedToScaledMFMAF8F6F4>(
-          context, getMfmaVersion(isaFamily), matrixInstructionSize,
-          /*benefit=*/4);
-      [[fallthrough]];
-    case ISAFamily::CDNA3:
-    case ISAFamily::CDNA2:
-    case ISAFamily::CDNA1:
-      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
-                                                    /*benefit=*/3);
-      mfmaPatterns.add<::BlockedToMFMA>(context, getMfmaVersion(isaFamily),
-                                        matrixInstructionSize, kPack,
-                                        /*benefit=*/2);
-      break;
-    case ISAFamily::RDNA3:
-    case ISAFamily::RDNA4:
-      ttg::populateDecomposeScaledBlockedPatterns(mfmaPatterns,
-                                                  /*benefit=*/3);
-      mfmaPatterns.add<::BlockedToWMMA>(context, wmmaVersion,
-                                        matrixInstructionSize,
-                                        /*benefit=*/2);
-      break;
-    default:
-      break;
-    }
-    if (applyPatternsGreedily(m, std::move(mfmaPatterns)).failed())
+    if (failed(doAccelerateMatmul(getOperation(), gfxArch,
+                                  matrixInstructionSize, kPack)))
       signalPassFailure();
-
-    RewritePatternSet patterns(context);
-    patterns.add<AccelerateBlocked>(context, targetFeatures, /*benefit=*/1);
-    if (applyPatternsGreedily(m, std::move(patterns)).failed())
-      signalPassFailure();
-    decomposeMixedModeDotOp(m);
   }
 };
+
+LogicalResult triton::amdgpu::accelerateMatmul(ModuleOp m, StringRef gfxArch,
+                                               int matrixInstructionSize,
+                                               int kPack) {
+  return doAccelerateMatmul(m, gfxArch, matrixInstructionSize, kPack);
+}
 
 } // namespace mlir

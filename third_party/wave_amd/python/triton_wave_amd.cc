@@ -121,6 +121,19 @@ void init_triton_wave_amd(py::module &&m) {
           pm.addPass(mlir::createTritonWaveAMDConvertToTTGPUIR(options));
         });
 
+  // Wave-owned AMD matrix-core dot legalization. Mirrors the option order of
+  // amd.passes.ttgpuir.add_accelerate_matmul so the pipeline can swap
+  // producers.
+  m.def("add_accelerate_matmul",
+        [](mlir::PassManager &pm, const std::string &gfxArch,
+           int matrixInstructionSize, int kPack) {
+          mlir::TritonWaveAMDAccelerateMatmulOptions options;
+          options.gfxArch = gfxArch;
+          options.matrixInstructionSize = matrixInstructionSize;
+          options.kPack = kPack;
+          pm.addPass(mlir::createTritonWaveAMDAccelerateMatmul(options));
+        });
+
   // TTGIR GEMM preparation: legalize dots against Wave AMD architecture policy
   // and attach typed dot-plan attributes for the bridge.
   m.def("add_legalize_dots", [](mlir::PassManager &pm) {

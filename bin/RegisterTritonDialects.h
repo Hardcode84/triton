@@ -144,6 +144,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 #ifdef TRITON_WAVE_AMD_ENABLED
   // Wave AMD backend TTIR/TTGIR preparation passes.
   mlir::registerTritonWaveAMDConvertToTTGPUIR();
+  mlir::registerTritonWaveAMDAccelerateMatmul();
   mlir::registerTritonWaveAMDLegalizeDots();
   mlir::registerTritonWaveAMDPlanGemmSchedule();
   mlir::registerTritonWaveAMDPlanBufferDescriptors();

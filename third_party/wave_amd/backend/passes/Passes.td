@@ -42,6 +42,37 @@ def TritonWaveAMDConvertToTTGPUIR
   ];
 }
 
+def TritonWaveAMDAccelerateMatmul
+    : Pass<"tritonwaveamd-accelerate-matmul", "mlir::ModuleOp"> {
+  let summary = "Legalize dots to matrix-core ops for the Wave AMD backend";
+
+  let description = [{
+    Wave-owned entry point for AMD matrix-core dot legalization. It reuses the
+    base tritonamdgpu-accelerate-matmul transformation (intrinsic legality,
+    architecture policy, and WMMA/MFMA shape selection) so the Wave pipeline no
+    longer calls the AMD pass directly, giving Wave a seam it can later diverge
+    to emit Wave-native fragment layouts.
+
+    Behavior is currently identical to tritonamdgpu-accelerate-matmul: blocked
+    dots are rewritten to AMD WMMA (RDNA) or MFMA (CDNA) encodings with explicit
+    operand-role dot encodings.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+
+  let options = [
+    Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"\"\"",
+           "the GPU target arch, e.g., gfx1100">,
+    Option<"matrixInstructionSize", "matrix-instruction-size", "int32_t",
+           /*default=*/"0", "matrix instruction non-K dimension (0 = auto)">,
+    Option<"kPack", "kpack", "int32_t", /*default=*/"1",
+           "number of K elements packed per matrix instruction">
+  ];
+}
+
 def TritonWaveAMDLegalizeDots
     : Pass<"tritonwaveamd-legalize-dots", "mlir::ModuleOp"> {
   let summary = "Legalize TTGIR dots against Wave AMD architecture policy";

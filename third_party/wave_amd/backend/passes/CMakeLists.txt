@@ -10,6 +10,7 @@ mlir_tablegen(Passes.h.inc -gen-pass-decls -name TritonWaveAMD)
 add_public_tablegen_target(TritonWaveAMDBackendPassesIncGen)
 
 add_triton_library(TritonWaveAMDBackendPasses
+  AccelerateMatmul.cpp
   ConvertToTTGPUIR.cpp
   LegalizeDots.cpp
   PlanBufferDescriptors.cpp
@@ -22,4 +23,5 @@ add_triton_library(TritonWaveAMDBackendPasses
 
   LINK_LIBS PUBLIC
   TritonToTritonGPU
+  TritonAMDGPUTransforms
 )
