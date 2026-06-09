@@ -1248,7 +1248,10 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_k32_to_two_native_wmma_
     assert "wave.store" in wave
 
 
-def test_wave_amd_make_wave_stages_dot_operands_through_lds(tmp_path):
+def test_wave_amd_make_wave_elides_redundant_lds_staging(tmp_path):
+    # The dot-fragment LDS staging is an identity round-trip (store and load use
+    # the same per-lane slot), so the bridge elides it: no shared memory, no LDS
+    # ops, no staging barriers -- the dot still lowers to native WMMA.
     wave, metadata = _lower_accelerated_ttgir_to_wave(
         tmp_path,
         DOT_MATMUL_K32_TTIR,
@@ -1258,20 +1261,19 @@ def test_wave_amd_make_wave_stages_dot_operands_through_lds(tmp_path):
     )
 
     assert metadata["name"] == "dot_k32_kernel"
-    assert "wave.lds_size = 2048 : i64" in wave
-    assert wave.count("wave.lds_base") >= 4
-    assert wave.count("wave.barrier") >= 4
-    assert "waveamd.gemm.lds_slot = 0" in wave
-    assert "waveamd.gemm.lds_slot = 1" in wave
-    assert "waveamd.gemm.stage = 0" in wave
-    assert "waveamd.gemm.stage = 1" in wave
+    assert "wave.lds_size" not in wave
+    assert wave.count("wave.lds_base") == 0
+    assert wave.count("wave.barrier") == 0
+    assert "waveamd.gemm.lds_slot" not in wave
+    assert "waveamd.gemm.stage" not in wave
+    assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 2
 
 
 @pytest.mark.parametrize(
     ("ttir", "kernel_name", "expected_mmas", "expected_packs", "expected_stores"),
     [
-        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4, 36),
-        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8, 40),
+        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4, 32),
+        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8, 32),
     ],
 )
 def test_wave_amd_make_wave_lowers_accelerated_ttgir_32x32_dot_to_native_wmma_grid(tmp_path, ttir, kernel_name,
@@ -1302,7 +1304,7 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_scheduled_across_worker
     assert expected_marker in wave
     assert wave.count("wave.where") >= 4
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 4
-    assert wave.count("wave.store") == 36
+    assert wave.count("wave.store") == 32
 
 
 def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_tile_pattern(tmp_path):
