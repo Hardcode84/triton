@@ -14,6 +14,15 @@ for exists, and three TTGIR preparation passes have landed.
 C++ TTGIR preparation passes (Triton tree, `backend/passes/`, registered into
 `triton-opt` and the `TritonWaveAMD` plugin):
 
+- `tritonwaveamd-convert-to-ttgpuir`: Wave-owned Triton-to-TritonGPU conversion.
+  Currently byte-identical to the base pass (reuses the extracted
+  `mlir::triton::convertToTritonGPU` helper); the pipeline calls it instead of
+  `passes.ttir.add_convert_to_ttgpuir`. The seam exists; the layouts have not
+  diverged yet.
+- `tritonwaveamd-accelerate-matmul`: Wave-owned matrix-core dot legalization.
+  Currently byte-identical to `amd.accelerate_matmul` (reuses the extracted
+  `mlir::triton::amdgpu::accelerateMatmul` helper); the pipeline calls it
+  instead of the AMD pass.
 - `tritonwaveamd-legalize-dots`: rejects MFMA with a diagnostic; attaches
   `waveamd.dot.{instr_kind,a_op_idx,b_op_idx}` and `waveamd.dot.role` on operand
   convert_layouts. **Consumed** by the bridge.
@@ -33,8 +42,14 @@ Migration phase scorecard (details inline in Migration Plan below):
 - Phase 7 (buffer descriptors): pass + consumer landed; path latent.
 - Phase 8 (delete bridge analysis): dot-path type-string parsing deleted; layout
   and epilogue analysis still live.
-- Phases 3 (replace `add_convert_to_ttgpuir`) and 4 (layout exprs to C++): NOT
-  STARTED. The pipeline still calls `add_convert_to_ttgpuir`.
+- Phase 3 (replace `add_convert_to_ttgpuir`): producer SEAM owned. The pipeline
+  no longer calls the base conversion or `amd.accelerate_matmul`; both are
+  Wave-owned passes (`tritonwaveamd-convert-to-ttgpuir`,
+  `tritonwaveamd-accelerate-matmul`). They are still byte-identical reuses, so
+  the emitted layouts are still TritonGPU encodings, not Wave-native contracts;
+  diverging them is the remaining Phase 3 work.
+- Phase 4 (layout exprs to C++): NOT STARTED; depends on the Phase 3 layout
+  divergence above.
 
 Corrections to the original assumptions below:
 
@@ -90,10 +105,13 @@ The bridge should see a Wave-ready TTGIR module. It may map operations, copy
 attributes, and materialize prepared expressions. It should not infer missing
 structure from arbitrary TTIR/TTGIR graphs.
 
-Current divergence: the "Wave C++ TTIR-to-TTGIR conversion" step is not yet
-implemented. The pipeline still runs base `add_convert_to_ttgpuir` plus reused
-TTGIR cleanup, then the three Wave C++ TTGIR preparation passes. "Wave C++ TTIR
-preparation" is also not a separate step yet.
+Current divergence: the "Wave C++ TTIR-to-TTGIR conversion" step exists as a
+Wave-owned pass (`tritonwaveamd-convert-to-ttgpuir`) but still emits TritonGPU
+layouts byte-identically to the base conversion, so it is not yet a Wave-native
+layout contract. The pipeline runs that Wave conversion plus reused TTGIR
+cleanup, then the Wave-owned `tritonwaveamd-accelerate-matmul`, then the three
+Wave C++ TTGIR preparation passes. "Wave C++ TTIR preparation" is not a separate
+step yet.
 
 ## Repository Ownership
 
@@ -420,14 +438,23 @@ Useful Wave tests:
    - Reuse Triton AMD target feature and intrinsic legality logic where possible.
    - Fix option plumbing so `matrix_instr_nonkdim` has one default.
    - Status: `tritonwaveamd-legalize-dots` rejects MFMA in TTGIR; the bridge no
-     longer parses encodings for dot policy. Option plumbing still TODO.
+     longer parses encodings for dot policy. Option plumbing fixed:
+     `matrix_instr_nonkdim` had a duplicate field with conflicting defaults
+     (16 advertised, 0 in effect); collapsed to a single default of 0.
 
-3. Replace `add_convert_to_ttgpuir`. [NOT STARTED]
+3. Replace `add_convert_to_ttgpuir`. [PARTIAL: producer owned]
    - Add a Triton-tree C++ TTIR-to-TTGIR conversion for Wave.
    - Emit Wave-compatible layout contracts directly.
    - Remove dependence on TritonGPU layout approximations for the Wave path.
-   - Status: the linchpin. Pipeline still calls `add_convert_to_ttgpuir`. Open
-     question (below) about intrinsic selection is the main unknown.
+   - Status: the Wave pipeline no longer calls the base conversion or
+     `amd.accelerate_matmul`; both are Wave-owned passes
+     (`tritonwaveamd-convert-to-ttgpuir`, `tritonwaveamd-accelerate-matmul`),
+     each a byte-identical reuse of the extracted base body
+     (`mlir::triton::convertToTritonGPU`, `mlir::triton::amdgpu::accelerateMatmul`).
+     The open question below is now half-answered in practice: Wave reuses the
+     AMD intrinsic selection wholesale by calling its legalization. What remains
+     is emitting Wave-native layouts instead of TritonGPU encodings -- the
+     reason the passes are still "byte-identical" rather than "diverged".
 
 4. Move layout expression construction out of `lowering.py`. [NOT STARTED]
    - Introduce symbolic layout/index metadata in TTIR/TTGIR preparation.
@@ -494,7 +521,9 @@ Status as of 2026-06-09 in brackets.
   TTIR preparation and TTIR-to-TTGIR conversion do not.)
 - [NO] Python compiler code is limited to the mechanical TTGIR-to-Wave bridge.
   (`lowering.py` still constructs layouts and folds epilogues.)
-- [NO] The Wave pipeline does not call `add_convert_to_ttgpuir`. (It still does.)
+- [YES] The Wave pipeline does not call `add_convert_to_ttgpuir` (nor
+  `amd.accelerate_matmul`). Both are replaced by Wave-owned passes, though those
+  passes still emit TritonGPU layouts rather than Wave-native contracts.
 - [PARTIAL] All memory and fragment layout math appears as prepared symbolic
   expressions and lowers to `wave.index_expr`. (Layout math is symbolic
   `wave.index_expr` already, but constructed in the Python bridge, not prepared.)
