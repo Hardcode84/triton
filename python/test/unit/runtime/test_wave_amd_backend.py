@@ -1268,14 +1268,15 @@ def test_wave_amd_make_wave_stages_dot_operands_through_lds(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("ttir", "kernel_name", "expected_mmas", "expected_packs"),
+    ("ttir", "kernel_name", "expected_mmas", "expected_packs", "expected_stores"),
     [
-        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4),
-        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8),
+        (DOT_MATMUL_32X32_TTIR, "dot_32x32_kernel", 4, 4, 36),
+        (DOT_MATMUL_32X32_K32_TTIR, "dot_32x32_k32_kernel", 8, 8, 40),
     ],
 )
 def test_wave_amd_make_wave_lowers_accelerated_ttgir_32x32_dot_to_native_wmma_grid(tmp_path, ttir, kernel_name,
-                                                                                   expected_mmas, expected_packs):
+                                                                                   expected_mmas, expected_packs,
+                                                                                   expected_stores):
     wave, metadata = _lower_accelerated_ttgir_to_wave(tmp_path, ttir)
 
     assert metadata["name"] == kernel_name
@@ -1283,7 +1284,7 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_32x32_dot_to_native_wmma_gr
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == expected_mmas
     assert wave.count("waveamd.fragment_pack") == expected_packs
     assert wave.count("waveamd.fragment_unpack") == 4
-    assert wave.count("wave.store") == 32
+    assert wave.count("wave.store") == expected_stores
 
 
 @pytest.mark.parametrize(
@@ -1301,7 +1302,7 @@ def test_wave_amd_make_wave_lowers_accelerated_ttgir_dot_scheduled_across_worker
     assert expected_marker in wave
     assert wave.count("wave.where") >= 4
     assert wave.count('waveamd.mma "wmma.f32.16x16x16.f16"') == 4
-    assert wave.count("wave.store") == 32
+    assert wave.count("wave.store") == 36
 
 
 def test_wave_amd_make_wave_lowers_accelerated_ttgir_realistic_matmul_tile_pattern(tmp_path):
@@ -2223,6 +2224,8 @@ def test_wave_amd_runtime_launches_masked_kernel_tail(tmp_path, monkeypatch, dev
         target = active_driver.get_current_target()
     except Exception as exc:
         pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    from triton.backends import Backend, backends
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
     monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
     monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
 
@@ -2264,6 +2267,8 @@ def test_wave_amd_runtime_launches_masked_sub_mul_tail(tmp_path, monkeypatch, de
         target = active_driver.get_current_target()
     except Exception as exc:
         pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    from triton.backends import Backend, backends
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
     monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
     monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
 
@@ -2305,6 +2310,8 @@ def test_wave_amd_runtime_launches_masked_select_tail(tmp_path, monkeypatch, dev
         target = active_driver.get_current_target()
     except Exception as exc:
         pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    from triton.backends import Backend, backends
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
     monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
     monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
 
@@ -2348,6 +2355,8 @@ def test_wave_amd_runtime_launches_masked_load_other_tail(tmp_path, monkeypatch,
         target = active_driver.get_current_target()
     except Exception as exc:
         pytest.skip(f"Wave AMD runtime smoke requires a working HIP runtime: {exc}")
+    from triton.backends import Backend, backends
+    monkeypatch.setitem(backends, "wave_amd", Backend(WaveAMDBackend, wave_driver.WaveAMDDriver))
     monkeypatch.setattr(triton_compiler.driver, "_default", active_driver)
     monkeypatch.setattr(triton_compiler.driver, "_active", active_driver)
 
