@@ -3,6 +3,45 @@
 
 include "mlir/Pass/PassBase.td"
 
+def TritonWaveAMDConvertToTTGPUIR
+    : Pass<"tritonwaveamd-convert-to-ttgpuir", "mlir::ModuleOp"> {
+  let summary = "Convert Triton to TritonGPU for the Wave AMD backend";
+
+  let description = [{
+    Wave-owned entry point for the Triton-to-TritonGPU conversion. It reuses the
+    base conversion machinery so the Wave pipeline no longer calls
+    `convert-triton-to-tritongpu` directly, giving Wave a seam it can later
+    diverge to emit Wave-native layout contracts instead of the default blocked
+    encodings.
+
+    Behavior is currently identical to `convert-triton-to-tritongpu`: tensors
+    without an encoding get the default blocked layout parameterized by the warp
+    configuration, and the module gets the `ttg.num-warps`,
+    `ttg.threads-per-warp`, `ttg.num-ctas`, and `ttg.target` attributes.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::math::MathDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+
+  let options = [
+    Option<"target", "target", "std::string", /*default=*/"\"\"",
+           "the GPU target, e.g., hip:gfx942">,
+    Option<"numWarps", "num-warps", "int32_t", /*default=*/"4",
+           "number of warps">,
+    Option<"threadsPerWarp", "threads-per-warp", "int32_t", /*default=*/"32",
+           "number of threads per warp">,
+    Option<"numCTAs", "num-ctas", "int32_t", /*default=*/"1",
+           "number of ctas in a cga">,
+    Option<"enableSourceRemat", "enable-source-remat", "bool",
+           /*default=*/"false", "enable trivial source rematerialization">
+  ];
+}
+
 def TritonWaveAMDLegalizeDots
     : Pass<"tritonwaveamd-legalize-dots", "mlir::ModuleOp"> {
   let summary = "Legalize TTGIR dots against Wave AMD architecture policy";

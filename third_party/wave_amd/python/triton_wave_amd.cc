@@ -108,6 +108,19 @@ py::object packTensorInfo(mlir::Type type) {
 void init_triton_wave_amd(py::module &&m) {
   m.doc() = "Wave AMDGPU backend native hooks";
 
+  // Wave-owned Triton-to-TritonGPU conversion. Mirrors the option order of the
+  // base passes.ttir.add_convert_to_ttgpuir so the pipeline can swap producers.
+  m.def("add_convert_to_ttgpuir",
+        [](mlir::PassManager &pm, const std::string &target, int numWarps,
+           int threadsPerWarp, int numCTAs) {
+          mlir::TritonWaveAMDConvertToTTGPUIROptions options;
+          options.target = target;
+          options.numWarps = numWarps;
+          options.threadsPerWarp = threadsPerWarp;
+          options.numCTAs = numCTAs;
+          pm.addPass(mlir::createTritonWaveAMDConvertToTTGPUIR(options));
+        });
+
   // TTGIR GEMM preparation: legalize dots against Wave AMD architecture policy
   // and attach typed dot-plan attributes for the bridge.
   m.def("add_legalize_dots", [](mlir::PassManager &pm) {

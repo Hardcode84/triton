@@ -733,35 +733,44 @@ public:
       return signalPassFailure();
     }
 
-    MLIRContext *context = &getContext();
-    ModuleOp mod = getOperation();
-    // type converter
-    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
-                                         numCTAs, enableSourceRemat);
-    TritonGPUConversionTarget target(*context, typeConverter);
-    // rewrite patterns
-    RewritePatternSet patterns(context);
-    // add rules
-    populateArithPatternsAndLegality(typeConverter, patterns, target);
-    populateMathPatternsAndLegality(typeConverter, patterns, target);
-    FuncArgRenamer renamer;
-    populateFunctionTypeConversions(typeConverter, renamer, patterns);
-    populateTritonPatterns(typeConverter, patterns, numCTAs);
-    // TODO: can we use
-    //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
-    populateSCFPatterns(typeConverter, patterns);
-    populateCFPatterns(typeConverter, patterns);
-    patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
-
-    Builder b(&getContext());
-    mod->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
-    mod->setAttr(AttrNumThreadsPerWarp, b.getI32IntegerAttr(threadsPerWarp));
-    mod->setAttr(AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
-    mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
-
-    if (failed(applyPartialConversion(mod, target, std::move(patterns))))
+    if (failed(mlir::triton::convertToTritonGPU(
+            getOperation(), target.getValue(), numWarps, threadsPerWarp,
+            numCTAs, enableSourceRemat)))
       return signalPassFailure();
   }
 };
 
 } // namespace
+
+LogicalResult mlir::triton::convertToTritonGPU(ModuleOp mod, StringRef target,
+                                               int numWarps, int threadsPerWarp,
+                                               int numCTAs,
+                                               bool enableSourceRemat) {
+  using namespace mlir::triton::gpu;
+  MLIRContext *context = mod.getContext();
+  // type converter
+  TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
+                                       numCTAs, enableSourceRemat);
+  TritonGPUConversionTarget convTarget(*context, typeConverter);
+  // rewrite patterns
+  RewritePatternSet patterns(context);
+  // add rules
+  populateArithPatternsAndLegality(typeConverter, patterns, convTarget);
+  populateMathPatternsAndLegality(typeConverter, patterns, convTarget);
+  FuncArgRenamer renamer;
+  populateFunctionTypeConversions(typeConverter, renamer, patterns);
+  populateTritonPatterns(typeConverter, patterns, numCTAs);
+  // TODO: can we use
+  //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
+  populateSCFPatterns(typeConverter, patterns);
+  populateCFPatterns(typeConverter, patterns);
+  patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
+
+  Builder b(context);
+  mod->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
+  mod->setAttr(AttrNumThreadsPerWarp, b.getI32IntegerAttr(threadsPerWarp));
+  mod->setAttr(AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
+  mod->setAttr(AttrTargetName, b.getStringAttr(target));
+
+  return applyPartialConversion(mod, convTarget, std::move(patterns));
+}
