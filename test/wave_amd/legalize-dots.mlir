@@ -52,3 +52,24 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
     tt.return %d : tensor<16x16xf32, #mma>
   }
 }
+
+// -----
+
+// Operand convert_layouts carry the role so the bridge reads it from a prepared
+// attr instead of parsing the dot_op encoding.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 2], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}, instrShape = [16, 16, 32]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @wmma_dot_cvt
+  tt.func @wmma_dot_cvt(%a: tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %b: tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %c: tensor<16x16xf32, #blocked>) -> tensor<16x16xf32, #blocked> {
+    %0 = ttg.convert_layout %c : tensor<16x16xf32, #blocked> -> tensor<16x16xf32, #mma>
+    // CHECK: ttg.convert_layout %arg0 {waveamd.dot.role = 0 : i32}
+    %1 = ttg.convert_layout %a : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> -> tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    // CHECK: ttg.convert_layout %arg1 {waveamd.dot.role = 1 : i32}
+    %2 = ttg.convert_layout %b : tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+    %3 = tt.dot %1, %2, %0 : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<16x16xf32, #mma>
+    %4 = ttg.convert_layout %3 : tensor<16x16xf32, #mma> -> tensor<16x16xf32, #blocked>
+    tt.return %4 : tensor<16x16xf32, #blocked>
+  }
+}

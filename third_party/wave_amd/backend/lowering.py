@@ -1,4 +1,3 @@
-import re
 import sys
 from dataclasses import dataclass, field
 from functools import reduce
@@ -341,7 +340,7 @@ class _TTIRToWaveLowerer:
         for op in ops:
             if op.get_name() != "ttg.convert_layout":
                 continue
-            role = _ttgir_dot_operand_role(op.get_result(0).get_type())
+            role = op.get_int_attr("waveamd.dot.role")
             if role is None:
                 continue
             self._record_dot_operand_role(op.get_result(0).id(), role)
@@ -734,15 +733,14 @@ class _TTIRToWaveLowerer:
     def _lower_convert_layout(self, op) -> None:
         src = self._value(op.get_operand(0))
         info = self._result_tensor_info(op)
-        src_type = op.get_operand(0).get_type()
-        dst_type = op.get_result(0).get_type()
-        conversion = _expect_ttgir_convert_layout_kind(src_type, dst_type)
-        if conversion == "dot_operand":
-            role = _ttgir_dot_operand_role(dst_type)
-            if role is None:
-                raise NotImplementedError("wave_amd TTGIR dot operand conversion must carry opIdx")
+        # Classify from prepared metadata and the Wave payload, not type strings:
+        # a dot-operand conversion carries a prepared role; a dot/MMA result
+        # conversion forwards a result fragment; anything else is a mechanical
+        # forward.
+        role = op.get_int_attr("waveamd.dot.role")
+        if role is not None:
             self._expect_ttgir_dot_operand_payload(src, role)
-        elif conversion == "mma_result":
+        elif src.dot.dot_grid is not None or src.dot.fragment is not None or src.dot.fragments:
             self._expect_ttgir_mma_result_payload(src)
 
         # TTGIR layout conversions encode Triton's SIMT distribution contract.
@@ -1415,6 +1413,10 @@ class _TTIRToWaveLowerer:
         self.loop_yields[block.get_parent().id()] = self._value(op.get_operand(0))
 
     def _lower_dot(self, op) -> None:
+        instr_kind = op.get_str_attr("waveamd.dot.instr_kind")
+        if instr_kind is None:
+            raise NotImplementedError("wave_amd tt.dot requires a prepared waveamd.dot.instr_kind attr "
+                                      "(run tritonwaveamd-legalize-dots)")
         lhs_info = self._value_tensor_info(op.get_operand(0))
         rhs_info = self._value_tensor_info(op.get_operand(1))
         acc_info = self._value_tensor_info(op.get_operand(2))
@@ -1435,8 +1437,7 @@ class _TTIRToWaveLowerer:
             for n_tile in range(config.n_tiles):
                 result = self._dot_accumulator_fragment(acc, result_info, m_tile, n_tile)
                 for k_step in range(config.k_steps):
-                    result = self.func.mma("wmma.f32.16x16x16.f16", lhs_grid.a(m_tile, k_step),
-                                           rhs_grid.b(n_tile, k_step), result)
+                    result = self.func.mma(instr_kind, lhs_grid.a(m_tile, k_step), rhs_grid.b(n_tile, k_step), result)
                 result_fragments.append(result)
         result_grid = _DotFragmentGrid(
             role=2,
@@ -2354,48 +2355,6 @@ def _symbolic_is_uniform(value: _SymbolicIndex) -> bool:
 def _symbolic_scale(value: _SymbolicIndex, scale, scale_bindings: Dict[object, object]) -> _SymbolicIndex:
     return _SymbolicIndex(value.const * scale, tuple(coeff * scale for coeff in value.coeffs),
                           {**value.bindings, **scale_bindings})
-
-
-def _ttgir_convert_layout_kind(src_type, dst_type) -> Optional[str]:
-    src = str(src_type)
-    dst = str(dst_type)
-    if _is_ttgir_dot_operand_type(dst):
-        return "dot_operand"
-    if _is_ttgir_amd_mma_type(dst):
-        return "mma_accumulator"
-    if _is_ttgir_amd_mma_type(src):
-        return "mma_result"
-    return None
-
-
-def _expect_ttgir_convert_layout_kind(src_type, dst_type) -> str:
-    if _is_ttgir_amd_mfma_type(src_type) or _is_ttgir_amd_mfma_type(dst_type):
-        raise NotImplementedError("wave_amd TTGIR lowering does not yet support AMD MFMA encodings")
-    conversion = _ttgir_convert_layout_kind(src_type, dst_type)
-    if conversion is None:
-        raise NotImplementedError("wave_amd TTGIR lowering currently supports only matrix-core ttg.convert_layout ops "
-                                  f"(got {src_type} -> {dst_type})")
-    return conversion
-
-
-def _is_ttgir_dot_operand_type(type_text: str) -> bool:
-    return "#ttg.dot_op" in str(type_text)
-
-
-def _is_ttgir_amd_mma_type(type_text: str) -> bool:
-    text = str(type_text)
-    return "#ttg.amd_wmma" in text or "#ttg.amd_mfma" in text
-
-
-def _is_ttgir_amd_mfma_type(type_text: str) -> bool:
-    return "#ttg.amd_mfma" in str(type_text)
-
-
-def _ttgir_dot_operand_role(type_text) -> Optional[int]:
-    match = re.search(r"opIdx\s*=\s*([01])", str(type_text))
-    if match is None:
-        return None
-    return int(match.group(1))
 
 
 def _pack_tensor_info(info) -> Optional[_TensorInfo]:

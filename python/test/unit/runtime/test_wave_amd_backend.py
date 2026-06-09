@@ -637,23 +637,6 @@ def _accelerated_ttgir_text(tmp_path, ttir, options_dict=None):
     return _accelerated_ttgir_text_for_target(tmp_path, ttir, options_dict=options_dict)
 
 
-def _accelerated_ttgir_convert_layout_types(tmp_path, ttir, arch="gfx1100", warp_size=32):
-    target = GPUTarget("wave_amd", arch, warp_size)
-    backend = WaveAMDBackend(target)
-    options = backend.parse_options({"num_warps": 1})
-    module = _parse_ttir(tmp_path, backend, ttir)
-    pairs = []
-
-    backend.make_ttgir(module, {}, options)
-
-    def collect(op):
-        if op.get_name() == "ttg.convert_layout":
-            pairs.append((str(op.get_operand(0).get_type()), str(op.get_result(0).get_type())))
-
-    module.walk(collect)
-    return pairs
-
-
 @pytest.mark.parametrize(
     ("ttir", "kernel_name", "expected_min_blocked"),
     [
@@ -736,70 +719,29 @@ def test_wave_amd_ttgir_stage_accelerates_expanded_matmul_cases(tmp_path, ttir, 
     assert ttgir.count("ttg.convert_layout") >= 3
 
 
-def test_wave_amd_ttgir_convert_layout_classifier_accepts_matrix_core_shapes():
-    blocked = "tensor<16x16xf16, #ttg.blocked<{}>>"
-    dot_a = ("tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.amd_wmma<{version = 1}>, "
-             "kWidth = 16}>>")
-    dot_b = ("tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.amd_wmma<{version = 1}>, "
-             "kWidth = 16}>>")
-    mma = "tensor<16x16xf32, #ttg.amd_wmma<{version = 1}>>"
-
-    assert wave_lowering._ttgir_convert_layout_kind(blocked, dot_a) == "dot_operand"
-    assert wave_lowering._ttgir_convert_layout_kind(blocked, dot_b) == "dot_operand"
-    assert wave_lowering._ttgir_convert_layout_kind(blocked, mma) == "mma_accumulator"
-    assert wave_lowering._ttgir_convert_layout_kind(mma, blocked) == "mma_result"
-    assert wave_lowering._ttgir_convert_layout_kind(blocked, blocked) is None
-    assert wave_lowering._ttgir_dot_operand_role(dot_a) == 0
-    assert wave_lowering._ttgir_dot_operand_role(dot_b) == 1
-
-    with pytest.raises(NotImplementedError, match="only matrix-core ttg.convert_layout ops"):
-        wave_lowering._expect_ttgir_convert_layout_kind(blocked, blocked)
-
-
-def test_wave_amd_ttgir_convert_layout_rejects_mfma_encodings():
-    blocked = "tensor<16x16xf16, #ttg.blocked<{}>>"
-    mfma_dot = ("tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.amd_mfma<{version = 2, "
-                "instrShape = [16, 16, 16]}>, kWidth = 4}>>")
-    mfma_acc = "tensor<16x16xf32, #ttg.amd_mfma<{version = 2, instrShape = [16, 16, 16]}>>"
-
-    assert wave_lowering._ttgir_convert_layout_kind(blocked, mfma_dot) == "dot_operand"
-    assert wave_lowering._ttgir_convert_layout_kind(blocked, mfma_acc) == "mma_accumulator"
-    assert wave_lowering._ttgir_convert_layout_kind(mfma_acc, blocked) == "mma_result"
-
-    with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
-        wave_lowering._expect_ttgir_convert_layout_kind(blocked, mfma_dot)
-    with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
-        wave_lowering._expect_ttgir_convert_layout_kind(blocked, mfma_acc)
-    with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
-        wave_lowering._expect_ttgir_convert_layout_kind(mfma_acc, blocked)
-
-
 def test_wave_amd_architecture_policy_documents_wmma_only_gemm():
     assert "WMMA" in wave_lowering.ARCHITECTURE_POLICY
     assert "MFMA" in wave_lowering.ARCHITECTURE_POLICY
     assert "rejected" in wave_lowering.ARCHITECTURE_POLICY
 
 
-def test_wave_amd_dot_role_collection_uses_ttgir_encodings_only():
+def test_wave_amd_dot_role_collection_reads_prepared_role_attr():
 
     class FakeValue:
 
-        def __init__(self, value_id, value_type="tensor<16x16xf16, #ttg.blocked<{}>>"):
+        def __init__(self, value_id):
             self._id = value_id
-            self._type = value_type
 
         def id(self):
             return self._id
 
-        def get_type(self):
-            return self._type
-
     class FakeOp:
 
-        def __init__(self, name, operands, results=()):
+        def __init__(self, name, operands, results=(), role=None):
             self._name = name
             self._operands = operands
             self._results = results
+            self._role = role
 
         def get_name(self):
             return self._name
@@ -810,27 +752,18 @@ def test_wave_amd_dot_role_collection_uses_ttgir_encodings_only():
         def get_result(self, index):
             return self._results[index]
 
-    encoded_src = FakeValue(4)
-    encoded_dst = FakeValue(5, "tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>")
-    encoded_convert = FakeOp("ttg.convert_layout", (encoded_src, ), (encoded_dst, ))
+        def get_int_attr(self, name):
+            return self._role if name == "waveamd.dot.role" else None
+
+    tagged = FakeOp("ttg.convert_layout", (FakeValue(4), ), (FakeValue(5), ), role=1)
+    # A convert_layout without the prepared role attr is not a dot operand.
+    untagged = FakeOp("ttg.convert_layout", (FakeValue(6), ), (FakeValue(7), ), role=None)
 
     lowerer = wave_lowering._TTIRToWaveLowerer.__new__(wave_lowering._TTIRToWaveLowerer)
     lowerer.dot_operand_roles = {}
-    lowerer.producers_by_result = {}
-    lowerer._collect_dot_operand_roles((FakeOp("tt.dot", (FakeValue(1), FakeValue(2), FakeValue(3))), encoded_convert))
+    lowerer._collect_dot_operand_roles((tagged, untagged))
 
     assert lowerer.dot_operand_roles == {4: 1, 5: 1}
-
-
-def test_wave_amd_ttgir_stage_uses_supported_matrix_core_convert_layouts(tmp_path):
-    pairs = _accelerated_ttgir_convert_layout_types(tmp_path, DOT_MATMUL_TTIR)
-
-    assert pairs
-    assert [wave_lowering._ttgir_convert_layout_kind(src, dst) for src, dst in pairs] == [
-        "dot_operand",
-        "dot_operand",
-        "mma_result",
-    ]
 
 
 def test_wave_amd_ttgir_stage_rejects_gfx9_mfma_convert_layouts(tmp_path, capfd):
@@ -848,11 +781,6 @@ def test_wave_amd_ttgir_stage_rejects_gfx9_mfma_convert_layouts(tmp_path, capfd)
     err = capfd.readouterr().err
     assert "does not support AMD MFMA" in err
     assert "TritonWaveAMDLegalizeDots" in err
-
-    # The bridge keeps a defensive guard for direct callers of the helper.
-    mfma_type = "tensor<16x16xf32, #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1]}>>"
-    with pytest.raises(NotImplementedError, match="does not yet support AMD MFMA"):
-        wave_lowering._expect_ttgir_convert_layout_kind(mfma_type, mfma_type)
 
 
 def test_wave_amd_backend_hash_tracks_packaged_codegen_artifacts(tmp_path, monkeypatch):

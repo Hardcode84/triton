@@ -34,6 +34,7 @@ namespace {
 constexpr StringLiteral kInstrKindAttr = "waveamd.dot.instr_kind";
 constexpr StringLiteral kAOpIdxAttr = "waveamd.dot.a_op_idx";
 constexpr StringLiteral kBOpIdxAttr = "waveamd.dot.b_op_idx";
+constexpr StringLiteral kRoleAttr = "waveamd.dot.role";
 
 // Short element-type name used in the instruction kind string.
 static StringRef elementName(Type type) {
@@ -80,12 +81,23 @@ static void annotateWmmaDot(tt::DotOp dot, ttg::AMDWmmaEncodingAttr wmma) {
 
   Builder b(dot.getContext());
   dot->setAttr(kInstrKindAttr, b.getStringAttr(os.str()));
-  if (auto aDot =
-          dyn_cast_or_null<ttg::DotOperandEncodingAttr>(aTy.getEncoding()))
+
+  // Tag the operand and its source convert_layout with the role, so the bridge
+  // reads the role from a prepared attr instead of parsing the dot_op encoding.
+  auto tagRole = [&](Value operand, ttg::DotOperandEncodingAttr enc) {
+    if (auto cvt = operand.getDefiningOp<ttg::ConvertLayoutOp>())
+      cvt->setAttr(kRoleAttr, b.getI32IntegerAttr(enc.getOpIdx()));
+  };
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
+  if (aDot) {
     dot->setAttr(kAOpIdxAttr, b.getI32IntegerAttr(aDot.getOpIdx()));
-  if (auto bDot =
-          dyn_cast_or_null<ttg::DotOperandEncodingAttr>(bTy.getEncoding()))
+    tagRole(dot.getA(), aDot);
+  }
+  if (bDot) {
     dot->setAttr(kBOpIdxAttr, b.getI32IntegerAttr(bDot.getOpIdx()));
+    tagRole(dot.getB(), bDot);
+  }
 }
 
 struct TritonWaveAMDLegalizeDotsPass
