@@ -123,8 +123,10 @@ def clone_module_for_preview(mod, suffix: str = ".ttir"):
 
 
 def add_wave_ttgir_passes(pm, options) -> None:
-    passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
-                                       options.num_ctas)
+    # Wave owns the Triton-to-TritonGPU conversion (see tritonwaveamd-convert-to-
+    # ttgpuir). Currently byte-identical to the base pass, but it gives Wave a
+    # seam to diverge toward Wave-native layout contracts.
+    wave_amd.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size, options.num_ctas)
     passes.ttgpuir.add_coalesce(pm)
     passes.ttgpuir.add_f32_dot_tc(pm, False)
     passes.ttgpuir.add_remove_layout_conversions(pm)
