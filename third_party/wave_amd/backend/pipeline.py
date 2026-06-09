@@ -3,7 +3,7 @@ from enum import Enum
 import tempfile
 from typing import Callable, Optional, Sequence
 
-from triton._C.libtriton import amd, ir, passes, wave_amd
+from triton._C.libtriton import ir, passes, wave_amd
 
 
 class PassReuse(str, Enum):
@@ -132,7 +132,10 @@ def add_wave_ttgir_passes(pm, options) -> None:
     passes.ttgpuir.add_remove_layout_conversions(pm)
     passes.common.add_canonicalizer(pm)
     passes.common.add_cse(pm)
-    amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
+    # Wave owns the matrix-core dot legalization (see tritonwaveamd-accelerate-
+    # matmul). Currently byte-identical to the AMD pass, but it gives Wave a seam
+    # to diverge toward Wave-native fragment layouts.
+    wave_amd.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
     passes.ttgpuir.add_remove_layout_conversions(pm)
     passes.common.add_canonicalizer(pm)
     passes.common.add_cse(pm)
