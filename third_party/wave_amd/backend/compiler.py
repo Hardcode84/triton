@@ -53,7 +53,7 @@ class WaveAMDOptions:
     waves_per_eu: int = 0
     num_stages: int = 2
     num_ctas: int = 1
-    matrix_instr_nonkdim: int = 16
+    matrix_instr_nonkdim: int = 0
     extern_libs: dict = None
     debug: bool = False
     instrumentation_mode: str = ""
@@ -66,7 +66,6 @@ class WaveAMDOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     enable_ttgir_preview: bool = False
-    matrix_instr_nonkdim: int = 0
     kpack: int = 1
     backend_name: str = "wave_amd"
 
