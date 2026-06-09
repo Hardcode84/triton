@@ -138,6 +138,7 @@ def add_wave_ttgir_passes(pm, options) -> None:
     # descriptor planning in C++ so the bridge consumes typed attrs instead of
     # parsing TTGIR type strings or inferring ranges.
     wave_amd.add_legalize_dots(pm)
+    wave_amd.add_plan_gemm_schedule(pm)
     wave_amd.add_plan_buffer_descriptors(pm)
 
 

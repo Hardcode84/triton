@@ -30,6 +30,32 @@ def TritonWaveAMDLegalizeDots
   ];
 }
 
+def TritonWaveAMDPlanGemmSchedule
+    : Pass<"tritonwaveamd-plan-gemm-schedule", "mlir::ModuleOp"> {
+  let summary = "Plan Wave AMD GEMM tiling and LDS staging in TTGIR";
+
+  let description = [{
+    Wave TTGIR GEMM preparation step that owns the GEMM schedule so the Python
+    bridge consumes it mechanically instead of recomputing it.
+
+    For every matrix-core `tt.dot` it attaches the tiling
+    (`waveamd.gemm.{m_tiles,n_tiles,k_steps}`) and the per-wave LDS staging plan
+    (`waveamd.gemm.lds_{slots_per_wave,dwords_per_slot,bytes}`) derived from the
+    module warp configuration. Non matrix-core or non-static dots are left
+    unannotated.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+
+  let options = [
+    Option<"fragmentRegisters", "fragment-registers", "int64_t", /*default=*/"8",
+           "Dwords per lane staged through LDS for one dot operand fragment.">
+  ];
+}
+
 def TritonWaveAMDPlanBufferDescriptors
     : Pass<"tritonwaveamd-plan-buffer-descriptors", "mlir::ModuleOp"> {
   let summary = "Plan Wave AMD buffer descriptor ranges for static footprints";

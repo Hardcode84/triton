@@ -14,8 +14,8 @@ from triton.backends.wave_amd.gemm_pipeline import (
     WaveBufferPlan,
     WaveGemmPipelinePlan,
     WaveGemmSchedule,
+    WaveLdsPlan,
     buffer_plan_for_static_footprint,
-    schedule_for_dot,
 )
 
 ARCHITECTURE_POLICY = (
@@ -373,24 +373,27 @@ class _TTIRToWaveLowerer:
         self.dot_operand_roles[value_id] = role
 
     def _collect_gemm_schedule(self, ops: Sequence[object]) -> Optional[WaveGemmSchedule]:
-        schedules = []
+        # The GEMM schedule is prepared in TTGIR by tritonwaveamd-plan-gemm-schedule;
+        # read the attrs mechanically instead of recomputing the plan here.
+        best = None
         for op in ops:
             if op.get_name() != "tt.dot":
                 continue
-            lhs = self._value_tensor_info(op.get_operand(0))
-            rhs = self._value_tensor_info(op.get_operand(1))
-            result = self._result_tensor_info(op)
-            schedule = schedule_for_dot(
-                self.gemm_pipeline,
-                None if lhs is None else lhs.shape,
-                None if rhs is None else rhs.shape,
-                None if result is None else result.shape,
+            slots = op.get_int_attr("waveamd.gemm.lds_slots_per_wave")
+            dwords = op.get_int_attr("waveamd.gemm.lds_dwords_per_slot")
+            if slots is None or dwords is None:
+                continue
+            lds = WaveLdsPlan(slots_per_wave=slots, dwords_per_slot=dwords, num_warps=self.num_warps)
+            schedule = WaveGemmSchedule(
+                m_tiles=op.get_int_attr("waveamd.gemm.m_tiles") or 0,
+                n_tiles=op.get_int_attr("waveamd.gemm.n_tiles") or 0,
+                k_steps=op.get_int_attr("waveamd.gemm.k_steps") or 0,
+                stages=(),
+                lds=lds,
             )
-            if schedule is not None:
-                schedules.append(schedule)
-        if not schedules:
-            return None
-        return max(schedules, key=lambda schedule: 0 if schedule.lds is None else schedule.lds.bytes)
+            if best is None or schedule.lds.bytes > best.lds.bytes:
+                best = schedule
+        return best
 
     def _kernel_lds_size(self) -> Optional[int]:
         if self.gemm_schedule is None or self.gemm_schedule.lds is None:

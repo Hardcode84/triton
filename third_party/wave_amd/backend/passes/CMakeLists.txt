@@ -12,6 +12,7 @@ add_public_tablegen_target(TritonWaveAMDBackendPassesIncGen)
 add_triton_library(TritonWaveAMDBackendPasses
   LegalizeDots.cpp
   PlanBufferDescriptors.cpp
+  PlanGemmSchedule.cpp
 
   DEPENDS
   TritonWaveAMDBackendPassesIncGen
