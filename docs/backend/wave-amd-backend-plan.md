@@ -384,7 +384,8 @@ on; the elementwise slice ships without it.
   a `kind` string, e.g. `"wmma"` on gfx1100;
   `include/mlir/Dialect/Wave/IR/WaveAMDOps.td`), via `fragment_pack` /
   `fragment_unpack` / `fragment_fill`; loop / branch token threading.
-- **`convert_layout` / cross-lane synthesis (the real layout problem):** when src
+- **`convert_layout` / cross-lane synthesis (the real layout problem) -- SHIPPED
+  (affine, single + multi-warp):** when src
   and dst `LinearLayout`s differ, compute the delta
   `srcLL.invert_and_compose(dstLL)` (the same primitive Triton uses to lower
   `convert_layout` to LLVM) and classify: intra-lane reg permutation (free),
@@ -397,6 +398,40 @@ on; the elementwise slice ships without it.
   ops. Classification is the easy step; delta->hardware-op *emission* is the real
   cost (Triton needs dedicated swap/ship + generic-swizzling impls). Gates
   reductions / transposes / dot operands.
+  - **Shipped in the converter** (`third_party/wave_amd/backend/wave_converter.py`;
+    tests `third_party/wave_amd/test/{transpose_e2e,transpose_mw_e2e,strided_copy_e2e}.py`,
+    recon `spike_recon{,2}.py`): the spike (a bespoke per-kernel converter, now
+    retired) generalized into the production `convert`. A 32x32 transpose -- one
+    `ttg.convert_layout`, a `register`<->`lane` reshuffle -- runs through the real
+    `make_wave` and is correct on gfx1100 (`y == x^T`); a `num_warps=2` 32x32 and
+    64x64 transpose (the convert delta now also moves the `warp` dim) is correct
+    too. What it establishes:
+    - The roundtrip is **bindings-only and small**: per register slot, global
+      `wave.load` -> `wave.store` to `wave.lds_base` + `flatten(srcLL)` ->
+      `wave.barrier(join(stores))` -> `wave.load(after=barrier)` from `lds` +
+      `flatten(dstLL)` -> global `wave.store`. No `WaveAMDMachine` op, no C++.
+    - Addresses come straight from **`.bases`, not `.apply`** (`.apply` aborts
+      across the singleton/layout context boundary, confirming the M1b note). The
+      converter synthesizes the general affine offset per `(register, lane, warp)`
+      from the bases (constant + per-lane-bit shift/mask/mul + masked `warp_id =
+      workitem_id >> log2(W)`), so runtime strides and bit-interleaved lanes fall
+      out for free -- not just the spike's clean `cL*lane + const` case. Index and
+      pointer values stay **symbolic** (an affine `Lin` over coordinates) so
+      `broadcast` / `expand_dims` / `trans` are bookkeeping and SIMD is emitted
+      only at `cmpi` / `load` / `store`.
+    - A **naive, unswizzled** row-major shared layout is *correct* (Triton's
+      `optimalSwizzlingLdSt` / `GenericSwizzling` is a bank-conflict *perf*
+      optimization, not a correctness requirement), and spans the full workgroup
+      tile so cross-warp deltas land via the workgroup-wide `s_barrier`.
+    - **Tokens are load-bearing.** The threaded `store -> barrier -> load(after=)`
+      chain is what makes wave-translate emit the `s_waitcnt lgkmcnt(0)` +
+      `s_barrier` fence (the cross-warp fence at `num_warps>1`); drop it and the
+      kernel races. (Validates the "Memory token generation" design.)
+  - **Still open (deferred, not disproven):** non-affine XOR-swizzled deltas (dot
+    operands, bank-optimal shared) -- addresses are not clean-affine, so the
+    bases-driven affine synthesis raises rather than miscompiling; bank-conflict
+    swizzling for perf; and packing the per-register unroll into `vector<N>`
+    loads. Multi-CTA (`block` in the delta) stays out of scope.
 - **Fully in-process emit:** add a nanobind over `translateWaveToAMDGPU` (asm, runs
   the lowering pipeline) or `assembleWaveAMDGPUKernels` (HSACO directly -- but the
   caller must first run the WaveAMDMachine lowering in-process via `register_passes`
