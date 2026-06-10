@@ -33,6 +33,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -361,6 +362,49 @@ void init_triton_ir(py::module &&m) {
       .def("is_integer",
            [](Type &self, unsigned width) { return self.isInteger(width); })
       .def("is_fp16", &Type::isF16)
+      // wave_amd: structural type introspection for the TTGIR->Wave converter.
+      // The dtype helpers transparently look through a ranked tensor to its
+      // element type, so they can be called on either scalar or tensor types.
+      .def("is_ranked_tensor",
+           [](Type &self) { return isa<RankedTensorType>(self); })
+      .def("get_element_type",
+           [](Type &self) -> Type {
+             if (auto t = dyn_cast<RankedTensorType>(self))
+               return t.getElementType();
+             return self;
+           })
+      .def("is_pointer_type",
+           [](Type &self) {
+             Type t = self;
+             if (auto rt = dyn_cast<RankedTensorType>(self))
+               t = rt.getElementType();
+             return isa<triton::PointerType>(t);
+           })
+      .def("get_pointee_type",
+           [](Type &self) -> py::object {
+             Type t = self;
+             if (auto rt = dyn_cast<RankedTensorType>(self))
+               t = rt.getElementType();
+             if (auto p = dyn_cast<triton::PointerType>(t))
+               return py::cast(p.getPointeeType());
+             return py::none();
+           })
+      .def("is_floating",
+           [](Type &self) {
+             Type t = self;
+             if (auto rt = dyn_cast<RankedTensorType>(self))
+               t = rt.getElementType();
+             return isa<mlir::FloatType>(t);
+           })
+      .def("get_bitwidth",
+           [](Type &self) -> py::object {
+             Type t = self;
+             if (auto rt = dyn_cast<RankedTensorType>(self))
+               t = rt.getElementType();
+             if (isa<mlir::FloatType, mlir::IntegerType>(t))
+               return py::cast(t.getIntOrFloatBitWidth());
+             return py::none();
+           })
       .def("__eq__",
            [](Type &self, py::object &other) {
              Type *other_ty = py::cast<Type *>(other);
@@ -441,6 +485,17 @@ void init_triton_ir(py::module &&m) {
              self.replaceAllUsesWith(newValue);
            })
       .def("get_type", &Value::getType)
+      // wave_amd: finalized-TTGIR distributed layout of a tensor value as a
+      // LinearLayout (read .bases / get_in_dim_names / get_out_dim_names as
+      // plain data; do not use .apply, whose dim-name context differs). Returns
+      // None for non-tensor values or tensors without an encoding.
+      .def("get_tensor_layout",
+           [](Value &self) -> py::object {
+             auto ty = dyn_cast<RankedTensorType>(self.getType());
+             if (!ty || !ty.getEncoding())
+               return py::none();
+             return py::cast(ttg::toLinearLayout(ty));
+           })
       .def("id",
            [](Value &self) {
              // The Value is identified by and compared with
