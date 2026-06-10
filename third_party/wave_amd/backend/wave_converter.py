@@ -45,13 +45,19 @@ import sys
 from pathlib import Path
 
 # arith::CmpIPredicate enum value -> wave.cmpi predicate keyword.
+# wave's AMDGPU lowering (WaveAMDMachine getU32CmpKind) only supports the
+# unsigned U32 comparisons {eq, ne, ult, ule, ugt, uge}. triton emits *signed*
+# index comparisons (e.g. `offs < n` -> slt), so the signed predicates are
+# folded onto their unsigned equivalents. This is sound for the elementwise
+# masked-copy scope, whose compared values (program_id*BLOCK + iota, and the
+# bound n) are non-negative.
 _CMPI_PRED = {
     0: "eq",
     1: "ne",
-    2: "slt",
-    3: "sle",
-    4: "sgt",
-    5: "sge",
+    2: "ult",  # slt
+    3: "ule",  # sle
+    4: "ugt",  # sgt
+    5: "uge",  # sge
     6: "ult",
     7: "ule",
     8: "ugt",
