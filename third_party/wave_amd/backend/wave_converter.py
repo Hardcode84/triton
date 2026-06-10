@@ -41,6 +41,7 @@ in-process coexistence is preserved; there are no top-level Wave imports.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -83,6 +84,31 @@ def _import_dsl():
         sys.path.insert(0, pkg)
     from mlir.dialects import wave_dsl as dsl
     return dsl
+
+
+def _wave_translate_bin() -> str:
+    env = os.environ.get("WAVE_TRANSLATE")
+    if env:
+        return env
+    root = os.environ.get("WAVE_REPO", _DEFAULT_WAVE_REPO)
+    return str(Path(root) / "build" / "bin" / "wave-translate")
+
+
+def wave_to_amdgpu_asm(module_text: str) -> str:
+    """Lower high-level Wave IR text to AMDGPU asm via ``wave-translate``.
+
+    The target arch travels in the module's ``waveamdmachine.target`` attribute
+    (set by :func:`convert`), so no arch flag is needed here. wave-translate runs
+    in a subprocess against wave-mlir's own statically-linked LLVM; only text
+    crosses the boundary, so it never clashes with triton's ``_C`` LLVM in-process.
+    """
+    tool = _wave_translate_bin()
+    if not Path(tool).exists():
+        raise RuntimeError(f"wave_amd: wave-translate not found at {tool}; set WAVE_TRANSLATE")
+    proc = subprocess.run([tool, "--wave-to-amdgpu-asm", "-"], input=module_text, text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"wave_amd: wave-translate failed ({proc.returncode}):\n{proc.stderr}")
+    return proc.stdout
 
 
 def _wave_scalar_type(ty, dsl):

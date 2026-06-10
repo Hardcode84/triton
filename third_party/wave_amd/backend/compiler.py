@@ -41,11 +41,24 @@ class WaveAMDBackend(amd_compiler.HIPBackend):
 
     @staticmethod
     def make_wave(src, metadata, options):
-        raise NotImplementedError("wave_amd: finalized-TTGIR -> Wave converter lands in M2")
+        # src: finalized TTGIR ModuleOp. Convert structurally to Wave dialect IR
+        # text (the converter walks TTGIR via triton's _C bindings and emits Wave
+        # IR via wave-mlir's bindings in-process). Returns Wave IR text because
+        # the next stage runs in wave-mlir's separate LLVM runtime.
+        from triton.backends.wave_amd.wave_converter import convert, wave_ir_text
+        metadata["name"] = src.get_entry_func_name()
+        bld = convert(src, options.arch)
+        if not bld.module.operation.verify():
+            raise RuntimeError("wave_amd: converted Wave module failed to verify")
+        return wave_ir_text(bld)
 
     @staticmethod
     def make_amdgcn(src, metadata, options):
-        raise NotImplementedError("wave_amd: Wave -> AMDGPU asm (wave-translate) lands in M2b")
+        # src: high-level Wave IR text. Lower to AMDGPU asm via wave-translate
+        # (wave-mlir's LLVM). The inherited make_hsaco then assembles + links it
+        # with triton's LLVM, exactly as the HIP backend does for its own asm.
+        from triton.backends.wave_amd.wave_converter import wave_to_amdgpu_asm
+        return wave_to_amdgpu_asm(src)
 
     def add_stages(self, stages, options, language):
         if language != Language.TRITON:
