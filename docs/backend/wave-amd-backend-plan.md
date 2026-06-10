@@ -236,9 +236,69 @@ flowchart TD
   structured DSL `bld.index_expr(expr, bindings={sym: ssaValue})` over `ixsimpl`
   `Expr`s (no text); uniformity flows from each binding's operand type (uniform
   scalar vs `simd`).
-- Memory ordering via a single token chain (`wave.token` / `after` / `join` /
-  `wait`), threaded through the `load` / `store` token results.
+- Memory ordering: the MVP emits **no** tokens -- in/out are distinct buffers (no
+  hazard) and load->store readiness rides the SSA value dep (the lowering inserts
+  the `vmcnt` wait). See "Memory token generation" for when/how tokens are made.
 - Divisibility / range facts -> `wave.assume`.
+
+## Memory token generation
+
+`!wave.mem.token` is an explicit happens-before SSA graph layered over the MLIR
+`MemRead`/`MemWrite` effects (`include/mlir/Dialect/Wave/IR/WaveOps.td`):
+`wave.load` returns `(value, token)`, `wave.store` returns a `token`, and both
+take an optional `after` dependency; `wave.token` mints an empty one,
+`wave.after` / `wave.join` combine, `wave.wait` forces completion, and
+`wave.barrier [deps] -> token` is the LDS visibility fence (`s_waitcnt
+lgkmcnt(0)` + `s_barrier` on RDNA3). The DSL surfaces all of these:
+`fb.load(ptr, ty, after=...)`, `fb.store(v, ptr, after=...)`,
+`fb.barrier(*deps)`, `fb.wait(*toks)`, `fb.token()`, `fb.after(...)`,
+`fb.join(...)`.
+
+TTGIR has none of this -- its ordering is implicit (program order + memory
+effects) -- so the converter must *materialize* implicit ordering into explicit
+tokens, but **only where a real happens-before exists**; a blanket chain would
+needlessly serialize. Two concerns are separate:
+
+- **Value readiness (`vmcnt`) is not a token concern.** The loaded SIMD value's
+  wait is inserted by the WaveAMDMachine lowering from the *value use*, not from a
+  token. Validated in M3: with no token threaded, the emitted asm still has
+  `s_waitcnt vmcnt(0)` between the `global_load_b32` and the `global_store_b32`
+  that consumes it.
+- **Memory-to-memory ordering** (RAW / WAW / WAR through memory, with no SSA value
+  link between the two ops) is exactly what tokens express.
+
+MVP reality (elementwise masked-copy, and saxpy): emit **no** tokens. In/out are
+distinct buffers (no hazard), and the only ordering -- load before the store that
+consumes its value -- is already carried by the SSA data dependency. saxpy's two
+loads *should* stay un-chained so they overlap; the single wait before first use
+is the backend's job. M2/M3 confirm tokenless converter output is correct, so the
+MVP is tokenless *by design*, not as a shortcut.
+
+Generation strategy when scaling past distinct-buffer elementwise: during the
+walk track, per memory resource (keyed by base-pointer SSA value / kernarg), the
+last store token and any outstanding load tokens.
+
+- load from B: `after =` last-store-token(B) if it may alias; else none (reads
+  don't block reads).
+- store to B: `after = join(`prior store + outstanding load tokens to B that may
+  alias`)`; then set last-store(B).
+- distinct kernarg pointers -> treated as non-aliasing -> no edge; when
+  disjointness is unprovable, fall back to a conservative per-buffer chain
+  (correctness over overlap).
+
+The case that *forces* tokens is cross-lane layout conversion via LDS (the
+`convert_layout` roadmap item): the store, the barrier, and the read are ordered
+only by tokens -- there is no value link across the LDS round-trip --
+
+```python
+t0     = fb.store(regs, lds_ptr)              # wave.store -> token
+t1     = fb.barrier(t0)                        # store visible to all lanes -> token
+val, _ = fb.load(lds_ptr2, simd_ty, after=t1)  # read sequenced after the barrier
+```
+
+So token generation lands with the LDS staging path (and in-place / atomic
+cases), not before. The per-resource tracker above is the foundation those build
+on; the elementwise slice ships without it.
 
 ## Milestones
 
@@ -365,7 +425,9 @@ flowchart TD
   dependency that dlopens with it breaks the process). Pass only plain data across
   the boundary -- never `Mlir*` capsules.
 - **Implicit mask / token recovery:** TTGIR carries masks as `tensor<i1>` and
-  ordering as side effects; reconstruct `wave.where` and the token chain.
+  ordering as MLIR side effects; reconstruct `wave.where`, and materialize memory
+  tokens only on real hazards / LDS staging (see "Memory token generation") -- the
+  elementwise MVP needs none.
 - **Emit input** must be high-level Wave / WaveAMD ops under
   `waveamdmachine.target`.
 - **Launch / kernarg ABI (critical):** wave defines its own kernarg layout
